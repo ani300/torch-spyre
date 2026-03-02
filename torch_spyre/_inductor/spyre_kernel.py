@@ -477,12 +477,21 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                     # but the device sizes are different
 
                     # When implementing torch.nn.Linear + relayout_linear_weights pass, we hit this case
+                    # We also hit this case on SDPA transposes that need realization
 
                     # When this happens, for now we do the op as a Transpose as we know that's the only
                     # option we support
 
                     # TODO(aviros): Make this a fully fledged STCDP op
                     op = TRANSPOSE_OP
+                    orig_strides = buf.get_stride()
+                    transpose_dims = []
+                    print(f"DEBUG STRIDES {orig_strides}")
+                    for idx in range(len(orig_strides)-1):
+                        if orig_strides[idx+1] > orig_strides[idx]:
+                            transpose_dims.append(idx)
+                            transpose_dims.append(idx+1)
+                    assert len(transpose_dims) <= 2, f"Only 1 transpose is supported: {transpose_dims}"
                     generic_relayout = True
                 elif (
                     args[1].device_layout.device_size
@@ -506,7 +515,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             # TODO(aviros): Remove this piece of code when real relayout is implemented
             if generic_relayout:
                 ks.dimensions.reverse()
-                ks.op_info["transposed_dims"] = [0, 1]
+                ks.op_info["transposed_dims"] = transpose_dims
 
             self.kernel_specs.append(ks)
         else:
