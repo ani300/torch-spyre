@@ -72,7 +72,9 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
 
         name = buffer.get_name()
         codegen_shape_tuple = self.codegen_python_shape_tuple(tuple(layout.size))
-        codegen_stride_tuple = self.codegen_python_shape_tuple(tuple(layout.stride))
+        codegen_stride_tuple = self.codegen_python_shape_tuple(
+            tuple(layout.stride)
+        )
 
         out = (
             f"{name} = spyre_empty_with_layout("

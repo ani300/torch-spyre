@@ -43,7 +43,7 @@ from .constants import (
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import map_dims_to_vars, wildcard_symbol
-from .stickify import is_sparse
+from .stickify import derive_dim_order, is_sparse
 
 
 class RValue(ABC):
@@ -484,13 +484,12 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
 
                     # TODO(aviros): Make this a fully fledged STCDP op
                     op = TRANSPOSE_OP
-                    orig_strides = buf.get_stride()
-                    transpose_dims = []
-                    print(f"DEBUG STRIDES {orig_strides}")
-                    for idx in range(len(orig_strides)-1):
-                        if orig_strides[idx+1] > orig_strides[idx]:
-                            transpose_dims.append(idx)
-                            transpose_dims.append(idx+1)
+                    rank = len(args[0].host_size)
+                    in_dim_order = derive_dim_order(args[0].device_layout, rank)
+                    out_dim_order = derive_dim_order(args[1].device_layout, rank)
+                    transpose_dims = [
+                        d for d in range(rank) if in_dim_order.index(d) != out_dim_order.index(d)
+                    ]
                     assert len(transpose_dims) <= 2, f"Only 1 transpose is supported: {transpose_dims}"
                     generic_relayout = True
                 elif (

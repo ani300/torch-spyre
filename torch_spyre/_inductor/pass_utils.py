@@ -57,13 +57,24 @@ def map_dims_to_vars(layout: FixedLayout, index: Expr) -> dict[int, Symbol]:
     to the free variables of index that correspond to them.
     Dimensions of size 1 are mapped to a wild_card_symbol of `*`
 
-    This works by reversing the algorithm used by torch._inductor.ir. _fixed_indexer to build index.
+    This works by reversing the algorithm used by torch._inductor.ir._fixed_indexer
+    to build index.  Each symbol's coefficient in the index expression equals the
+    stride that was used when the index was constructed.  We look up that stride
+    value in the layout's *index strides* (the strides from decide_layout() that
+    were used to build the index expression).
+
+    For FixedTiledLayout, layout.stride may hold device-consistent strides that
+    differ from the strides used to build the index.  In that case the original
+    strides are available via layout.index_stride.
     """
+    # Use index_stride if available (FixedTiledLayout), else layout.stride.
+    stride = getattr(layout, "index_stride", layout.stride)
+
     result = {}
     for sym in index.free_symbols:
         stride_val = sympy_subs(index, {sym: 1}) - sympy_subs(index, {sym: 0})
-        if stride_val in layout.stride:
-            idx = layout.stride.index(stride_val)
+        if stride_val in stride:
+            idx = stride.index(stride_val)
             result[idx] = sym
 
     for d in range(len(layout.size)):
