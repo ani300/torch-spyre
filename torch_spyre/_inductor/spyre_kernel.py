@@ -521,7 +521,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
 
             # TODO(aviros): Remove this piece of code when real relayout is implemented
             if generic_relayout:
-                ks.dimensions.reverse()
                 ks.op_info["transposed_dims"] = transpose_dims
 
             self.kernel_specs.append(ks)
