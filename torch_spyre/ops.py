@@ -353,7 +353,10 @@ def spyre__sdpa_overrideable(
             scaling_factor = 1.0 / math.sqrt(query.shape[-1])
         scaling_factor = math.sqrt(scaling_factor)
 
+        scaling_factor = torch.full_like(query, scaling_factor)
+
         query = query * scaling_factor
+        key = key * scaling_factor
 
         if is_causal:
             # TODO(aviros): Implement
@@ -361,7 +364,7 @@ def spyre__sdpa_overrideable(
 
         key_t = key.transpose(-2, -1).clone(memory_format=torch.contiguous_format)
 
-        attn = torch.matmul(query, key_t * scaling_factor)
+        attn = torch.matmul(query, key_t)
         if attn_bias is not None:
             attn.add_(attn_bias)
 

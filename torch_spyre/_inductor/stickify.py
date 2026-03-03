@@ -198,7 +198,12 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     raise Unsupported(f"size mismatch: {op}({in_size})=>{out_size}) ")
 
         return FixedTiledLayout(
-            output.device, output.dtype, output.size, strides_from_device_layout(output.size, stl), stl, index_stride=list(output.stride)
+            output.device,
+            output.dtype,
+            output.size,
+            strides_from_device_layout(output.size, stl),
+            stl,
+            index_stride=list(output.stride),
         )
     elif op == spyreop.layernormnorm.default:
         # Output layout is determined by layout of first argument only
@@ -210,7 +215,12 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             )
         stl = SpyreTensorLayout(x_stl.device_size, x_stl.dim_map, x_stl.device_dtype)
         return FixedTiledLayout(
-            output.device, output.dtype, output.size, strides_from_device_layout(output.size, stl), stl, index_stride=list(output.stride)
+            output.device,
+            output.dtype,
+            output.size,
+            strides_from_device_layout(output.size, stl),
+            stl,
+            index_stride=list(output.stride),
         )
     else:
         # Stick compatability check.
@@ -237,7 +247,12 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             if arg.layout.size == output.size:
                 stl = device_layout_like(arg.layout, output.dtype)
                 return FixedTiledLayout(
-                    output.device, output.dtype, output.size, strides_from_device_layout(output.size, stl), stl, index_stride=list(output.stride)
+                    output.device,
+                    output.dtype,
+                    output.size,
+                    strides_from_device_layout(output.size, stl),
+                    stl,
+                    index_stride=list(output.stride),
                 )
 
         # Case 2: All inputs are broadcasting at least one dimension.
@@ -255,7 +270,12 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         dim_order = derive_dim_order(chosen.layout.device_layout, len(output.size))
         stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
         return FixedTiledLayout(
-            output.device, output.dtype, output.size, strides_from_device_layout(output.size, stl), stl, index_stride=list(output.stride)
+            output.device,
+            output.dtype,
+            output.size,
+            strides_from_device_layout(output.size, stl),
+            stl,
+            index_stride=list(output.stride),
         )
 
 
@@ -276,7 +296,12 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             raise Unsupported(f"matmul stick dimensions mismatch {x_stl} {y_stl}")
         stl = SpyreTensorLayout(output.size, output.dtype, out_dim_order)
         return FixedTiledLayout(
-            output.device, output.dtype, output.size, strides_from_device_layout(output.size, stl), stl, index_stride=list(output.stride)
+            output.device,
+            output.dtype,
+            output.size,
+            strides_from_device_layout(output.size, stl),
+            stl,
+            index_stride=list(output.stride),
         )
     elif red.reduction_type == BATCH_MATMUL_OP:
         x_layout = args[0].layout
@@ -301,7 +326,12 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             raise Unsupported(f"bmm stick dimensions mismatch {x_stl} {y_stl}")
         stl = SpyreTensorLayout(output.size, output.dtype, out_dim_order)
         return FixedTiledLayout(
-            output.device, output.dtype, output.size, strides_from_device_layout(output.size, stl), stl, index_stride=list(output.stride)
+            output.device,
+            output.dtype,
+            output.size,
+            strides_from_device_layout(output.size, stl),
+            stl,
+            index_stride=list(output.stride),
         )
     elif red.reduction_type == "exx2":
         x = args[0]
@@ -311,7 +341,12 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         dim_map = list(range(len(output.size))) + [-1]
         stl = SpyreTensorLayout(output.size, output.dtype, dim_map)
         return FixedTiledLayout(
-            output.device, output.dtype, output.size, strides_from_device_layout(output.size, stl), stl, index_stride=list(output.stride)
+            output.device,
+            output.dtype,
+            output.size,
+            strides_from_device_layout(output.size, stl),
+            stl,
+            index_stride=list(output.stride),
         )
     else:
         x = args[0]
@@ -323,7 +358,12 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             out_dim_order = out_dim_order + [-1]
         stl = SpyreTensorLayout(output.size, output.dtype, out_dim_order)
         return FixedTiledLayout(
-            output.device, output.dtype, output.size, strides_from_device_layout(output.size, stl), stl, index_stride=list(output.stride)
+            output.device,
+            output.dtype,
+            output.size,
+            strides_from_device_layout(output.size, stl),
+            stl,
+            index_stride=list(output.stride),
         )
 
 
@@ -332,7 +372,12 @@ def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
     # Use the generic stick format
     stl = SpyreTensorLayout(output.size, output.dtype)
     return FixedTiledLayout(
-        output.device, output.dtype, output.size, strides_from_device_layout(output.size, stl), stl, index_stride=list(output.stride)
+        output.device,
+        output.dtype,
+        output.size,
+        strides_from_device_layout(output.size, stl),
+        stl,
+        index_stride=list(output.stride),
     )
 
 

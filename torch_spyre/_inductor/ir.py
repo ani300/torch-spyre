@@ -87,7 +87,9 @@ class FixedTiledLayout(FixedLayout):
     ) -> None:
         super().__init__(device, dtype, size, stride)
         self.device_layout: SpyreTensorLayout = device_layout
-        self.index_stride: list[Expr] = index_stride if index_stride is not None else list(stride)
+        self.index_stride: list[Expr] = (
+            index_stride if index_stride is not None else list(stride)
+        )
         self.allocation: dict[str, Any] = {}
 
     def __str__(self) -> str:

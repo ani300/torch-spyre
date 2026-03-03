@@ -488,9 +488,13 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                     in_dim_order = derive_dim_order(args[0].device_layout, rank)
                     out_dim_order = derive_dim_order(args[1].device_layout, rank)
                     transpose_dims = [
-                        d for d in range(rank) if in_dim_order.index(d) != out_dim_order.index(d)
+                        d
+                        for d in range(rank)
+                        if in_dim_order.index(d) != out_dim_order.index(d)
                     ]
-                    assert len(transpose_dims) <= 2, f"Only 1 transpose is supported: {transpose_dims}"
+                    assert len(transpose_dims) <= 2, (
+                        f"Only 1 transpose is supported: {transpose_dims}"
+                    )
                     generic_relayout = True
                 elif (
                     args[1].device_layout.device_size
