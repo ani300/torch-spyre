@@ -100,3 +100,5 @@
   template_name: base
 - operator_name: tril
   template_name: base
+- operator_name: triu
+  template_name: base

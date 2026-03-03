@@ -358,13 +358,15 @@ def spyre__sdpa_overrideable(
         query = query * scaling_factor
         key = key * scaling_factor
 
-        if is_causal:
-            # TODO(aviros): Implement
-            pass
-
         key_t = key.transpose(-2, -1).clone(memory_format=torch.contiguous_format)
 
         attn = torch.matmul(query, key_t)
+
+        if is_causal:
+            assert attn_bias is None
+            attn_bias = torch.full_like(attn, float("-inf"))
+            attn_bias = attn_bias.triu(diagonal=1)
+
         if attn_bias is not None:
             attn.add_(attn_bias)
 
@@ -395,7 +397,6 @@ def spyre__sdpa_overrideable(
             None,
         )
 
-    # Prevents double tracing
     compiled_sdpa = torch.compile(_sdpa_overrideable, dynamic=False)
     return compiled_sdpa(
         query, key, value, attn_bias, dropout_p, is_causal, return_debug_mask, scale

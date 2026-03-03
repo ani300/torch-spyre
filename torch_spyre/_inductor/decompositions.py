@@ -39,6 +39,8 @@ spyre_decompositions_to_exclude = [
     # uses torch.full, which is not yet supported in Spyre eager mode.
     # See: https://github.com/torch-spyre/torch-spyre/issues/128#issuecomment-3576168221
     torch.ops.aten.new_ones,
+    torch.ops.aten.triu,
+    torch.ops.aten.tril,
 ]
 
 

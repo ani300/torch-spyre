@@ -233,3 +233,8 @@ def spyre__embedding(
     """
     # TODO: Remove this fallback once we enable gather/scatter ops on spyre
     return aten.embedding(weight, indices, padding_idx, scale_grad_by_freq, sparse)
+
+
+@register_fallback([aten.triu.out])
+def spyre__triu(input, diagonal, **kwargs):
+    return torch.triu(input, diagonal, **kwargs)
