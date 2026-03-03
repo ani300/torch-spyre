@@ -163,6 +163,20 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     raise Unsupported("swap on non 1-D tensor")
                 stl = SpyreTensorLayout(output.size, output.dtype, [0, -1])
 
+            case aten.permute.default:
+                if is_sparse(x_stl):
+                    raise Unsupported("permute on sparse tensor")
+                dims = origin_node.args[1]
+                ndims = len(x.layout.size)
+                dims = [d % ndims for d in dims]
+                inv_perm = [0] * ndims
+                for new_pos, old_pos in enumerate(dims):
+                    inv_perm[old_pos] = new_pos
+                new_dim_map = [inv_perm[d] if d >= 0 else d for d in x_stl.dim_map]
+                stl = SpyreTensorLayout(
+                    x_stl.device_size, new_dim_map, x_stl.device_dtype
+                )
+
             case aten.clone.default:
                 if is_sparse(x_stl):
                     # TODO: Determine whether we already support cloning a sparse tensor

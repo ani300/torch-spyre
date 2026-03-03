@@ -463,7 +463,13 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 ):
                     # Transpose: check that the input / output sizes are the same, but in different order.
                     # Device sizes have the stick dimension split
-                    op = TRANSPOSE_OP
+                    if (
+                        args[0].device_layout.device_size
+                        != args[1].device_layout.device_size
+                    ):
+                        op = TRANSPOSE_OP
+                    else:
+                        op = CLONE_OP
                 elif Counter(in_di) == Counter(out_di) and in_di != out_di:
                     # Transpose: check that the input / output DimensionInfo are the same, but in different order.
                     op = TRANSPOSE_OP
@@ -510,7 +516,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 raise Unsupported(f"Data operation on {type(args[0])}")
 
             ks = create_kernel_spec(op, False, in_di, args, scales, op_info)
-            if in_di != out_di:
+            if (
+                in_di != out_di
+                and args[0].device_layout.device_size
+                != args[1].device_layout.device_size
+            ):
                 ks.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
                 ]

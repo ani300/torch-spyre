@@ -384,9 +384,15 @@ def spyre__sdpa_overrideable(
         philox_seed = torch.empty((1,), dtype=torch.float16, device="spyre")
         philox_offset = torch.empty((1,), dtype=torch.float16, device="spyre")
 
+        # B, H, S, E
+        out = torch.matmul(attn, value)
+
+        # B, S, H, E
+        out = out.transpose(1, 2).clone(memory_format=torch.contiguous_format)
+
         # Returns (Tensor output, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k, Tensor philox_seed, Tensor philox_offset, Tensor debug_attn_mask)
         return (
-            torch.matmul(attn, value),
+            out.transpose(1, 2),
             logsumexp,
             None,
             None,
