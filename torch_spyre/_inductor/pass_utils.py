@@ -23,12 +23,88 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 
+from torch_spyre._C import SpyreTensorLayout, compute_view_layout
+from torch_spyre._inductor.errors import Unsupported
+
 from .ir import FixedTiledLayout
+
+
+# This dictionary contains the history of the view ops originating from a realized buffer
+# This is used to compute the device layouts for op layout propagation and also for
+# OpSpec generation later on.
+
+# The list of view op infos will contain a dictionary with info for each view.
+# For example, for a permute view op:
+# {
+#   "type": "permute",
+#   "dims": [3, 1, 2, 0],
+#   "new_layout": TensorBox.get_layout()
+# }
+# With this information, we can compute the new STL from a starting STL
+partial_view_info: dict[str, list] = {}
 
 
 class SchedNodeArg(NamedTuple):
     dep: MemoryDep
     layout: FixedTiledLayout
+
+
+def compute_permute_stl(
+    dims: list, starting_stl: SpyreTensorLayout
+) -> SpyreTensorLayout:
+    ndims = len(dims)
+
+    inv_perm = [0] * ndims
+    for new_pos, old_pos in enumerate(dims):
+        inv_perm[old_pos] = new_pos
+
+    new_dim_map = [inv_perm[dim] for dim in starting_stl.dim_map]
+
+    return SpyreTensorLayout(
+        starting_stl.device_size, new_dim_map, starting_stl.device_dtype
+    )
+
+
+def compute_transpose_stl(
+    dim0: int, dim1: int, starting_stl: SpyreTensorLayout
+) -> SpyreTensorLayout:
+    dim_map = starting_stl.dim_map
+    for idx, dim in enumerate(dim_map):
+        if dim == dim0:
+            dim_map[idx] = dim1
+        elif dim == dim1:
+            dim_map[idx] = dim0
+    return SpyreTensorLayout(
+        starting_stl.device_size, dim_map, starting_stl.device_dtype
+    )
+
+
+def propagate_view_stl(
+    view_op_list: list, starting_stl: SpyreTensorLayout
+) -> SpyreTensorLayout:
+    new_stl = starting_stl
+    for view_op_info in view_op_list:
+        if view_op_info["type"] == "permute":
+            new_stl = compute_permute_stl(view_op_info["dims"], new_stl)
+        elif view_op_info["type"] == "transpose":
+            new_stl = compute_transpose_stl(
+                view_op_info["dim0"], view_op_info["dim1"], new_stl
+            )
+        elif view_op_info["type"] == "view":
+            new_stl = compute_view_layout(
+                view_op_info["old_sizes"], view_op_info["new_sizes"], new_stl
+            )
+        elif view_op_info["type"] == "squeeze":
+            new_stl = compute_view_layout(
+                view_op_info["old_sizes"], view_op_info["new_sizes"], new_stl
+            )
+        elif view_op_info["type"] == "unsqueeze":
+            new_stl = compute_view_layout(
+                view_op_info["old_sizes"], view_op_info["new_sizes"], new_stl
+            )
+        else:
+            raise Unsupported("This view op is not supported in stickification yet")
+    return new_stl
 
 
 def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
@@ -39,6 +115,18 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
             layout = buf.get_layout()
             if not isinstance(layout, FixedTiledLayout):
                 raise RuntimeError(f"{buf} does not have FixedTiledLayout")
+
+            # TODO: Add check that the index matches the final
+            # layout in the views to ensure it's the right tree
+            if arg.name in partial_view_info:
+                # Apply all the views in order to obtain the final STL for the FTL
+                new_stl = propagate_view_stl(
+                    partial_view_info[arg.name], layout.device_layout
+                )
+                layout.device_layout = new_stl
+                print("Updated layout")
+            print(f"Final layout {layout.device_layout}")
+
             res.append(SchedNodeArg(arg, layout))
     return res
 

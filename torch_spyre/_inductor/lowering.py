@@ -15,17 +15,19 @@
 
 from contextlib import contextmanager
 
+import sympy
 import torch
 
-from torch._inductor.ir import Reduction, Pointwise
+from torch._inductor.ir import Reduction, Pointwise, TensorBox
 import torch._inductor.lowering as lowering
 
-from typing import Any, Callable, Union
+from typing import Any, Callable, Sequence, Union
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction
+from .pass_utils import partial_view_info
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 import threading
@@ -61,7 +63,6 @@ def register_spyre_lowering(
         type_promotion_kind=type_promotion_kind,
         override_return_dtype=override_return_dtype,
     )
-
     return lowering.register_lowering(
         op,
         broadcast=broadcast,
@@ -529,3 +530,80 @@ def lower_clamp(x, min=None, max=None):
     )
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(torch.ops.aten._unsafe_view.default, type_promotion_kind=None)
+@register_spyre_lowering(torch.ops.aten.view.default, type_promotion_kind=None)
+@register_spyre_lowering(torch.ops.aten.reshape.default, type_promotion_kind=None)
+def view(x: TensorBox, sizes: Sequence[sympy.Expr]) -> TensorBox:
+    from torch._inductor.lowering import view as view_lowering
+
+    tbox = view_lowering(x, sizes)
+    if tbox.get_name() not in partial_view_info:
+        partial_view_info[tbox.get_name()] = []
+    partial_view_info[tbox.get_name()].append(
+        {
+            "type": "view",
+            "old_sizes": x.get_layout().size,
+            "new_sizes": sizes,
+            "new_layout": tbox.get_layout(),
+        }
+    )
+    print(f"Successfully intervened view! {tbox} {partial_view_info}")
+    return tbox
+
+
+@register_spyre_lowering(torch.ops.aten.permute.default, type_promotion_kind=None)
+def permute(x, dims):
+    from torch._inductor.lowering import permute as permute_lowering
+
+    tbox = permute_lowering(x, dims)
+    if tbox.get_name() not in partial_view_info:
+        partial_view_info[tbox.get_name()] = []
+    partial_view_info[tbox.get_name()].append(
+        {
+            "type": "permute",
+            "dims": dims,
+            "new_layout": tbox.get_layout(),
+        }
+    )
+    print(f"Successfully intervened permute! {tbox} {partial_view_info}")
+    return tbox
+
+
+@register_spyre_lowering(torch.ops.aten.squeeze, type_promotion_kind=None)
+def squeeze(x, dim=None):
+    from torch._inductor.lowering import squeeze as squeeze_lowering
+
+    tbox = squeeze_lowering(x, dim)
+    if tbox.get_name() not in partial_view_info:
+        partial_view_info[tbox.get_name()] = []
+    partial_view_info[tbox.get_name()].append(
+        {
+            "type": "squeeze",
+            "old_sizes": x.get_layout().size,
+            "new_sizes": tbox.get_layout().size,
+            "new_layout": tbox.get_layout(),
+        }
+    )
+    print(f"Successfully intervened squeeze! {tbox} {partial_view_info}")
+    return tbox
+
+
+@register_spyre_lowering(torch.ops.aten.unsqueeze, type_promotion_kind=None)
+def unsqueeze(x, dim):
+    from torch._inductor.lowering import unsqueeze as unsqueeze_lowering
+
+    tbox = unsqueeze_lowering(x, dim)
+    if tbox.get_name() not in partial_view_info:
+        partial_view_info[tbox.get_name()] = []
+    partial_view_info[tbox.get_name()].append(
+        {
+            "type": "unsqueeze",
+            "old_sizes": x.get_layout().size,
+            "new_sizes": tbox.get_layout().size,
+            "new_layout": tbox.get_layout(),
+        }
+    )
+    print(f"Successfully intervened unsqueeze! {tbox} {partial_view_info}")
+    return tbox

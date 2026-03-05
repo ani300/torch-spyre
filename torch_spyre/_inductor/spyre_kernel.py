@@ -42,7 +42,12 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import map_dims_to_vars, wildcard_symbol
+from .pass_utils import (
+    map_dims_to_vars,
+    propagate_view_stl,
+    wildcard_symbol,
+    partial_view_info,
+)
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
 import logging
@@ -408,6 +413,16 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}"
             )
 
+        # TODO: Add check that the index matches the final
+        # layout in the views to ensure it's the right tree
+        if name in partial_view_info:
+            # Apply all the views in order to obtain the final STL for the FTL
+            new_stl = propagate_view_stl(partial_view_info[name], layout.device_layout)
+            layout.device_layout = new_stl
+            print("Updated layout in kernel load")
+
+        print(f"Load debug: {index} {layout} {self.current_node.node.origins}")
+
         return TensorAccess(name, index, layout).unsqueeze_if_sparse()
 
     def store(
@@ -422,6 +437,13 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
+        # TODO: Add check that the index matches the final
+        # layout in the views to ensure it's the right tree
+        if name in partial_view_info:
+            # Apply all the views in order to obtain the final STL for the FTL
+            new_stl = propagate_view_stl(partial_view_info[name], layout.device_layout)
+            layout.device_layout = new_stl
+            print("Updated layout in kernel store")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout).unsqueeze_if_sparse()
         actuals = self.args.python_argdefs()[1]
@@ -543,6 +565,13 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
+        # TODO: Add check that the index matches the final
+        # layout in the views to ensure it's the right tree
+        if name in partial_view_info:
+            # Apply all the views in order to obtain the final STL for the FTL
+            new_stl = propagate_view_stl(partial_view_info[name], layout.device_layout)
+            layout.device_layout = new_stl
+            print("Updated layout in kernel store_reduction")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)

@@ -13,7 +13,12 @@
 # limitations under the License.
 
 import torch
-from torch_spyre._C import SpyreTensorLayout, as_strided_with_layout
+from torch_spyre._C import (
+    SpyreTensorLayout,
+    as_strided_with_layout,
+    compute_view_layout,
+)
+from torch_spyre._inductor.pass_utils import compute_permute_stl, compute_transpose_stl
 import torch_spyre.fallbacks  # noqa: F401
 
 
@@ -35,27 +40,6 @@ def spyre__mm_out(
 ) -> torch.Tensor:
     compiled_mm = torch.compile(torch.mm, dynamic=False)
     return compiled_mm(self, mat2, out=out)
-
-
-@torch.library.register_kernel("aten::linear", ["spyre"])
-def spyre__linear(
-    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
-) -> torch.Tensor:
-    def _linear(input, weight, bias):
-        weight = weight.transpose(-1, -2).contiguous()
-        while weight.dim() < input.dim():
-            weight = torch.unsqueeze(weight, 0)
-        out = input @ weight
-        if bias:
-            out += bias
-        return out
-
-    # Prevents double tracing
-    if not torch.compiler.is_compiling():
-        compiled_linear = torch.compile(_linear, dynamic=False)
-    else:
-        compiled_linear = _linear
-    return compiled_linear(input, weight, bias)
 
 
 @torch.library.register_kernel("aten::addmm", ["spyre"])  # type:ignore
@@ -108,16 +92,7 @@ def spyre__permute(self: torch.Tensor, dims: list[int]) -> torch.Tensor:
 
     prev_stl: SpyreTensorLayout = self.device_tensor_layout()  # type:ignore
     assert isinstance(prev_stl, SpyreTensorLayout)
-    inv_perm = [0] * ndims
-    for new_pos, old_pos in enumerate(dims):
-        inv_perm[old_pos] = new_pos
-
-    new_dim_map = [inv_perm[dim] for dim in prev_stl.dim_map]
-
-    new_stl = SpyreTensorLayout(
-        prev_stl.device_size, new_dim_map, prev_stl.device_dtype
-    )
-
+    new_stl = compute_permute_stl(dims, prev_stl)
     result = as_strided_with_layout(
         self, tuple(new_sizes), tuple(new_strides), self.storage_offset(), new_stl
     )
@@ -140,14 +115,7 @@ def spyre__transpose_int(self: torch.Tensor, dim0: int, dim1: int) -> torch.Tens
     strides[dim0], strides[dim1] = strides[dim1], strides[dim0]
     prev_stl: SpyreTensorLayout = self.device_tensor_layout()  # type:ignore
     assert isinstance(prev_stl, SpyreTensorLayout)
-    dim_map = prev_stl.dim_map
-    for idx, dim in enumerate(dim_map):
-        if dim == dim0:
-            dim_map[idx] = dim1
-        elif dim == dim1:
-            dim_map[idx] = dim0
-    new_stl = SpyreTensorLayout(prev_stl.device_size, dim_map, prev_stl.device_dtype)
-
+    new_stl = compute_transpose_stl(dim0, dim1, prev_stl)
     result = as_strided_with_layout(
         self, tuple(sizes), tuple(strides), self.storage_offset(), new_stl
     )
@@ -181,9 +149,7 @@ def infer_squeeze_geometry(
             sizes.append(tensor.size(idx))
             strides.append(tensor.stride(idx))
 
-    new_stl = torch_spyre._C.compute_view_layout(
-        tensor.size(), torch.Size(sizes), current_stl
-    )
+    new_stl = compute_view_layout(tensor.size(), torch.Size(sizes), current_stl)
 
     return tuple(sizes), tuple(strides), new_stl
 
@@ -238,9 +204,7 @@ def infer_unsqueeze_geometry(
     if stick_dim is None:
         raise ValueError("Unsqueezing of sparse tensors not implemented")
 
-    new_stl = torch_spyre._C.compute_view_layout(
-        tensor.size(), torch.Size(sizes), current_stl
-    )
+    new_stl = compute_view_layout(tensor.size(), torch.Size(sizes), current_stl)
 
     return tuple(sizes), tuple(strides), new_stl
 
