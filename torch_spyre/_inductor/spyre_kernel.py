@@ -46,7 +46,6 @@ from .pass_utils import (
     map_dims_to_vars,
     propagate_view_stl,
     wildcard_symbol,
-    partial_view_info,
 )
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
@@ -415,9 +414,14 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
 
         # TODO: Add check that the index matches the final
         # layout in the views to ensure it's the right tree
-        if name in partial_view_info:
+        if (
+            getattr(V.graph, "partial_view_info", None)
+            and name in V.graph.partial_view_info
+        ):
             # Apply all the views in order to obtain the final STL for the FTL
-            new_stl = propagate_view_stl(partial_view_info[name], layout.device_layout)
+            new_stl = propagate_view_stl(
+                V.graph.partial_view_info[name], layout.device_layout
+            )
             layout.device_layout = new_stl
             print("Updated layout in kernel load")
 
@@ -439,9 +443,14 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         # TODO: Add check that the index matches the final
         # layout in the views to ensure it's the right tree
-        if name in partial_view_info:
+        if (
+            getattr(V.graph, "partial_view_info", None)
+            and name in V.graph.partial_view_info
+        ):
             # Apply all the views in order to obtain the final STL for the FTL
-            new_stl = propagate_view_stl(partial_view_info[name], layout.device_layout)
+            new_stl = propagate_view_stl(
+                V.graph.partial_view_info[name], layout.device_layout
+            )
             layout.device_layout = new_stl
             print("Updated layout in kernel store")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
@@ -567,9 +576,14 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         # TODO: Add check that the index matches the final
         # layout in the views to ensure it's the right tree
-        if name in partial_view_info:
+        if (
+            getattr(V.graph, "partial_view_info", None)
+            and name in V.graph.partial_view_info
+        ):
             # Apply all the views in order to obtain the final STL for the FTL
-            new_stl = propagate_view_stl(partial_view_info[name], layout.device_layout)
+            new_stl = propagate_view_stl(
+                V.graph.partial_view_info[name], layout.device_layout
+            )
             layout.device_layout = new_stl
             print("Updated layout in kernel store_reduction")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)

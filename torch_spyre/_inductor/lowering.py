@@ -27,7 +27,6 @@ from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction
-from .pass_utils import partial_view_info
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 import threading
@@ -539,9 +538,11 @@ def view(x: TensorBox, sizes: Sequence[sympy.Expr]) -> TensorBox:
     from torch._inductor.lowering import view as view_lowering
 
     tbox = view_lowering(x, sizes)
-    if tbox.get_name() not in partial_view_info:
-        partial_view_info[tbox.get_name()] = []
-    partial_view_info[tbox.get_name()].append(
+    if getattr(V.graph, "partial_view_info", None) is None:
+        V.graph.partial_view_info = {}
+    if tbox.get_name() not in V.graph.partial_view_info:
+        V.graph.partial_view_info[tbox.get_name()] = []
+    V.graph.partial_view_info[tbox.get_name()].append(
         {
             "type": "view",
             "old_sizes": x.get_layout().size,
@@ -549,7 +550,7 @@ def view(x: TensorBox, sizes: Sequence[sympy.Expr]) -> TensorBox:
             "new_layout": tbox.get_layout(),
         }
     )
-    print(f"Successfully intervened view! {tbox} {partial_view_info}")
+    print(f"Successfully intervened view! {tbox} {V.graph.partial_view_info}")
     return tbox
 
 
@@ -558,16 +559,18 @@ def permute(x, dims):
     from torch._inductor.lowering import permute as permute_lowering
 
     tbox = permute_lowering(x, dims)
-    if tbox.get_name() not in partial_view_info:
-        partial_view_info[tbox.get_name()] = []
-    partial_view_info[tbox.get_name()].append(
+    if getattr(V.graph, "partial_view_info", None) is None:
+        V.graph.partial_view_info = {}
+    if tbox.get_name() not in V.graph.partial_view_info:
+        V.graph.partial_view_info[tbox.get_name()] = []
+    V.graph.partial_view_info[tbox.get_name()].append(
         {
             "type": "permute",
             "dims": dims,
             "new_layout": tbox.get_layout(),
         }
     )
-    print(f"Successfully intervened permute! {tbox} {partial_view_info}")
+    print(f"Successfully intervened permute! {tbox} {V.graph.partial_view_info}")
     return tbox
 
 
@@ -576,9 +579,11 @@ def squeeze(x, dim=None):
     from torch._inductor.lowering import squeeze as squeeze_lowering
 
     tbox = squeeze_lowering(x, dim)
-    if tbox.get_name() not in partial_view_info:
-        partial_view_info[tbox.get_name()] = []
-    partial_view_info[tbox.get_name()].append(
+    if getattr(V.graph, "partial_view_info", None) is None:
+        V.graph.partial_view_info = {}
+    if tbox.get_name() not in V.graph.partial_view_info:
+        V.graph.partial_view_info[tbox.get_name()] = []
+    V.graph.partial_view_info[tbox.get_name()].append(
         {
             "type": "squeeze",
             "old_sizes": x.get_layout().size,
@@ -586,7 +591,7 @@ def squeeze(x, dim=None):
             "new_layout": tbox.get_layout(),
         }
     )
-    print(f"Successfully intervened squeeze! {tbox} {partial_view_info}")
+    print(f"Successfully intervened squeeze! {tbox} {V.graph.partial_view_info}")
     return tbox
 
 
@@ -595,9 +600,11 @@ def unsqueeze(x, dim):
     from torch._inductor.lowering import unsqueeze as unsqueeze_lowering
 
     tbox = unsqueeze_lowering(x, dim)
-    if tbox.get_name() not in partial_view_info:
-        partial_view_info[tbox.get_name()] = []
-    partial_view_info[tbox.get_name()].append(
+    if getattr(V.graph, "partial_view_info", None) is None:
+        V.graph.partial_view_info = {}
+    if tbox.get_name() not in V.graph.partial_view_info:
+        V.graph.partial_view_info[tbox.get_name()] = []
+    V.graph.partial_view_info[tbox.get_name()].append(
         {
             "type": "unsqueeze",
             "old_sizes": x.get_layout().size,
@@ -605,5 +612,5 @@ def unsqueeze(x, dim):
             "new_layout": tbox.get_layout(),
         }
     )
-    print(f"Successfully intervened unsqueeze! {tbox} {partial_view_info}")
+    print(f"Successfully intervened unsqueeze! {tbox} {V.graph.partial_view_info}")
     return tbox

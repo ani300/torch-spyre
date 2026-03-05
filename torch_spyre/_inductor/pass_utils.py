@@ -29,21 +29,6 @@ from torch_spyre._inductor.errors import Unsupported
 from .ir import FixedTiledLayout
 
 
-# This dictionary contains the history of the view ops originating from a realized buffer
-# This is used to compute the device layouts for op layout propagation and also for
-# OpSpec generation later on.
-
-# The list of view op infos will contain a dictionary with info for each view.
-# For example, for a permute view op:
-# {
-#   "type": "permute",
-#   "dims": [3, 1, 2, 0],
-#   "new_layout": TensorBox.get_layout()
-# }
-# With this information, we can compute the new STL from a starting STL
-partial_view_info: dict[str, list] = {}
-
-
 class SchedNodeArg(NamedTuple):
     dep: MemoryDep
     layout: FixedTiledLayout
@@ -79,6 +64,20 @@ def compute_transpose_stl(
     )
 
 
+# This partial_view_info dict contains the history of the view ops originating
+# from a realized buffer for a specific compilation
+# This is used to compute the device layouts for op layout propagation and also for
+# OpSpec generation later on.
+
+
+# The list of view op infos will contain a dictionary with info for each view.
+# For example, for a permute view op:
+# {
+#   "type": "permute",
+#   "dims": [3, 1, 2, 0],
+#   "new_layout": TensorBox.get_layout()
+# }
+# With this information, we can compute the new STL from a starting STL
 def propagate_view_stl(
     view_op_list: list, starting_stl: SpyreTensorLayout
 ) -> SpyreTensorLayout:
@@ -91,17 +90,17 @@ def propagate_view_stl(
                 view_op_info["dim0"], view_op_info["dim1"], new_stl
             )
         elif view_op_info["type"] == "view":
-            new_stl = compute_view_layout(
-                view_op_info["old_sizes"], view_op_info["new_sizes"], new_stl
-            )
+            old_sizes = tuple([int(s) for s in view_op_info["old_sizes"]])
+            new_sizes = tuple([int(s) for s in view_op_info["new_sizes"]])
+            new_stl = compute_view_layout(old_sizes, new_sizes, new_stl)
         elif view_op_info["type"] == "squeeze":
-            new_stl = compute_view_layout(
-                view_op_info["old_sizes"], view_op_info["new_sizes"], new_stl
-            )
+            old_sizes = tuple([int(s) for s in view_op_info["old_sizes"]])
+            new_sizes = tuple([int(s) for s in view_op_info["new_sizes"]])
+            new_stl = compute_view_layout(old_sizes, new_sizes, new_stl)
         elif view_op_info["type"] == "unsqueeze":
-            new_stl = compute_view_layout(
-                view_op_info["old_sizes"], view_op_info["new_sizes"], new_stl
-            )
+            old_sizes = tuple([int(s) for s in view_op_info["old_sizes"]])
+            new_sizes = tuple([int(s) for s in view_op_info["new_sizes"]])
+            new_stl = compute_view_layout(old_sizes, new_sizes, new_stl)
         else:
             raise Unsupported("This view op is not supported in stickification yet")
     return new_stl
@@ -118,10 +117,13 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
 
             # TODO: Add check that the index matches the final
             # layout in the views to ensure it's the right tree
-            if arg.name in partial_view_info:
+            if (
+                getattr(V.graph, "partial_view_info", None)
+                and arg.name in V.graph.partial_view_info
+            ):
                 # Apply all the views in order to obtain the final STL for the FTL
                 new_stl = propagate_view_stl(
-                    partial_view_info[arg.name], layout.device_layout
+                    V.graph.partial_view_info[arg.name], layout.device_layout
                 )
                 layout.device_layout = new_stl
                 print("Updated layout")
