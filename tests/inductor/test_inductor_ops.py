@@ -880,6 +880,78 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
             },
         },
+        ("test_sdpa", "test_sdpa_cpu"): {
+            "param_sets": {
+                "mha_prefill": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    False,
+                    False,
+                ),
+                "mha_prefill_causal": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    True,
+                    False,
+                ),
+                # TODO(aviros): Implement expand
+                # "gqa_prefill": (
+                #     cached_randn(
+                #         (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 256, 8, 128), differentiation=2, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 256, 8, 128), differentiation=3, dtype=torch.float16
+                #     ),
+                #     False,
+                #     True,
+                # ),
+                # TODO(aviros): Implement broadcast for batch dim in batch matmul
+                # "mha_decode": (
+                #     cached_randn(
+                #         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 257, 32, 128), differentiation=2, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 257, 32, 128), differentiation=3, dtype=torch.float16
+                #     ),
+                #     False,
+                #     False,
+                # ),
+                # TODO(aviros): Implement broadcast for batch dim in batch matmul, expand
+                # "gqa_decode": (
+                #     cached_randn(
+                #         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 257, 8, 128), differentiation=2, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 257, 8, 128), differentiation=3, dtype=torch.float16
+                #     ),
+                #     False,
+                #     True,
+                # ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1087,7 +1159,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, x)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_sdpa_cpu(self, q, k, v, is_causal, enable_gqa):
+        def fn(q, k, v, is_causal, enable_gqa):
+            return torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=is_causal, enable_gqa=enable_gqa
+            )
+
+        compare_with_cpu(fn, q, k, v, is_causal, enable_gqa)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_implicit_loading(self):
         def test(end, device=None):
             return torch.arange(end, device=device, dtype=torch.float16)
