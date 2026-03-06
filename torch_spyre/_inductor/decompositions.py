@@ -362,3 +362,19 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
     else:
         zero = torch.zeros_like(input)
     return torch.eq(input, zero)
+
+
+@torch.ops.aten.linear.default.py_impl(torch._C.DispatchKey.CompositeImplicitAutograd)
+def linear_decomp(
+    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    if input.device.type == "spyre":
+        weight = weight.transpose(-1, -2).contiguous()
+        while weight.dim() < input.dim():
+            weight = torch.unsqueeze(weight, 0)
+        out = input @ weight
+        if bias:
+            out += bias
+        return out
+    kernel = torch.library.get_kernel("aten::linear", "CPU")
+    return kernel.call_boxed(torch._C._dispatch_keys(input), input, weight, bias)
