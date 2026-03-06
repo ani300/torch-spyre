@@ -47,7 +47,7 @@ from .pass_utils import (
     propagate_view_stl,
     wildcard_symbol,
 )
-from .stickify import is_sparse
+from .stickify import derive_dim_order, is_sparse
 from .logging_utils import get_inductor_logger
 import logging
 
@@ -525,6 +525,17 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
 
                     # TODO(aviros): Make this a fully fledged STCDP op
                     op = TRANSPOSE_OP
+                    rank = len(args[0].host_size)
+                    in_dim_order = derive_dim_order(args[0].device_layout, rank)
+                    out_dim_order = derive_dim_order(args[1].device_layout, rank)
+                    transpose_dims = [
+                        d
+                        for d in range(rank)
+                        if in_dim_order.index(d) != out_dim_order.index(d)
+                    ]
+                    assert len(transpose_dims) <= 2, (
+                        f"Only 1 transpose is supported: {transpose_dims}"
+                    )
                     generic_relayout = True
                 elif (
                     args[1].device_layout.device_size
@@ -547,8 +558,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
 
             # TODO(aviros): Remove this piece of code when real relayout is implemented
             if generic_relayout:
-                op_spec.iteration_space.reverse()
-                op_spec.op_info["transposed_dims"] = [0, 1]
+                op_spec.op_info["transposed_dims"] = transpose_dims
 
             self.op_specs.append(op_spec)
         else:
