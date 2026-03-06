@@ -418,11 +418,20 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             getattr(V.graph, "partial_view_info", None)
             and name in V.graph.partial_view_info
         ):
-            # Apply all the views in order to obtain the final STL for the FTL
+            # Apply all the views in order to obtain the final STL for the FTL.
+            # Create a new layout rather than mutating in-place, because the
+            # same buffer may be loaded by multiple kernels. Mutating would
+            # double-apply the view propagation on subsequent loads.
             new_stl = propagate_view_stl(
                 V.graph.partial_view_info[name], layout.device_layout
             )
-            layout.device_layout = new_stl
+            layout = FixedTiledLayout(
+                layout.device,
+                layout.dtype,
+                layout.size,
+                layout.stride,
+                new_stl,
+            )
             print("Updated layout in kernel load")
 
         return TensorAccess(name, index, layout).unsqueeze_if_sparse()
