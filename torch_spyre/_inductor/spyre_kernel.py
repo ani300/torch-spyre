@@ -425,8 +425,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             layout.device_layout = new_stl
             print("Updated layout in kernel load")
 
-        print(f"Load debug: {index} {layout} {self.current_node.node.origins}")
-
         return TensorAccess(name, index, layout).unsqueeze_if_sparse()
 
     def store(
@@ -443,16 +441,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         # TODO: Add check that the index matches the final
         # layout in the views to ensure it's the right tree
-        if (
-            getattr(V.graph, "partial_view_info", None)
-            and name in V.graph.partial_view_info
-        ):
-            # Apply all the views in order to obtain the final STL for the FTL
-            new_stl = propagate_view_stl(
-                V.graph.partial_view_info[name], layout.device_layout
-            )
-            layout.device_layout = new_stl
-            print("Updated layout in kernel store")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout).unsqueeze_if_sparse()
         actuals = self.args.python_argdefs()[1]
@@ -576,16 +564,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         # TODO: Add check that the index matches the final
         # layout in the views to ensure it's the right tree
-        if (
-            getattr(V.graph, "partial_view_info", None)
-            and name in V.graph.partial_view_info
-        ):
-            # Apply all the views in order to obtain the final STL for the FTL
-            new_stl = propagate_view_stl(
-                V.graph.partial_view_info[name], layout.device_layout
-            )
-            layout.device_layout = new_stl
-            print("Updated layout in kernel store_reduction")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)

@@ -203,8 +203,8 @@ def ensure_default_handler(op_name):
 
 @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
-    x = V.graph.get_buffer(x.realize())
-    y = V.graph.get_buffer(y.realize())
+    x.realize()
+    y.realize()
     x_loader = x.make_loader()
     y_loader = y.make_loader()
 
@@ -269,8 +269,8 @@ def lower_mm(x, y):
 
 @register_spyre_lowering(torch.ops.aten.bmm.default)
 def lower_bmm(x, y):
-    x = V.graph.get_buffer(x.realize())
-    y = V.graph.get_buffer(y.realize())
+    x.realize()
+    y.realize()
     x_loader = x.make_loader()
     y_loader = y.make_loader()
 
@@ -531,6 +531,31 @@ def lower_clamp(x, min=None, max=None):
     return pw
 
 
+@register_spyre_lowering(torch.ops.aten.clone.default, type_promotion_kind=None)
+def clone(x, *, memory_format=None):
+    from torch._inductor.ir import FlexibleLayout, get_stride_order
+    from torch._inductor.lowering import clone as clone_lowering
+
+    result = clone_lowering(x, memory_format=memory_format)
+    # Upstream Inductor ignores memory_format (TODO in clone lowering).
+    # The output gets a FlexibleLayout whose stride order is inferred from
+    # the input's strides via ComputedBuffer.get_fill_order(). When the
+    # input is a non-contiguous view (e.g. a permute), the clone output
+    # inherits those strides instead of the requested memory format.
+    # This causes index/stride mismatches during Spyre's stickify pass.
+    # Fix: freeze the layout to the requested stride order so that
+    # decide_layout() respects the memory_format contract.
+    if memory_format is not None and memory_format != torch.preserve_format:
+        stride_order = get_stride_order(
+            FlexibleLayout.stride_ordered_for_memory_format(
+                result.get_size(), memory_format
+            )
+        )
+        result.realize()
+        result.freeze_layout_with_stride_order(stride_order)
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten._unsafe_view.default, type_promotion_kind=None)
 @register_spyre_lowering(torch.ops.aten.view.default, type_promotion_kind=None)
 @register_spyre_lowering(torch.ops.aten.reshape.default, type_promotion_kind=None)
@@ -550,7 +575,7 @@ def view(x: TensorBox, sizes: Sequence[sympy.Expr]) -> TensorBox:
             "new_layout": tbox.get_layout(),
         }
     )
-    print(f"Successfully intervened view! {tbox} {V.graph.partial_view_info}")
+    print(f"Successfully intervened view! {V.graph.partial_view_info}")
     return tbox
 
 
@@ -570,7 +595,7 @@ def permute(x, dims):
             "new_layout": tbox.get_layout(),
         }
     )
-    print(f"Successfully intervened permute! {tbox} {V.graph.partial_view_info}")
+    print(f"Successfully intervened permute! {V.graph.partial_view_info}")
     return tbox
 
 
@@ -591,7 +616,7 @@ def squeeze(x, dim=None):
             "new_layout": tbox.get_layout(),
         }
     )
-    print(f"Successfully intervened squeeze! {tbox} {V.graph.partial_view_info}")
+    print(f"Successfully intervened squeeze! {V.graph.partial_view_info}")
     return tbox
 
 
@@ -612,5 +637,5 @@ def unsqueeze(x, dim):
             "new_layout": tbox.get_layout(),
         }
     )
-    print(f"Successfully intervened unsqueeze! {tbox} {V.graph.partial_view_info}")
+    print(f"Successfully intervened unsqueeze! {V.graph.partial_view_info}")
     return tbox

@@ -121,11 +121,21 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
                 getattr(V.graph, "partial_view_info", None)
                 and arg.name in V.graph.partial_view_info
             ):
-                # Apply all the views in order to obtain the final STL for the FTL
+                # Apply all the views in order to obtain the final STL for the FTL.
+                # Create a new layout rather than mutating in-place, because
+                # get_mem_deps is called from multiple passes (stickify and
+                # core_division). Mutating would double-apply the view
+                # propagation on a subsequent call, corrupting dim_map.
                 new_stl = propagate_view_stl(
                     V.graph.partial_view_info[arg.name], layout.device_layout
                 )
-                layout.device_layout = new_stl
+                layout = FixedTiledLayout(
+                    layout.device,
+                    layout.dtype,
+                    layout.size,
+                    layout.stride,
+                    new_stl,
+                )
                 print("Updated layout")
             print(f"Final layout {layout.device_layout}")
 
