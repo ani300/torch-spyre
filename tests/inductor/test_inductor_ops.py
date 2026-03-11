@@ -133,7 +133,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             )
         },
-        ("test_mm", "test_binary_op"): {
+        ("test_mm", "test_mm_relaxed"): {
             "ops_dict": {
                 "mm": torch.mm,
                 # "einsum": lambda a, b: torch.einsum('mk, kn -> mn', a, b),  # bmm not supported yet
@@ -147,7 +147,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
-        ("test_bmm", "test_binary_op"): {
+        ("test_bmm", "test_mm_relaxed"): {
             "ops_dict": {"bmm": torch.bmm},
             "param_sets": make_param_dict(
                 [
@@ -916,9 +916,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         if a.dtype == torch.float32:
             compare_with_cpu(op, a, b)
-        elif op == torch.bmm:
-            compare(op, a, b)
         else:
+            compare(op, a, b)
+
+    # Increased mm test tolerance for splitk
+    def test_mm_relaxed(self, op, a, b):
+        K = b.shape[-2]
+        if K >= (128 // b.element_size()):  # multiple sticks
+            compare(op, a, b, atol=0.1, rtol=0.1)
+        else:  # single stick, no need to relax
             compare(op, a, b)
 
     def test_binary_op_cpu(self, op, x, y):
