@@ -18,13 +18,13 @@ from sympy import Expr, Symbol
 
 import sympy
 from torch._inductor.ir import FixedLayout
+from torch._inductor.dependencies import index_vars_no_squeeze
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import SpyreTensorLayout, compute_view_layout
-from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._C import SpyreTensorLayout
 
 from .ir import FixedTiledLayout
 
@@ -34,76 +34,176 @@ class SchedNodeArg(NamedTuple):
     layout: FixedTiledLayout
 
 
-def compute_permute_stl(
-    dims: list, starting_stl: SpyreTensorLayout
-) -> SpyreTensorLayout:
-    ndims = len(dims)
+def _compute_device_layout(
+    size: list[int],
+    stride: list[int],
+    device_size: list[int],
+    dim_map: list[int],
+    ranges: list[int],
+    steps: list[int],
+) -> tuple[list[int], list[int], list[tuple[int, int]]]:
+    """Core algorithm for computing a new device layout from indexing info.
 
-    inv_perm = [0] * ndims
-    for new_pos, old_pos in enumerate(dims):
-        inv_perm[old_pos] = new_pos
+    Given the host tensor's size/stride, its device layout (device_size/dim_map),
+    and the iteration ranges and per-variable steps of an indexing expression,
+    compute (fixed_device_size, fixed_dim_map) for the viewed tensor.
 
-    new_dim_map = [inv_perm[dim] for dim in starting_stl.dim_map]
+    Args:
+        size: Host tensor sizes.
+        stride: Host tensor strides.
+        device_size: Device dimension sizes from SpyreTensorLayout.
+        dim_map: Device-to-host dimension mapping from SpyreTensorLayout.
+        ranges: Iteration range for each variable.
+        steps: Stride (coefficient) for each variable in the index expression.
 
-    return SpyreTensorLayout(
-        starting_stl.device_size, new_dim_map, starting_stl.device_dtype
-    )
+    Returns:
+        (fixed_device_size, fixed_dim_map) for the new SpyreTensorLayout.
+    """
+    # Stage 1: compute split
+    # split[i] is the stride of device dim i w.r.t. host dim dim_map[i]
+    s = [1] * len(size)
+    split = [0] * len(dim_map)
+    for i in range(len(dim_map) - 1, -1, -1):
+        j = dim_map[i]
+        split[i] = s[j]
+        s[j] *= device_size[i]
+
+    # Stage 2: compute it_host_dim_map
+    # For each var, find which host dimensions it indexes into
+    num_vars = len(ranges)
+    it_host_dim_map: list[list[tuple[int, int, int]]] = [
+        [] for _ in range(num_vars)  # type: ignore[list-item]
+    ]
+    for i in range(num_vars):
+        step = steps[i]
+        if step == 0 or ranges[i] == 1:
+            continue  # var does not occur in indexer or has range 1
+        it_host_dim_map[i] = [()]  # expect at least one match
+        limit = step * ranges[i]
+        max_stride_below = 0
+        for j in range(len(size)):
+            if size[j] == 1:
+                continue
+            sj = stride[j]
+            if sj > step and sj < limit:
+                it_host_dim_map[i].append((j, 1, sj // step))
+            elif sj <= step and sj > max_stride_below:
+                max_stride_below = sj
+                it_host_dim_map[i][0] = (j, step // max_stride_below, 1)
+
+    # Stage 3: compute it_device_dim_map
+    # For each var's host dim mappings, find corresponding device dimensions
+    it_device_dim_map: list[list[tuple[int, int, int]]] = [[] for _ in range(num_vars)]
+    for i in range(num_vars):
+        for entry in it_host_dim_map[i]:
+            if not entry:
+                continue
+            j, num, den = entry
+            for k in range(len(dim_map)):
+                if j != dim_map[k]:
+                    continue  # device dim k does not map to host dim j
+                if (
+                    ranges[i] * num // den > split[k]
+                    and num // den < split[k] * device_size[k]
+                ):
+                    if num // den // split[k] > 0:
+                        it_device_dim_map[i].append((k, num // den // split[k], 1))
+                    else:
+                        it_device_dim_map[i].append((k, 1, split[k] * den // num))
+
+    # Stage 4: fix device layout
+    # Collect indexing contributions per device dim, sort by stride (desc),
+    # then split device dims with multiple contributors
+    
+    # order indexing terms for each coordinate in decreasing stride order
+    terms: list[list[tuple[int, int, int | None, int | None]]] = [[] for _ in range(len(device_size))]
+    for i in range(len(device_size)):
+        if device_size[i] == 1:
+            terms[i].append((1, i, None, None))
+            continue
+        for k in range(len(it_device_dim_map)):
+            for j, num, den in it_device_dim_map[k]:
+                if j != i:
+                    continue
+                terms[i].append((num, j, den, k))
+        terms[i].sort()
+        terms[i].reverse()
+
+    # split device dimensions with multiple indexing terms into
+    fixed_device_size: list[int] = []
+    fixed_dim_map: list[int] = []
+    fixed_it_device_dim_map = []
+    for i in range(len(terms)):
+        current = 1
+        for num, j, den, k in terms[i]:
+            fixed_device_size.append(device_size[i] // num // current)
+            current *= device_size[i] // num
+            fixed_dim_map.append(dim_map[i])
+            fixed_it_device_dim_map.append((dim_map[k], den))
+
+    return fixed_device_size, fixed_dim_map, fixed_it_device_dim_map
 
 
-def compute_transpose_stl(
-    dim0: int, dim1: int, starting_stl: SpyreTensorLayout
-) -> SpyreTensorLayout:
-    dim_map = starting_stl.dim_map
-    for idx, dim in enumerate(dim_map):
-        if dim == dim0:
-            dim_map[idx] = dim1
-        elif dim == dim1:
-            dim_map[idx] = dim0
-    return SpyreTensorLayout(
-        starting_stl.device_size, dim_map, starting_stl.device_dtype
-    )
-
-
-# This partial_view_info dict contains the history of the view ops originating
-# from a realized buffer for a specific compilation
-# This is used to compute the device layouts for op layout propagation and also for
-# OpSpec generation later on.
-
-
-# The list of view op infos will contain a dictionary with info for each view.
-# For example, for a permute view op:
-# {
-#   "type": "permute",
-#   "dims": [3, 1, 2, 0],
-#   "new_layout": TensorBox.get_layout()
-# }
-# With this information, we can compute the new STL from a starting STL
 def propagate_view_stl(
-    view_op_list: list, starting_stl: SpyreTensorLayout
+    stl: SpyreTensorLayout,
+    host_size: list[int],
+    host_stride: list[int],
+    new_size: list[int],
+    new_stride: list[int],
 ) -> SpyreTensorLayout:
-    new_stl = starting_stl
-    for view_op_info in view_op_list:
-        if view_op_info["type"] == "permute":
-            new_stl = compute_permute_stl(view_op_info["dims"], new_stl)
-        elif view_op_info["type"] == "transpose":
-            new_stl = compute_transpose_stl(
-                view_op_info["dim0"], view_op_info["dim1"], new_stl
-            )
-        elif view_op_info["type"] == "view":
-            old_sizes = tuple([int(s) for s in view_op_info["old_sizes"]])
-            new_sizes = tuple([int(s) for s in view_op_info["new_sizes"]])
-            new_stl = compute_view_layout(old_sizes, new_sizes, new_stl)
-        elif view_op_info["type"] == "squeeze":
-            old_sizes = tuple([int(s) for s in view_op_info["old_sizes"]])
-            new_sizes = tuple([int(s) for s in view_op_info["new_sizes"]])
-            new_stl = compute_view_layout(old_sizes, new_sizes, new_stl)
-        elif view_op_info["type"] == "unsqueeze":
-            old_sizes = tuple([int(s) for s in view_op_info["old_sizes"]])
-            new_sizes = tuple([int(s) for s in view_op_info["new_sizes"]])
-            new_stl = compute_view_layout(old_sizes, new_sizes, new_stl)
-        else:
-            raise Unsupported("This view op is not supported in stickification yet")
-    return new_stl
+    """Compute a new SpyreTensorLayout from concrete host sizes and strides.
+
+    This is used for eager-mode view operations (permute, transpose, etc.)
+    where the new sizes and strides are known directly.
+    """
+    fixed_device_size, fixed_dim_map, fixed_it_device_dim_map = _compute_device_layout(
+        host_size,
+        host_stride,
+        stl.device_size,
+        stl.dim_map,
+        new_size,
+        new_stride,
+    )
+    print(fixed_device_size, fixed_dim_map, fixed_it_device_dim_map)
+    return SpyreTensorLayout(
+        fixed_device_size,
+        [dm[0] for dm in fixed_it_device_dim_map],
+        stl.device_dtype,
+    )
+
+
+def propagate_view_ftl(
+    buffer_layout: FixedTiledLayout,
+    var_ranges: dict[sympy.Expr, sympy.Expr],
+    index: sympy.Expr,
+) -> FixedTiledLayout:
+    """Compute a new FixedTiledLayout by analyzing a sympy index expression."""
+    stl = buffer_layout.device_layout
+    size = [int(s) for s in buffer_layout.size]
+    stride = [int(s) for s in buffer_layout.stride]
+
+    vars_list = sorted(index.free_symbols, key=lambda s: s.name)
+    ranges = [int(var_ranges[v]) for v in vars_list]
+    steps = [int(index.subs(v, 1) - index.subs(v, 0)) for v in vars_list]
+    print(
+        f"index: {index}, var_ranges: {var_ranges}, vars_list: {vars_list}, host size: {size}, host stride: {stride}, ranges: {ranges}, steps: {steps}"
+    )
+
+    new_stl = propagate_view_stl(
+        stl,
+        size,
+        stride,
+        ranges,
+        steps,
+    )
+
+    return FixedTiledLayout(
+        buffer_layout.device,
+        buffer_layout.dtype,
+        buffer_layout.size,
+        buffer_layout.stride,
+        new_stl,
+    )
 
 
 def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
@@ -111,35 +211,19 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     for arg in n.read_writes.reads:
         if isinstance(arg, MemoryDep):
             buf = V.graph.get_buffer(arg.name)
-            layout = buf.get_layout()
-            if not isinstance(layout, FixedTiledLayout):
+            buffer_layout = buf.get_layout()
+
+            if not isinstance(buffer_layout, FixedTiledLayout):
                 raise RuntimeError(f"{buf} does not have FixedTiledLayout")
 
-            # TODO: Add check that the index matches the final
-            # layout in the views to ensure it's the right tree
-            if (
-                getattr(V.graph, "partial_view_info", None)
-                and arg.name in V.graph.partial_view_info
-            ):
-                # Apply all the views in order to obtain the final STL for the FTL.
-                # Create a new layout rather than mutating in-place, because
-                # get_mem_deps is called from multiple passes (stickify and
-                # core_division). Mutating would double-apply the view
-                # propagation on a subsequent call, corrupting dim_map.
-                new_stl = propagate_view_stl(
-                    V.graph.partial_view_info[arg.name], layout.device_layout
-                )
-                layout = FixedTiledLayout(
-                    layout.device,
-                    layout.dtype,
-                    layout.size,
-                    layout.stride,
-                    new_stl,
-                )
-                print("Updated layout")
-            print(f"Final layout {layout.device_layout}")
+            _, var_ranges = index_vars_no_squeeze(*n._sizes, prefix="c")
 
-            res.append(SchedNodeArg(arg, layout))
+            print(f"Stickify {n.get_name()} {arg} {var_ranges}")
+            arg_layout = propagate_view_ftl(buffer_layout, var_ranges, arg.index)
+            print(f"Buffer layout {buffer_layout.device_layout}")
+            print(f"Arg layout {arg_layout.device_layout}")
+
+            res.append(SchedNodeArg(arg, arg_layout))
     return res
 
 

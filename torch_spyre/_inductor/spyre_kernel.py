@@ -44,7 +44,7 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import (
     map_dims_to_vars,
-    propagate_view_stl,
+    propagate_view_ftl,
     wildcard_symbol,
 )
 from .stickify import derive_dim_order, is_sparse
@@ -418,27 +418,13 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}"
             )
 
-        # TODO: Add check that the index matches the final
-        # layout in the views to ensure it's the right tree
-        if (
-            getattr(V.graph, "partial_view_info", None)
-            and name in V.graph.partial_view_info
-        ):
-            # Apply all the views in order to obtain the final STL for the FTL.
-            # Create a new layout rather than mutating in-place, because the
-            # same buffer may be loaded by multiple kernels. Mutating would
-            # double-apply the view propagation on subsequent loads.
-            new_stl = propagate_view_stl(
-                V.graph.partial_view_info[name], layout.device_layout
-            )
-            layout = FixedTiledLayout(
-                layout.device,
-                layout.dtype,
-                layout.size,
-                layout.stride,
-                new_stl,
-            )
-            print("Updated layout in kernel load")
+        # Use the index expression to propagate the device layout
+        # through any view operations. Create a new layout rather than
+        # mutating in-place, because the same buffer may be loaded by
+        # multiple kernels.
+        var_ranges = self.var_ranges()
+        if var_ranges:
+            layout = propagate_view_ftl(layout, var_ranges, index)
 
         return TensorAccess(name, index, layout).unsqueeze_if_sparse()
 
@@ -454,8 +440,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
-        # TODO: Add check that the index matches the final
-        # layout in the views to ensure it's the right tree
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout).unsqueeze_if_sparse()
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)

@@ -18,7 +18,7 @@ from torch_spyre._C import (
     as_strided_with_layout,
     compute_view_layout,
 )
-from torch_spyre._inductor.pass_utils import compute_permute_stl, compute_transpose_stl
+from torch_spyre._inductor.pass_utils import propagate_view_stl
 import torch_spyre.fallbacks  # noqa: F401
 
 
@@ -105,7 +105,13 @@ def spyre__permute(self: torch.Tensor, dims: list[int]) -> torch.Tensor:
 
     prev_stl: SpyreTensorLayout = self.device_tensor_layout()  # type:ignore
     assert isinstance(prev_stl, SpyreTensorLayout)
-    new_stl = compute_permute_stl(dims, prev_stl)
+    new_stl = propagate_view_stl(
+        prev_stl,
+        sizes,
+        strides,
+        new_sizes,
+        new_strides,
+    )
     result = as_strided_with_layout(
         self, tuple(new_sizes), tuple(new_strides), self.storage_offset(), new_stl
     )
@@ -128,7 +134,15 @@ def spyre__transpose_int(self: torch.Tensor, dim0: int, dim1: int) -> torch.Tens
     strides[dim0], strides[dim1] = strides[dim1], strides[dim0]
     prev_stl: SpyreTensorLayout = self.device_tensor_layout()  # type:ignore
     assert isinstance(prev_stl, SpyreTensorLayout)
-    new_stl = compute_transpose_stl(dim0, dim1, prev_stl)
+    old_sizes = list(self.shape)
+    old_strides = list(self.stride())
+    new_stl = propagate_view_stl(
+        prev_stl,
+        old_sizes,
+        old_strides,
+        sizes,
+        strides,
+    )
     result = as_strided_with_layout(
         self, tuple(sizes), tuple(strides), self.storage_offset(), new_stl
     )
