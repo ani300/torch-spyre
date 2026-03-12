@@ -417,14 +417,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}"
             )
 
-        # Use the index expression to propagate the device layout
-        # through any view operations. Create a new layout rather than
-        # mutating in-place, because the same buffer may be loaded by
-        # multiple kernels.
-        var_ranges = self.var_ranges()
-        if var_ranges:
-            layout = propagate_view_ftl(layout, var_ranges, index)
-
         return TensorAccess(name, index, layout).unsqueeze_if_sparse()
 
     def store(

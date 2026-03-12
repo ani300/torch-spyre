@@ -23,7 +23,6 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor.views import compute_coordinates, compute_device_coordinates
 
 from .ir import FixedTiledLayout
@@ -33,34 +32,6 @@ class SchedNodeArg(NamedTuple):
     dep: MemoryDep
     layout: FixedTiledLayout
     dev_coords: Sequence[sympy.Expr]
-
-
-def propagate_view_stl(
-    stl: SpyreTensorLayout,
-    host_size: list[int],
-    host_stride: list[int],
-    new_size: list[int],
-    new_stride: list[int],
-) -> SpyreTensorLayout:
-    """Compute a new SpyreTensorLayout from concrete host sizes and strides.
-
-    This is used for eager-mode view operations (permute, transpose, etc.)
-    where the new sizes and strides are known directly.
-    """
-    fixed_device_size, fixed_dim_map, fixed_it_device_dim_map = _compute_device_layout(
-        host_size,
-        host_stride,
-        stl.device_size,
-        stl.dim_map,
-        new_size,
-        new_stride,
-    )
-    print(fixed_device_size, fixed_dim_map, fixed_it_device_dim_map)
-    return SpyreTensorLayout(
-        fixed_device_size,
-        [dm[0] for dm in fixed_it_device_dim_map],
-        stl.device_dtype,
-    )
 
 
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
