@@ -45,7 +45,6 @@ from .ir import FixedTiledLayout
 from .pass_utils import (
     is_wildcard,
     map_dims_to_vars,
-    propagate_view_ftl,
     wildcard_symbol,
 )
 from .stickify import is_sparse
