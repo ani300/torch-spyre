@@ -32,7 +32,7 @@ from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import StoreMode, V
 
-from .runtime import ConstantArg, OpSpec, TensorArg
+from torch_spyre.execution import ConstantArg, OpSpec, TensorArg
 from .constants import (
     MATMUL_REDUCTION_OP,
     SPYRE_FP32_OPS,
@@ -43,11 +43,12 @@ from .constants import (
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import (
+    is_wildcard,
     map_dims_to_vars,
     propagate_view_ftl,
     wildcard_symbol,
 )
-from .stickify import derive_dim_order, is_sparse
+from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
 import logging
 
@@ -391,7 +392,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             is_input,
             -1,
             tensor.layout.dtype,
-            tensor.layout.size,
             scales,
             tensor.layout.allocation,
             tensor.layout.device_layout,
@@ -479,55 +479,31 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             # Reshapes, transposes, and other dataops
             in_di = self.derive_dim_info(value)
             out_di = self.derive_dim_info(dst)
+
             args = [
                 self.create_tensor_arg(True, value.name, value, in_di),
                 self.create_tensor_arg(False, real_dst_name, dst, out_di),
             ]
-            generic_relayout = False
+            in_stl = args[0].device_layout  # type: ignore[union-attr]
+            out_stl = args[1].device_layout  # type: ignore[union-attr]
             if isinstance(args[0], TensorArg) and isinstance(args[1], TensorArg):
                 # Determine data op based on tensor args
                 if (
-                    Counter(args[0].host_size) == Counter(args[1].host_size)
-                    and args[0].host_size != args[1].host_size
-                ):
-                    # Transpose: check that the input / output sizes are the same, but in different order.
-                    # Device sizes have the stick dimension split
+                    Counter(in_stl.dim_map) == Counter(out_stl.dim_map)
+                    and in_stl.device_size != out_stl.device_size
+                ) or (Counter(in_di) == Counter(out_di) and in_di != out_di):
+                    # Transpose:
+                    #   - check that the input / output DimensionInfo are the same, but in different order.
+                    #   - check that the dim map has the same dimensions (no duplicate dimensions), but device size differs.
                     op = TRANSPOSE_OP
-                elif Counter(in_di) == Counter(out_di) and in_di != out_di:
-                    # Transpose: check that the input / output DimensionInfo are the same, but in different order.
-                    op = TRANSPOSE_OP
-                elif (
-                    Counter(args[0].host_size) == Counter(args[1].host_size)
-                    and args[0].host_size == args[1].host_size
-                    and args[0].device_layout.device_size
-                    != args[1].device_layout.device_size
+                elif all(is_wildcard(d.var) for d in in_di) and not all(
+                    is_wildcard(d.var) for d in out_di
                 ):
-                    # This is the generic relayout case in Spyre, where the host sizes match
-                    # but the device sizes are different
-
-                    # When implementing torch.nn.Linear + relayout_linear_weights pass, we hit this case
-
-                    # When this happens, for now we do the op as a Transpose as we know that's the only
-                    # option we support
-
-                    # TODO(aviros): Make this a fully fledged STCDP op
-                    op = TRANSPOSE_OP
-                    rank = len(args[0].host_size)
-                    in_dim_order = derive_dim_order(args[0].device_layout, rank)
-                    out_dim_order = derive_dim_order(args[1].device_layout, rank)
-                    transpose_dims = [
-                        d
-                        for d in range(rank)
-                        if in_dim_order.index(d) != out_dim_order.index(d)
-                    ]
-                    assert len(transpose_dims) <= 2, (
-                        f"Only 1 transpose is supported: {transpose_dims}"
-                    )
-                    generic_relayout = True
-                elif (
-                    args[1].device_layout.device_size
-                    == args[0].device_layout.device_size
-                ):
+                    # Broadcast: scalar input (all dims wildcards) expanding to non-scalar output.
+                    op = CLONE_OP
+                    in_di = out_di
+                    args[0] = self.create_tensor_arg(True, value.name, value, in_di)
+                elif in_stl.device_size == out_stl.device_size:
                     # Clone: check that device layout is the same.
                     op = CLONE_OP
                 else:
@@ -540,13 +516,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             op_spec = create_op_spec(op, False, out_di, args, op_info)
             if in_di != out_di:
                 op_spec.op_info["transposed_dims"] = [
-                    d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
+                    d for d in range(len(in_di)) if in_di[d] != out_di[d]
                 ]
-
-            # TODO(aviros): Remove this piece of code when real relayout is implemented
-            if generic_relayout:
-                op_spec.op_info["transposed_dims"] = transpose_dims
-
             self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")

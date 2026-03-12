@@ -17,18 +17,15 @@ from typing import Any, Callable, Optional
 import sympy
 from torch import Tensor
 from torch._inductor import ir
-from torch._inductor.codegen.common import DeferredLine
 from torch._inductor.codegen.wrapper import (
     BufferLike,
     PythonWrapperCodegen,
     SubgraphPythonWrapperCodegen,
-    codegen_reinterpret_view_helper,
 )
 from torch._inductor.ir import GraphPartitionSignature
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
-from torch_spyre._C import compute_view_layout, SpyreTensorLayout
 from .pass_utils import propagate_view_stl
 from .stickify import FixedTiledLayout
 from .errors import Unsupported
@@ -60,8 +57,8 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         super().write_header()
         self.imports.splice(
             """
-                from torch_spyre._inductor.runtime import ConstantArg, TensorArg, OpSpec, UnimplementedOp
-                from torch_spyre._inductor.runtime.async_compile import SpyreAsyncCompile
+                from torch_spyre.execution import ConstantArg, TensorArg, OpSpec, UnimplementedOp
+                from torch_spyre.execution.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
                 import subprocess
             """,
@@ -127,11 +124,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             s = self.codegen_python_shape_tuple(tgt_size)
             st = self.codegen_python_shape_tuple(tgt_stride)
             off = self.codegen_sizevar(tgt_offset)
-            expr = (
-                f"as_strided_with_layout("
-                f"{name}, {s}, {st}, {off}, "
-                f"{tgt_stl!r})"
-            )
+            expr = f"as_strided_with_layout({name}, {s}, {st}, {off}, {tgt_stl!r})"
             if cast_dtype is not None and cast_dtype != base_dtype:
                 return f"aten.view.dtype({expr}, {cast_dtype})"
             return expr
@@ -153,11 +146,15 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             if dtype is not None and dtype != base_dtype:
                 return f"aten.view.dtype({name}, {dtype})"
             return f"{name}"
-        
-        # print(d_size, d_stride, size, stride)
-        stl = propagate_view_stl(d_stl, [int(s) for s in d_size], [int(s) for s in d_stride], size, stride)
 
-        return apply_spyre_reinterpret(name, size, stride, offset, stl, dtype, base_dtype)
+        # print(d_size, d_stride, size, stride)
+        stl = propagate_view_stl(
+            d_stl, [int(s) for s in d_size], [int(s) for s in d_stride], size, stride
+        )
+
+        return apply_spyre_reinterpret(
+            name, size, stride, offset, stl, dtype, base_dtype
+        )
 
 
 def spyre_codegen_reinterpret_view_helper(data):
@@ -171,7 +168,9 @@ def spyre_codegen_reinterpret_view_helper(data):
     """
     if isinstance(data, ir.Buffer):
         lay = data.get_layout()
-        assert isinstance(lay, FixedTiledLayout), "The base buffer doesn't have a FixedTiledLayout"
+        assert isinstance(lay, FixedTiledLayout), (
+            "The base buffer doesn't have a FixedTiledLayout"
+        )
         stl = lay.device_layout
         return lay.size, lay.stride, lay.offset, lay.dtype, stl, True
 
@@ -210,10 +209,19 @@ def spyre_codegen_reinterpret_view_helper(data):
                     )
         assert base_stl is not None, "Input not found"
     else:
-        assert isinstance(base_lay, FixedTiledLayout), "The base buffer doesn't have a FixedTiledLayout"
+        assert isinstance(base_lay, FixedTiledLayout), (
+            "The base buffer doesn't have a FixedTiledLayout"
+        )
         base_stl = base_lay.device_layout
     print("DEBUG!", base_lay, cur, cur.get_name(), base_stl)
-    return base_lay.size, base_lay.stride, base_lay.offset, base_lay.dtype, base_stl, True
+    return (
+        base_lay.size,
+        base_lay.stride,
+        base_lay.offset,
+        base_lay.dtype,
+        base_stl,
+        True,
+    )
 
 
 def noop_simplify_loops_impl(
