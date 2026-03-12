@@ -24,7 +24,7 @@ def compute_relative_stride(
     """
     Compute strides of device dimensions with respect to host dimensions
     """
-    acc = [1] * rank
+    acc = [sympy.S.One] * rank
     rel_stride = [-1] * len(dim_map)
     for device_dim in range(len(dim_map) - 1, -1, -1):
         dim = dim_map[device_dim]
@@ -43,7 +43,7 @@ def compute_coordinates(
     """
     Derive an array of coordinate expressions into a tensor from an index
     """
-    coordinates = [0] * len(size)
+    coordinates = [sympy.S.Zero] * len(size)
     vars = index.free_symbols
     for var in vars:
         if var_ranges[var] <= 1:
@@ -79,7 +79,7 @@ def compute_device_coordinates(
     """
     rel_stride = compute_relative_stride(len(size), device_size, dim_map)
     host_coordinates = compute_coordinates(size, stride, var_ranges, index)
-    coordinates = [0] * len(device_size)
+    coordinates = [sympy.S.Zero] * len(device_size)
     for dim in range(len(device_size)):
         if dim_map[dim] == -1:
             continue
