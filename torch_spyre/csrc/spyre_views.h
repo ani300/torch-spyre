@@ -23,10 +23,6 @@ namespace spyre {
 
 class SpyreTensorLayout;
 
-SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
-                                      c10::IntArrayRef new_sizes,
-                                      const SpyreTensorLayout& old_stl);
-
 at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
                                     c10::IntArrayRef size,
                                     c10::IntArrayRef stride,

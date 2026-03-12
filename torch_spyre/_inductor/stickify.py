@@ -39,7 +39,6 @@ from torch_spyre._C import (
     SpyreTensorLayout,
     get_device_dtype,
     get_elem_in_stick,
-    compute_view_layout,
 )
 from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP

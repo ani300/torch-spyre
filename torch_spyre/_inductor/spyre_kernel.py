@@ -20,8 +20,6 @@ from collections import Counter
 import torch
 import sympy
 
-from torch_spyre._C import compute_view_layout
-
 from torch._inductor.codegen.common import (
     CSEVariable,
     IndentedBuffer,
@@ -522,8 +520,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
-        # TODO: Add check that the index matches the final
-        # layout in the views to ensure it's the right tree
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)

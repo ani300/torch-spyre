@@ -295,7 +295,6 @@ PYBIND11_MODULE(_C, m) {
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
-  m.def("compute_view_layout", &spyre::compute_view_layout);
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,

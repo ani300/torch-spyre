@@ -621,12 +621,9 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
 at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
                             c10::IntArrayRef stride,
                             std::optional<int64_t> storage_offset_) {
-  // TODO(aviros): This as is will lead to many errors for views, fail for now
-  TORCH_CHECK_NOT_IMPLEMENTED(
-      !self.is_privateuseone(),
-      "as_strided not implemented for Spyre tensors, implement the caller "
-      "using as_strided_with_layout with the proper semantics");
-  return at::cpu::as_strided(self, size, stride, storage_offset_);
+  SpyreTensorLayout stl =
+      (static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl()))->spyre_layout;
+  return as_strided_with_layout(self, size, stride, storage_offset_, stl);
 }
 
 at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
@@ -747,9 +744,6 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
                                   c10::IntArrayRef stride,
                                   std::optional<int64_t> storage_offset_,
                                   SpyreTensorLayout device_layout) {
-  // NOTE: This function does not check whether
-  // the as_strided info and stl are compatible.
-  // This is for the caller of this function to check
   auto storage_offset = storage_offset_.value_or(self.storage_offset());
   auto result = at::detail::make_tensor<SpyreTensorImpl>(
       c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
