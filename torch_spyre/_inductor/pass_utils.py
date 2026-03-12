@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NamedTuple, Sequence
+from typing import NamedTuple
 
-from sympy import Expr, Symbol
+from sympy import Expr, Symbol, S
 
 import sympy
 from torch._inductor.ir import FixedLayout
@@ -23,30 +23,13 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 
-from torch_spyre._inductor.views import compute_coordinates, compute_device_coordinates
-
 from .ir import FixedTiledLayout
+from .views import compute_device_coordinates, compute_coordinates
 
 
 class SchedNodeArg(NamedTuple):
     dep: MemoryDep
     layout: FixedTiledLayout
-    dev_coords: Sequence[sympy.Expr]
-
-
-def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
-    return compute_coordinates(layout.size, layout.stride, dep.ranges, dep.index)
-
-
-def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.Expr]:
-    return compute_device_coordinates(
-        layout.size,
-        layout.stride,
-        layout.device_layout.device_size,
-        layout.device_layout.dim_map,
-        dep.ranges,
-        dep.index,
-    )
 
 
 def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
@@ -54,17 +37,10 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     for arg in n.read_writes.reads:
         if isinstance(arg, MemoryDep):
             buf = V.graph.get_buffer(arg.name)
-            buffer_layout = buf.get_layout()
-
-            if not isinstance(buffer_layout, FixedTiledLayout):
+            layout = buf.get_layout()
+            if not isinstance(layout, FixedTiledLayout):
                 raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-
-            host_coords = host_coordinates(buffer_layout, arg)
-            dev_coords = device_coordinates(buffer_layout, arg)
-            print(f"host_coords: {host_coords}; dev_coords: {dev_coords}")
-            print(f"Buffer layout {buffer_layout.device_layout}")
-
-            res.append(SchedNodeArg(arg, buffer_layout, dev_coords))
+            res.append(SchedNodeArg(arg, layout))
     return res
 
 
@@ -97,3 +73,36 @@ def map_dims_to_vars(layout: FixedLayout, index: Expr) -> dict[int, Symbol]:
             result[d] = wildcard_symbol(d)
 
     return result
+
+
+def map_host_dims_to_exprs(layout: FixedLayout, index: Expr) -> list[Expr]:
+    """
+    Construct a list of len(layout.size) of the Exprs that are used to index
+    elements of each host dimension.
+    A dimension of size 1 will have an expr of `0`.
+    """
+
+    # TEMPORARY.  Replicate logic of map_dims_to_vars.
+    # To be replaced by @tardieu's new algorithm.
+    host_map = {}
+    for sym in index.free_symbols:
+        stride_val = sympy_subs(index, {sym: 1}) - sympy_subs(index, {sym: 0})
+        if stride_val in layout.stride:
+            idx = layout.stride.index(stride_val)
+            host_map[idx] = sym
+    return [host_map[d] if d in host_map else S.zero for d in range(len(layout.size))]
+
+
+def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
+    return compute_coordinates(layout.size, layout.stride, dep.ranges, dep.index)
+
+
+def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.Expr]:
+    return compute_device_coordinates(
+        layout.size,
+        layout.stride,
+        layout.device_layout.device_size,
+        layout.device_layout.dim_map,
+        dep.ranges,
+        dep.index,
+    )
