@@ -61,9 +61,11 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             strip=True,
         )
         self.header.writeline(
-            "from torch_spyre._C import spyre_reinterpret_tensor as reinterpret_tensor"
+            "from torch_spyre._C import reinterpret_tensor as reinterpret_tensor"
         )
-        self.header.writeline("from torch_spyre._C import as_strided_with_layout")
+        self.header.writeline(
+            "from torch_spyre._C import reinterpret_tensor_with_layout"
+        )
         self.header.writeline("del async_compile")
         self.header.writeline("async_compile = SpyreAsyncCompile()")
 
@@ -98,7 +100,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             return self.codegen_exact_buffer_reuse(old_name, new_name, del_line)
 
         new_stl = new.device_layout
-        reinterpret_view = f"as_strided_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
+        reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
 
 

@@ -268,7 +268,9 @@ PYBIND11_MODULE(_C, m) {
   m.def("to_with_layout", &spyre::to_with_layout);
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
-  m.def("spyre_reinterpret_tensor", &spyre::spyre_reinterpret_tensor);
+  m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
+  m.def("reinterpret_tensor_with_layout",
+        &spyre::reinterpret_tensor_with_layout);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)

@@ -23,9 +23,14 @@ namespace spyre {
 
 class SpyreTensorLayout;
 
-at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
-                                    c10::IntArrayRef size,
-                                    c10::IntArrayRef stride,
-                                    int64_t offset_increment);
+at::Tensor reinterpret_tensor(const at::Tensor& self, c10::IntArrayRef size,
+                              c10::IntArrayRef stride,
+                              int64_t offset_increment);
+
+at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
+                                          c10::IntArrayRef size,
+                                          c10::IntArrayRef stride,
+                                          int64_t offset_increment,
+                                          SpyreTensorLayout stl);
 
 }  // namespace spyre
