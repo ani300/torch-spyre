@@ -99,7 +99,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         if old.get_size() == new.get_size() and old.get_stride() == new.get_stride():
             return self.codegen_exact_buffer_reuse(old_name, new_name, del_line)
 
-        new_stl = new.device_layout
+        new_stl = new.get_layout().device_layout
         reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
 
