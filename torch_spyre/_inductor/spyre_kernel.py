@@ -20,7 +20,7 @@ from collections import Counter
 import torch
 import sympy
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, SpyreTensorLayout
 
 from torch._inductor.codegen.common import (
     CSEVariable,
@@ -73,10 +73,12 @@ class TensorAccess(RValue):
         if is_sparse(self.layout.device_layout):
             new_size = self.layout.size + [1]
             new_stride = self.layout.stride + [1]
-            new_stl = compute_view_layout(
-                torch.Size(self.layout.size),
-                torch.Size(new_size),
-                self.layout.device_layout,
+            old_stl = self.layout.device_layout
+            new_dim_map = [
+                len(self.layout.size) if d == -1 else d for d in old_stl.dim_map
+            ]
+            new_stl = SpyreTensorLayout(
+                old_stl.device_size, new_dim_map, old_stl.device_dtype
             )
             new_layout = FixedTiledLayout(
                 self.layout.device, self.layout.dtype, new_size, new_stride, new_stl
