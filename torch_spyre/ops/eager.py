@@ -36,6 +36,27 @@ def spyre__mm_out(
     return compiled_mm(self, mat2, out=out)
 
 
+@torch.library.register_kernel("aten::linear", ["spyre"])  # type:ignore
+def spyre__linear(
+    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    def _linear(input, weight, bias):
+        weight = weight.transpose(-1, -2).contiguous()
+        while weight.dim() < input.dim():
+            weight = torch.unsqueeze(weight, 0)
+        out = input @ weight
+        if bias:
+            out += bias
+        return out
+
+    # Prevents double tracing
+    if not torch.compiler.is_compiling():
+        compiled_linear = torch.compile(_linear, dynamic=False)
+    else:
+        compiled_linear = _linear
+    return compiled_linear(input, weight, bias)
+
+
 @torch.library.register_kernel("aten::addmm", ["spyre"])  # type:ignore
 def spyre__addmm_default(
     self: torch.Tensor,
@@ -74,7 +95,7 @@ def spyre__fill_scalar(
     return self
 
 
-@torch.library.register_kernel("aten::normal_", ["spyre"])
+@torch.library.register_kernel("aten::normal_", ["spyre"])  # type:ignore
 def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
     # "normal_" generates a random tensor, thus copying
     # "self" back from SPYRE to CPU is not needed.
@@ -98,21 +119,21 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     return self
 
 
-@torch.library.register_kernel("aten::silu.out", ["spyre"])
+@torch.library.register_kernel("aten::silu.out", ["spyre"])  # type:ignore
 def spyre__silu_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     # Out variant
     compiled_silu = torch.compile(torch.ops.aten.silu.out, dynamic=False)
     return compiled_silu(self, out=out)
 
 
-@torch.library.register_kernel("aten::mish.out", ["spyre"])
+@torch.library.register_kernel("aten::mish.out", ["spyre"])  # type:ignore
 def spyre__mish_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     # Out variant
     compiled_mish = torch.compile(torch.ops.aten.mish.out, dynamic=False)
     return compiled_mish(self, out=out)
 
 
-@torch.library.register_kernel("aten::uniform_", "spyre")
+@torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
 def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     # Create a new tensor on cpu
     cpu_tmp = torch.empty_like(self, device="cpu", memory_format=torch.preserve_format)
