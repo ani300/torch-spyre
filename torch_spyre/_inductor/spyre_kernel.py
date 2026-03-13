@@ -501,10 +501,18 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
 
             op_spec = create_op_spec(op, False, out_di, args, op_info)
-            if in_di != out_di:
+            if op == TRANSPOSE_OP:
                 op_spec.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d] != out_di[d]
                 ]
+                # Reorder it_dim_map of the input to implement transpositions
+                (
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
+                ) = (
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
+                )
             self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
