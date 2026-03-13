@@ -192,6 +192,7 @@ class DimInfos:
 # Extract the device size for a give host dim
 # Assumption is that the passed tensor operate in host dimension space
 def get_device_size(op_dim, tensor):
+    print("DEBUG 2", op_dim, tensor)
     dl = tensor["device_layout"]
     scale = tensor["it_dim_map"][op_dim]
     assert scale >= 0, "Scale value should be non-negative for tensor provided"
@@ -751,6 +752,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 #  - The first N-2 dims come from tensor 0
 #  - Last 2 dims come from tensor 1
 def get_padded_dimensions_matmul(ndim, inputs):
+    print("DEBUG", ndim, inputs)
     padded_dimensions = [0] * ndim
     for op_dim in range(ndim):
         tensor_idx = 0 if op_dim < ndim - 2 else 1

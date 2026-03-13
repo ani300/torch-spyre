@@ -33,4 +33,9 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
                                           int64_t offset_increment,
                                           SpyreTensorLayout stl);
 
+at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
+                                  c10::IntArrayRef stride,
+                                  std::optional<int64_t> storage_offset_,
+                                  SpyreTensorLayout device_layout);
+
 }  // namespace spyre

@@ -19,7 +19,6 @@
 #include <ATen/EmptyTensor.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <ATen/native/Resize.h>
-#include <ATen/ops/as_strided_cpu_dispatch.h>
 #include <ATen/ops/set_cpu_dispatch.h>
 #include <c10/core/Allocator.h>
 #include <c10/core/MemoryFormat.h>
@@ -647,14 +646,6 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   return tensor;
 }
 
-at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
-                            c10::IntArrayRef stride,
-                            std::optional<int64_t> storage_offset_) {
-  SpyreTensorLayout stl =
-      (static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl()))->spyre_layout;
-  return as_strided_with_layout(self, size, stride, storage_offset_, stl);
-}
-
 at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
                               int64_t storage_offset, c10::IntArrayRef size,
                               c10::IntArrayRef stride) {
@@ -772,33 +763,9 @@ at::Tensor py_empty_with_layout(
                            pin_memory_opt, memory_format_opt);
 }
 
-at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
-                                  c10::IntArrayRef stride,
-                                  std::optional<int64_t> storage_offset_,
-                                  SpyreTensorLayout device_layout) {
-  auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-  auto storage_offset = storage_offset_.value_or(self.storage_offset());
-  auto result = at::detail::make_tensor<SpyreTensorImpl>(
-      c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
-      self.dtype());
-  at::native::setStrided(result, size, stride, storage_offset);
-  auto spyre_impl = static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl());
-  spyre_impl->spyre_layout = device_layout;
-  if (device_layout == orig_impl->spyre_layout) {
-    spyre_impl->dma_sizes = orig_impl->dma_sizes;
-    spyre_impl->dma_strides = orig_impl->dma_strides;
-  } else {
-    spyre_impl->dma_sizes = size.vec();
-    spyre_impl->dma_strides = stride.vec();
-  }
-
-  return result;
-}
-
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));
-  m.impl("as_strided", TORCH_FN(spyre_as_strided));
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
   m.impl("_copy_from", TORCH_FN(spyre_copy_from));
 }
