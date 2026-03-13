@@ -316,8 +316,6 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         x_stl = x.layout.device_layout
         if is_sparse(x_stl) or x_stl.host_stick_dim() != (len(x.layout.size) - 1):
             raise Unsupported(f"exx2 unsupported layout {x_stl}")
-        if list(x.layout.size)[:-1] != output.size:
-            raise Unsupported("views not supported for exx2")
         dim_map = list(range(len(output.size))) + [-1]
         stl = SpyreTensorLayout(output.size, output.dtype, dim_map)
         return FixedTiledLayout(

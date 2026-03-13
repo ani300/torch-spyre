@@ -14,7 +14,7 @@
 
 from typing import NamedTuple
 
-from sympy import Expr, Symbol, S
+from sympy import Expr, Symbol
 
 import sympy
 from torch._inductor.ir import FixedLayout
