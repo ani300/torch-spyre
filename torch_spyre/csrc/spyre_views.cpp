@@ -38,9 +38,9 @@
 namespace spyre {
 
 // IMPORTANT NOTE: The squeeze view has to break the assumption that the STL
-// stays constant since allocation There will be a better fix in the short term,
-// but this is required as Pytorch/AOTAutograd likes squeezing tensors without
-// telling you through the view op
+// stays constant since allocation. There will be a better fix in the short
+// term, but this is required as Pytorch/AOTAutograd likes squeezing tensors
+// without telling you through the view op
 SpyreTensorLayout get_squeezed_layout(const SpyreTensorLayout& old_stl,
                                       const std::set<size_t>& removed_ones) {
   DEBUGINFO("We are correcting STL for squeeze");
@@ -50,13 +50,26 @@ SpyreTensorLayout get_squeezed_layout(const SpyreTensorLayout& old_stl,
   for (size_t i = 0; i < old_stl.dim_map.size(); ++i) {
     int32_t dim = old_stl.dim_map[i];
     if (removed_ones.count(dim)) {
-      continue;
+      if (dim != old_stl.dim_map[old_stl.dim_map.size() - 1]) {
+        // Remove non-stick squeezed dimensions
+        continue;
+      } else {
+        // Keep squeezed stick dimension but mark as sparse
+        new_device_size.push_back(
+            (i == old_stl.device_size.size() - 1)
+                ? spyre::elems_per_stick(old_stl.device_dtype)
+                : 1);
+        new_dim_map.push_back(-1);
+      }
+    } else {
+      // Do the normal logic for squeeze otherwise
+      auto below = std::count_if(
+          removed_ones.begin(), removed_ones.end(),
+          [dim](size_t r) { return static_cast<int32_t>(r) < dim; });
+
+      new_dim_map.push_back(dim - static_cast<int32_t>(below));
+      new_device_size.push_back(old_stl.device_size[i]);
     }
-    auto below = std::count_if(
-        removed_ones.begin(), removed_ones.end(),
-        [dim](size_t r) { return static_cast<int32_t>(r) < dim; });
-    new_dim_map.push_back(dim - static_cast<int32_t>(below));
-    new_device_size.push_back(old_stl.device_size[i]);
   }
 
   DEBUGINFO(new_device_size, new_dim_map)
