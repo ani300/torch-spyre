@@ -146,8 +146,6 @@ static at::Tensor spyre_alias_with_sizes_and_strides(const at::Tensor& self,
     spyre_tensor_impl_->dma_strides =
         std::vector<int64_t>(strides.begin(), strides.end());
   }
-  spyre_tensor_impl_->dma_sizes = self.sizes().vec();
-  spyre_tensor_impl_->dma_strides = self.strides().vec();
   return self_;
 }
 
