@@ -146,23 +146,31 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             case _:
                 in_coords = host_coordinates(x.layout, x.dep)
                 out_coords = host_coordinates(output, output_dep)
-                if in_coords == out_coords and x.index == output_dep.index:
+                if in_coords == out_coords and x.dep.index == output_dep.index:
                     # Input and output tensors are being accessed identically.
                     # We can simply propagate the device_layout.
                     stl = device_layout_like(x.layout, output.dtype)
                 else:
-                    # Use row major adjusted to put stick dimension last
-                    print(x.layout, x.dep)
+                    # TODO: This needs further work
+                    # Use row major adjusted to put stick dimension last and any
+                    # non-stick size one dimensions in the output to the interior
+                    # to avoid tiling them.
                     in_device_coords = device_coordinates(x.layout, x.dep)
                     stick_expr = in_device_coords[-1]
-                    if stick_expr == 0:
+                    if is_sparse(x_stl):
                         raise Unsupported("TODO: unary op with view on sparse tensor")
-                    try:
+
+                    if stick_expr in out_coords:
                         out_stick_dim = out_coords.index(stick_expr)
-                    except ValueError:
-                        raise Unsupported("output stick dim not well-defined")
+                    else:
+                        out_stick_dim = -1
                     dim_order = [
-                        d for d in range(len(output.size)) if d != out_stick_dim
+                        d
+                        for d in range(len(output.size))
+                        if d != out_stick_dim and out_coords[d] != 0
+                    ]
+                    dim_order += [
+                        d for d in range(len(output.size)) if out_coords[d] == 0
                     ]
                     dim_order += [out_stick_dim]
                     stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
@@ -214,16 +222,17 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             stl = device_layout_like(args[0].layout, output.dtype)
         else:
             # Use row major adjusted to put stick dimension last
+            # TODO: Should we also push size 1 dims to the interior here like in unary above??
             if len(stick_exprs) == 0:
                 raise Unsupported(
                     "pointwise op with views/broadcasts without stick dim"
                 )
 
             stick_expr = next(iter(stick_exprs))
-            try:
+            if stick_expr in out_coords:
                 out_stick_dim = out_coords.index(stick_expr)
-            except ValueError:
-                raise Unsupported("output stick dim not well-defined")
+            else:
+                out_stick_dim = -1
 
             dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
             dim_order += [out_stick_dim]
@@ -258,7 +267,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         x_stl = x.layout.device_layout
         y_stl = y.layout.device_layout
         if is_sparse(x_stl) or is_sparse(y_stl):
-            raise Unsupported(f"{red.reduction_type} on sparse tensors {x_stl} {y_stl}")
+            raise Unsupported(f"{red.reduction_type} on sparse tensor {x_stl} {y_stl}")
 
         x_coords = host_coordinates(x.layout, x.dep)
         x_dev_coords = device_coordinates(x.layout, x.dep)
