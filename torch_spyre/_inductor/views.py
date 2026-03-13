@@ -91,6 +91,4 @@ def compute_device_coordinates(
             limit = term.subs(var, var_ranges[var])
             if limit > rel_stride[dim] and step < rel_stride[dim] * device_size[dim]:
                 coordinates[dim] += term // rel_stride[dim]
-    print(f"Inputs {size} {stride} {device_size} {dim_map} {var_ranges} {index}")
-    print(f"Outputs {rel_stride} {host_coordinates} {coordinates}")
     return coordinates
