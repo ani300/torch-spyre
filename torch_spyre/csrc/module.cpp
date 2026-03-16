@@ -234,6 +234,15 @@ DataFormats get_device_dtype(c10::ScalarType torch_dtype) {
   return sen_dtype_dev;
 }
 
+bool is_supported_dtype(c10::ScalarType dtype) {
+  // TODO(kmehant,yoheiueda): Replace this heuristic with a reliable method to
+  // determine supported dtypes. Using elems_per_stick can miss certain
+  // unsupported dtypes. See #950
+  DataFormats sen_dtype_dev = get_device_dtype(dtype);
+  return sen_dtype_dev != DataFormats::INVALID &&
+         elems_per_stick(sen_dtype_dev) > 0;
+}
+
 }  // namespace spyre
 
 PYBIND11_MODULE(_C, m) {
