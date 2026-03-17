@@ -41,6 +41,13 @@ def relayout_linear_weights(graph: torch.fx.Graph) -> None:
                     node.update_arg(1, contiguous_node)
 
 
+_RESHAPE_OPS = (
+    torch.ops.aten.view.default,
+    torch.ops.aten.reshape.default,
+    torch.ops.aten._unsafe_view.default,
+)
+
+
 def _unflatten_mm_to_bmm(graph: torch.fx.Graph) -> None:
     """
     Convert view(3D→2D) → mm(2D, 2D) → view(2D→3D) into bmm(3D, unsqueeze(2D)).
@@ -51,16 +58,10 @@ def _unflatten_mm_to_bmm(graph: torch.fx.Graph) -> None:
       2. mm(flattened, weight) -> [B*M, N]
       3. view(mm_result, [B, M, N])
 
-    The Spyre backend handles bmm natively.  This pass converts the pattern
+    The Spyre backend handles bmm better. This pass converts the pattern
     into a semantically correct bmm by unsqueezeing and expanding the 2D
     weight to match the batch dimension of the input.
     """
-    _RESHAPE_OPS = (
-        torch.ops.aten.view.default,
-        torch.ops.aten.reshape.default,
-        torch.ops.aten._unsafe_view.default,
-    )
-
     for node in list(graph.nodes):
         if not (
             node.op == "call_function" and node.target == torch.ops.aten.mm.default
@@ -80,9 +81,6 @@ def _unflatten_mm_to_bmm(graph: torch.fx.Graph) -> None:
         if not (isinstance(lhs_input, torch.fx.Node) and "val" in lhs_input.meta):
             continue
         lhs_orig_shape = list(lhs_input.meta["val"].shape)
-        # Only handle 3D inputs; higher dims need the bmm unflatten pass
-        if len(lhs_orig_shape) != 3:
-            continue
 
         # RHS must be a plain 2D tensor (not a reshaped one)
         if not (isinstance(rhs, torch.fx.Node) and "val" in rhs.meta):
@@ -165,11 +163,7 @@ def _is_batch_collapsing_reshape(node: torch.fx.Node) -> bool:
         return False
     if node.op != "call_function":
         return False
-    if node.target not in (
-        torch.ops.aten.reshape.default,
-        torch.ops.aten.view.default,
-        torch.ops.aten._unsafe_view.default,
-    ):
+    if node.target not in _RESHAPE_OPS:
         return False
     # The reshape output should be 3D (batch_product, M, K)
     output_shape = node.args[1]
@@ -224,13 +218,7 @@ def unflatten_bmm_batch_dims(graph: torch.fx.Graph) -> None:
             continue
         output_view = bmm_users[0]
         if not (
-            output_view.op == "call_function"
-            and output_view.target
-            in (
-                torch.ops.aten.view.default,
-                torch.ops.aten.reshape.default,
-                torch.ops.aten._unsafe_view.default,
-            )
+            output_view.op == "call_function" and output_view.target in _RESHAPE_OPS
         ):
             continue
 
