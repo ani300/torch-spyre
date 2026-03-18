@@ -103,7 +103,7 @@ def spyre_linear(
 ):
     from torch_spyre._inductor.decompositions import _linear_spyre_impl
 
-    c_linear = torch.compile(_linear_spyre_impl)
+    c_linear = torch.compile(_linear_spyre_impl, dynamic=False)
     return c_linear(input, weight, bias)
 
 
