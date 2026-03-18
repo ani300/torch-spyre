@@ -21,9 +21,6 @@ from utils_inductor import (
     cached_randn,
 )
 
-FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
-FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
-
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)
@@ -124,7 +121,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             backend.inductor_graphs[0].print_readable(print_output=False)
         )
 
-        print(inductor_graph_str)
         if x.dim() == 2:
             assert "aten.mm.default" in inductor_graph_str, (
                 "Expected aten.mm.default in 2D linear decomposition graph"
