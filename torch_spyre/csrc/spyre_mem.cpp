@@ -645,7 +645,6 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   spyre_tensor_impl->spyre_layout = device_layout;
   spyre_tensor_impl->dma_sizes = size.vec();
   spyre_tensor_impl->dma_strides = stride.vec();
-  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
   return tensor;
 }
 

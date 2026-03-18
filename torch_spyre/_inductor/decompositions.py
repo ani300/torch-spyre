@@ -399,31 +399,16 @@ def addmm_decomp(
     return result
 
 
-@torch.ops.aten.linear.default.py_impl(torch._C.DispatchKey.CompositeImplicitAutograd)
-def linear_decomp(
+def _linear_spyre_impl(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    if input.device.type == "spyre":
-        weight = weight.transpose(-1, -2).contiguous()
-        while weight.dim() < input.dim():
-            weight = torch.unsqueeze(weight, 0)
-        out = input @ weight
-        if bias is not None:
-            out += bias
-        return out
+    weight = weight.transpose(-1, -2).contiguous()
+    while weight.dim() < input.dim():
+        weight = torch.unsqueeze(weight, 0)
+    out = input @ weight
+    if bias is not None:
+        out = out + bias
+    return out
 
-    # Compute keyset the same way the dispatcher does
-    key_set = torch._C._dispatch_tls_local_include_set()
-    for t in [input, weight]:
-        key_set = key_set | torch._C._dispatch_keys(t)
-    exclude_set = (
-        torch._C._dispatch_tls_local_exclude_set()
-        | torch._C.DispatchKeySet(torch._C.DispatchKey.PythonDispatcher)
-        | torch._C.DispatchKeySet(torch._C.DispatchKey.PythonTLSSnapshot)
-    )
-    key_set = key_set - exclude_set
 
-    # This gives a concrete runtime key, never an alias, and skips our Python dispatch
-    dispatch_key = key_set.highestPriorityTypeId()
-    kernel = torch.library.get_kernel("aten::linear", dispatch_key)
-    return kernel.call_boxed(torch._C._dispatch_keys(input), input, weight, bias)
+register_spyre_decomposition([torch.ops.aten.linear.default])(_linear_spyre_impl)
