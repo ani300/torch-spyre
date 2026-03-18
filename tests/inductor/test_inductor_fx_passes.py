@@ -158,7 +158,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         inductor_graph_str = normalize_gm(
             backend.inductor_graphs[0].print_readable(print_output=False)
         )
-        print(inductor_graph_str)
         assert "aten.bmm.default" in inductor_graph_str, (
             "Expected aten.bmm.default after unflatten_mm_to_bmm pass"
         )
