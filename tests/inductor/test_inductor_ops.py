@@ -20,6 +20,7 @@ from utils_inductor import (
     ParameterizedTestMeta,
     cached_randn,
     make_param_dict,
+    unique_randn_along_dim,
 )
 from utils_inductor import compare, compare_with_cpu
 
@@ -203,9 +204,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_sdsc_padding_amin_keepdim1", "test_reduce_keepdim1_cpu"): {
             "ops_dict": {"amin": torch.amin},
             "param_sets": {
-                "dim_0": (0, torch.ones((3, 7), dtype=torch.float16)),
+                "dim_0": (0, unique_randn_along_dim((3, 7), dim=0)),
+                "dim_1": (1, unique_randn_along_dim((3, 7), dim=1)),
                 #  Disabled because torch-sendnn fails
-                # "dim_1": (1, torch.ones((3, 7), dtype=torch.float16)),
                 # "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
             },
         },
@@ -310,15 +311,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "sum": torch.max,
             },
             "param_sets": {
-                "2d_dim_0": (0, cached_randn((67, 256))),
-                "2d_dim_1": (1, cached_randn((67, 256))),  #  sparse tensor output
+                "2d_dim_0": (0, unique_randn_along_dim((67, 256), dim=0)),
+                "2d_dim_1": (
+                    1,
+                    unique_randn_along_dim((67, 256), dim=1),
+                ),  #  sparse tensor output
                 # "3d_dim_0": (0, cached_randn((67, 71, 256))), # layout needs repermutation
-                "3d_dim_1": (1, cached_randn((67, 71, 256))),
-                "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
-                "4d_dim_0": (0, cached_randn((6, 17, 7, 64))),
-                "4d_dim_1": (1, cached_randn((6, 17, 7, 64))),
-                "4d_dim_2": (2, cached_randn((6, 17, 7, 64))),
-                "4d_dim_3": (3, cached_randn((6, 17, 7, 64))),  # sparse tensor output
+                "3d_dim_1": (1, unique_randn_along_dim((67, 71, 256), dim=1)),
+                "3d_dim_2": (
+                    2,
+                    unique_randn_along_dim((67, 71, 256), dim=2),
+                ),  # sparse tensor output
+                "4d_dim_0": (0, unique_randn_along_dim((6, 17, 7, 64), dim=0)),
+                "4d_dim_1": (1, unique_randn_along_dim((6, 17, 7, 64), dim=1)),
+                "4d_dim_2": (2, unique_randn_along_dim((6, 17, 7, 64), dim=2)),
+                "4d_dim_3": (
+                    3,
+                    unique_randn_along_dim((6, 17, 7, 64), dim=3),
+                ),  # sparse tensor output
             },
         },
         ("test_max_keepdim1", "test_reduce_keepdim1_cpu"): {
@@ -326,15 +336,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "sum": torch.max,
             },
             "param_sets": {
-                "2d_dim_0": (0, cached_randn((67, 256))),
-                "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
-                "3d_dim_0": (0, cached_randn((67, 71, 256))),
-                "3d_dim_1": (1, cached_randn((67, 71, 256))),
-                "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
-                "4d_dim_0": (0, cached_randn((6, 7, 12, 256))),
-                "4d_dim_1": (1, cached_randn((6, 7, 12, 256))),
-                "4d_dim_2": (2, cached_randn((6, 7, 12, 256))),
-                "4d_dim_3": (3, cached_randn((6, 7, 12, 256))),
+                "2d_dim_0": (0, unique_randn_along_dim((67, 256), dim=0)),
+                "2d_dim_1": (
+                    1,
+                    unique_randn_along_dim((67, 256), dim=1),
+                ),  # sparse tensor output
+                "3d_dim_0": (0, unique_randn_along_dim((67, 71, 256), dim=0)),
+                "3d_dim_1": (1, unique_randn_along_dim((67, 71, 256), dim=1)),
+                "3d_dim_2": (
+                    2,
+                    unique_randn_along_dim((67, 71, 256), dim=2),
+                ),  # sparse tensor output
+                "4d_dim_0": (0, unique_randn_along_dim((6, 7, 12, 256), dim=0)),
+                "4d_dim_1": (1, unique_randn_along_dim((6, 7, 12, 256), dim=1)),
+                "4d_dim_2": (2, unique_randn_along_dim((6, 7, 12, 256), dim=2)),
+                "4d_dim_3": (3, unique_randn_along_dim((6, 7, 12, 256), dim=3)),
             },
         },
         ("test_sum_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -942,6 +958,37 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
             },
         },
+        ("test_softplus", "test_softplus_cpu"): {
+            "param_sets": {
+                "2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "3d": (cached_randn((64, 256, 128), dtype=torch.float16),),
+                "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
+            },
+        },
+        ("test_scalar_cpu", "test_scalar_cpu"): {
+            "ops_dict": {
+                "add": torch.add,
+                "sub": torch.sub,
+                "mul": torch.mul,
+                "div": torch.div,
+                "true_divide": torch.true_divide,
+                "combined": lambda scalar, x: (
+                    a := torch.add(x, scalar),
+                    b := torch.add(scalar, a),
+                    c := torch.add(b, scalar),
+                    d := torch.sub(c, scalar),
+                    e := torch.mul(5, d),
+                    out := torch.add(e, e),
+                    out,
+                ),
+            },
+            "param_sets": {
+                "1d": (cached_randn((1024,), dtype=torch.float16), 3.0),
+                "2d": (cached_randn((512, 1024), dtype=torch.float16), 1.0),
+                "3d": (cached_randn((8, 64, 1024), dtype=torch.float16), 1.5),
+                "4d": (cached_randn((2, 4, 64, 1024), dtype=torch.float16), 2.4),
+            },
+        },
         ("test_linear", "test_linear_fn"): {
             "param_sets": {
                 "2d_no_bias": (
@@ -964,7 +1011,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((128, 256)),
                     cached_randn((128,)),
                 ),
-            },
+            }
         },
     }
 
@@ -1000,18 +1047,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch.testing.assert_close(result, torch.eq(x, y))
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_scalar_cpu(self):
-        def fn(x):
-            a = torch.add(x, 1.0)
-            b = torch.add(1.0, a)
-            c = torch.add(b, 1.0)
-            d = torch.sub(c, 2.0)
-            e = torch.mul(5, d)
-            out = torch.add(e, e)
-            return out
+    def test_scalar_cpu(self, op, *args):
+        def fn(*tensor_args):
+            # Scalar args are preserved as scalars
+            tensor_args = list(tensor_args)
+            updated_args = [
+                tensor_args.pop(0) if isinstance(arg, torch.Tensor) else arg
+                for arg in args
+            ]
+            return op(*updated_args)
 
-        x = torch.rand(512, 1024, dtype=torch.float16)
-        compare_with_cpu(fn, x)
+        tensor_args = [arg for arg in args if isinstance(arg, torch.Tensor)]
+
+        compare_with_cpu(fn, *tensor_args)
 
     def test_unary_op_cpu(self, op, x):
         compare_with_cpu(op, x)
@@ -1190,6 +1238,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_rmsnorm_cpu(self, x):
         def fn(input):
             return torch.nn.functional.rms_norm(input, [input.shape[-1]], eps=1e-6)
+
+        compare_with_cpu(fn, x)
+
+    def test_softplus_cpu(self, x):
+        beta = 1.0
+        threshold = 20.0
+
+        def fn(input):
+            return torch.nn.functional.softplus(input, beta, threshold)
 
         compare_with_cpu(fn, x)
 

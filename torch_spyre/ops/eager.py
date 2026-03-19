@@ -97,14 +97,4 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     return self
 
 
-@torch.library.register_kernel("aten::linear", "spyre")
-def spyre_linear(
-    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
-):
-    from torch_spyre._inductor.decompositions import _linear_spyre_impl
-
-    c_linear = torch.compile(_linear_spyre_impl, dynamic=False)
-    return c_linear(input, weight, bias)
-
-
 # INSERT_CODEGEN_HERE
