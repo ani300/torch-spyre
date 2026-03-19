@@ -25,9 +25,10 @@ from torch._inductor.custom_graph_pass import (
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from .temp_passes import (
+    bmm_unflatten_pass,
+    mm_to_bmm_pass,
     relayout_linear_weights,
     replace_scalar_with_tensor,
-    unflatten_bmm_batch_dims,
 )
 from .stickify import propagate_spyre_tensor_layouts
 from .core_division import core_division_planning
@@ -79,7 +80,8 @@ class CustomPostPasses(CustomGraphPass):
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
         replace_scalar_with_tensor,
         relayout_linear_weights,
-        unflatten_bmm_batch_dims,
+        mm_to_bmm_pass.apply,
+        bmm_unflatten_pass.apply,
     ]
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
