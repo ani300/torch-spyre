@@ -107,9 +107,7 @@ def _unflatten_mm_to_bmm(
     if len(mm_users) != 1:
         return
     output_view = mm_users[0]
-    if not (
-        output_view.op == "call_function" and output_view.target in _RESHAPE_OPS
-    ):
+    if not (output_view.op == "call_function" and output_view.target in _RESHAPE_OPS):
         return
     output_shape = output_view.args[1]
     if not isinstance(output_shape, (list, tuple)):
@@ -155,9 +153,7 @@ def _unflatten_mm_to_bmm(
             aten.bmm.default,
             args=(lhs_input, expanded),
         )
-        bmm_node.meta["val"] = torch.empty(
-            output_shape, dtype=rhs_dtype, device="meta"
-        )
+        bmm_node.meta["val"] = torch.empty(output_shape, dtype=rhs_dtype, device="meta")
 
     # Replace all uses of mm and output view with the bmm
     node.replace_all_uses_with(bmm_node)
@@ -229,9 +225,7 @@ def _unflatten_bmm_batch_dims(
     if len(bmm_users) != 1:
         return
     output_view = bmm_users[0]
-    if not (
-        output_view.op == "call_function" and output_view.target in _RESHAPE_OPS
-    ):
+    if not (output_view.op == "call_function" and output_view.target in _RESHAPE_OPS):
         return
 
     output_shape = output_view.args[1]
