@@ -1013,6 +1013,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             }
         },
+        ("test_tril", "test_tril_cpu"): {
+            "param_sets": {
+                "2d": (cached_randn((64, 64)),),
+                "3d": (cached_randn((32, 64, 64)),),
+            }
+        },
+        ("test_triu", "test_triu_cpu"): {
+            "param_sets": {
+                "2d": (
+                    cached_randn((64, 64)),
+                    1,
+                ),
+                "3d": (
+                    cached_randn((32, 64, 64)),
+                    1,
+                ),
+            }
+        },
         ("test_sdpa", "test_sdpa_cpu"): {
             "param_sets": {
                 "mha_prefill": (
@@ -1025,6 +1043,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn(
                         (2, 256, 32, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
+                    None,
                     False,
                     False,
                 ),
@@ -1038,6 +1057,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn(
                         (2, 256, 32, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
+                    None,
+                    True,
+                    False,
+                ),
+                "mha_prefill_mask": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    torch.triu(
+                        torch.ones((256, 256), dtype=torch.float16) * -float("inf"),
+                        diagonal=1,
+                    ),
                     True,
                     False,
                 ),
@@ -1322,11 +1359,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, x)
 
+    def test_tril_cpu(self, x):
+        def fn(input):
+            return torch.tril(input)
+
+        compare_with_cpu(fn, x)
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_sdpa_cpu(self, q, k, v, is_causal, enable_gqa):
-        def fn(q, k, v, is_causal, enable_gqa):
+    def test_triu_cpu(self, x, diagonal):
+        def fn(input, diagonal):
+            return torch.triu(input, diagonal)
+
+        compare_with_cpu(fn, x, diagonal)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_sdpa_cpu(self, q, k, v, attn_mask, is_causal, enable_gqa):
+        def fn(q, k, v, attn_mask, is_causal, enable_gqa):
             return torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, is_causal=is_causal, enable_gqa=enable_gqa
+                q, k, v, attn_mask, is_causal=is_causal, enable_gqa=enable_gqa
             )
 
         compare_with_cpu(fn, q, k, v, is_causal, enable_gqa)
