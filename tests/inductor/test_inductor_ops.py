@@ -1075,7 +1075,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         torch.ones((256, 256), dtype=torch.float16) * -float("inf"),
                         diagonal=1,
                     ),
-                    True,
+                    False,
                     False,
                 ),
                 # TODO(aviros): Implement expand
@@ -1359,6 +1359,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, x)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_tril_cpu(self, x):
         def fn(input):
             return torch.tril(input)
@@ -1379,7 +1380,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 q, k, v, attn_mask, is_causal=is_causal, enable_gqa=enable_gqa
             )
 
-        compare_with_cpu(fn, q, k, v, is_causal, enable_gqa)
+        compare_with_cpu(fn, q, k, v, attn_mask, is_causal, enable_gqa)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):

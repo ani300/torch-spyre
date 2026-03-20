@@ -524,11 +524,9 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
 
             op_spec = create_op_spec(op, False, out_di, args, op_info)
             if op == TRANSPOSE_OP:
+                # print(in_di, out_di, value.layout, dst.layout, in_stl, out_stl)
                 op_spec.op_info["transposed_dims"] = [
-                    d
-                    for d in range(len(in_di))
-                    if in_di[d] != out_di[d]
-                    or value.layout.stride[d] != dst.layout.stride[d]
+                    d for d in range(len(in_di)) if in_di[d] != out_di[d]
                 ]
                 # Reorder it_dim_map of the input to implement transpositions
                 (
