@@ -552,6 +552,7 @@ def spyre__sdpa_overrideable(
         scaling_factor = 1.0 / math.sqrt(query.shape[-1])
     scaling_factor = math.sqrt(scaling_factor)
 
+    # TODO (aviros): Figure why this broadcast doesn't work
     scaling_factor = torch.full_like(query, scaling_factor)
 
     query = query * scaling_factor
