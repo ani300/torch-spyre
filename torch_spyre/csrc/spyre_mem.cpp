@@ -689,16 +689,18 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
 
   } else if (self.is_privateuseone() && dst.is_privateuseone()) {
     // Copy from Spyre to Spyre
+    TORCH_CHECK(false, "Error: In-device copy not implemented.");
     // FIXME: This will need to be addressed for proper spyre to spyre copy
-    source_storage =
-        (static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl()))->storage();
-    dest_storage =
-        (static_cast<SpyreTensorImpl*>(dst.unsafeGetTensorImpl()))->storage();
-    DEBUGINFO("Copying", source_storage.nbytes(), "bytes from",
-              source_storage.device(), "to", dest_storage.device());
-    std::memcpy(dest_storage.data_ptr().get(), source_storage.data_ptr().get(),
-                source_storage.nbytes());
-    DEBUGINFO("Finished Copying ");
+    // source_storage =
+    //     (static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl()))->storage();
+    // dest_storage =
+    //     (static_cast<SpyreTensorImpl*>(dst.unsafeGetTensorImpl()))->storage();
+    // DEBUGINFO("Copying", source_storage.nbytes(), "bytes from",
+    //           source_storage.device(), "to", dest_storage.device());
+    // std::memcpy(dest_storage.data_ptr().get(),
+    // source_storage.data_ptr().get(),
+    //             source_storage.nbytes());
+    // DEBUGINFO("Finished Copying ");
     return dst;
   } else {
     // For all other cases fallback to the upstream implementation
