@@ -21,7 +21,6 @@ from sympy import Integer, Symbol, Expr, Mod, floor
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
-    RESTICKIFY_OP,
     INPUT_DIM_LABELS,
     LAYOUT_LABELS,
     OUTPUT_DIM_LABELS,
@@ -233,10 +232,6 @@ def _is_matmul(op: str) -> bool:
     return op in ("matmul", "batchmatmul")
 
 
-def _is_data_op(op: str) -> bool:
-    return op in ("to_dtype", IDENTITY_OP, RESTICKIFY_OP)
-
-
 def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
     if is_matmul:
         return MATMUL_DIM_LABELS[5 - ndim :]
@@ -312,7 +307,6 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
 
 def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     is_matmul = _is_matmul(op_spec.op)
-    is_data_op = _is_data_op(op_spec.op)
     ndim = len(op_spec.iteration_space)
     dim_labels = _get_op_dim_labels(ndim, is_matmul)
 
@@ -330,13 +324,12 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     }
 
     dim_splits = {
-        symbol_mapping[dim]: value[-1] if not is_data_op else 1
-        for dim, value in op_spec.iteration_space.items()
+        symbol_mapping[dim]: value[-1] for dim, value in op_spec.iteration_space.items()
     }
     num_cores = math.prod(dim_splits.values())
 
     work_slices = {
-        symbol_mapping[sym]: wk_slice if not is_data_op else 1
+        symbol_mapping[sym]: wk_slice
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
