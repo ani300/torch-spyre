@@ -110,6 +110,8 @@ def multi_dim_iteration_space_split(
     # First pass: satisfy minimum split requirements
     if min_splits:
         for var, min_split in min_splits.items():
+            assert var not in priorities  # there shouldn't be an overlap
+
             # Check if we have enough cores for this minimum split
             if n_cores_remaining // min_split <= 0:
                 logger.critical(
@@ -127,8 +129,6 @@ def multi_dim_iteration_space_split(
     for v in priorities:
         if n_cores_remaining <= 1:
             break
-        if min_splits and v in min_splits:
-            continue  # Already handled in first pass
 
         best_split = core_split(iteration_space[v], n_cores_remaining)
         if best_split > 1:
@@ -164,6 +164,9 @@ def adjust_it_space_for_sticks(
                 f"Mixed-dtype tensors sharing a stick variable are not supported."
             )
             continue
+        # FIXME: here we assume padding to a full stick. It may not always be the
+        #        case and we shouldn use a more robust way of computing the number
+        #        of sticks
         it_space[stick_var] = (
             it_space[stick_var] + elems_per_stick - 1
         ) // elems_per_stick
@@ -230,6 +233,7 @@ def prioritize_dimensions(
     output: TensorDep,
     it_space: dict[Symbol, Expr],
     inputs: list[TensorDep] | None = None,
+    exclude_reduction: bool = False,
 ) -> tuple[list[Symbol], dict[Symbol, int]]:
     """
     Return iteration variables in priority order for core division, along with
@@ -250,25 +254,28 @@ def prioritize_dimensions(
     coord_vars = {v for e in output.device_coords[:-1] for v in e.free_symbols}
 
     all_deps = (inputs + [output]) if inputs is not None else [output]
+    # NOTE: it is possible that a reduction var is selected as must split
     min_splits = must_split_vars(all_deps, it_space)
-    priority = list(min_splits.keys())
 
+    priority = []
     remaining_output = []
     reduction_dims: list[tuple[Symbol, Expr]] = []
     for s, e in it_space.items():
         if s in min_splits:
+            assert not exclude_reduction or s in coord_vars, (
+                f"Excluding reduction dimensions but {s} must be split"
+            )
             continue
         if s in coord_vars:
             remaining_output.append((s, e))
         else:
-            # NOTE: skip reduction dims for now for known backend bug
-            # reduction_dims.append((s, e))
-            pass
+            reduction_dims.append((s, e))
 
     remaining_output.sort(key=lambda t: t[1], reverse=True)
     reduction_dims.sort(key=lambda t: t[1], reverse=True)
     priority += [t[0] for t in remaining_output]
-    priority += [t[0] for t in reduction_dims]
+    if not exclude_reduction:
+        priority += [t[0] for t in reduction_dims]
 
     return priority, min_splits
 
@@ -309,8 +316,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         return
 
     red: Reduction = n.node.data
-    if red.reduction_type not in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP):
-        return
+    is_matmul = red.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP)
 
     it_space = iteration_space(n)
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
@@ -319,7 +325,12 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     # Adjust all stick dimension variables (inputs and output) to count sticks
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
 
-    priorities, min_splits = prioritize_dimensions(output_td, it_space, input_tds)
+    # FIXME: For non-matmul reduction, excluting reduction dimensions from work
+    #        division candidates temporarily till known backend issue is fixed
+    #        https://github.com/torch-spyre/torch-spyre/issues/1304
+    priorities, min_splits = prioritize_dimensions(
+        output_td, it_space, input_tds, exclude_reduction=not is_matmul
+    )
     splits = multi_dim_iteration_space_split(
         it_space, max_cores, priorities, min_splits
     )
