@@ -12,8 +12,8 @@ def check(name, cpu_expected, spyre_result):
         print(f"  FAIL: {name}")
         diff = (cpu_expected.float() - actual.float()).abs().max().item()
         print(f"    max abs diff: {diff}")
-        print(f"    expected[:3,:3]:\n{cpu_expected[:3,:3]}")
-        print(f"    actual[:3,:3]:\n{actual[:3,:3]}")
+        print(f"    expected[:3,:3]:\n{cpu_expected[:3, :3]}")
+        print(f"    actual[:3,:3]:\n{actual[:3, :3]}")
         return False
 
 
