@@ -45,7 +45,7 @@ from .pass_utils import (
 )
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
-from .op_spec import OpSpec, TensorArg
+from .op_spec import IndirectSource, OpSpec, TensorArg
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -301,6 +301,48 @@ class SpyreKernelOpsHandler(DefaultHandler):
         self.kernel.num_load += 1
         return self.kernel.load(name, index)
 
+    def indirect_indexing(
+        self,
+        index_var: RValue,
+        size,
+        check: bool = True,
+        wrap_neg: bool = True,
+    ) -> sympy.Symbol:
+        """Convert a runtime-loaded index value into a sympy symbol.
+
+        Mirrors upstream Inductor's ``ops.indirect_indexing``
+        (``torch/_inductor/ops_handler.py:963``).  Returns a fresh
+        ``tmp_<n>`` symbol and records ``symbol -> TensorAccess`` on the
+        kernel so ``store()`` can translate it into ``IndirectSource``
+        metadata on the emitted ``TensorArg``.
+
+        Bounds checks (``check``) and negative-wrap (``wrap_neg``) are
+        ignored: Spyre index tensors are handled by deeptools' IBR
+        machinery at runtime, which performs its own validation.
+        """
+        origin = index_var
+        # Peel any identity/arithmetic wrappers introduced by upstream
+        # lowerings (e.g. ``to_dtype``) down to the underlying
+        # ``TensorAccess`` — only direct loads are indirect-indexable.
+        while isinstance(origin, PointwiseOp) and origin.arguments:
+            origin = origin.arguments[0]
+        if not isinstance(origin, TensorAccess):
+            raise Unsupported(
+                "indirect_indexing: expected index value to come from a "
+                f"direct load, got {type(index_var).__name__}"
+            )
+        # Match upstream Inductor's ``SymT.TMP`` symbol naming ("tmpN")
+        # so downstream helpers that detect data-dependent indices via
+        # ``free_symbol_is_type(..., SymT.TMP)`` continue to work.
+        sym = sympy.Symbol(
+            f"tmp{self.kernel._indirect_counter}",
+            integer=True,
+            nonnegative=True,
+        )
+        self.kernel._indirect_counter += 1
+        self.kernel.indirect_cse_origins[sym] = origin
+        return sym
+
     def store(
         self, name: str, index: sympy.Expr, value: RValue, mode: StoreMode = None
     ) -> None:
@@ -353,6 +395,16 @@ class SpyreKernel(Kernel[CSEVariable]):
         super().__init__()
         self.op_specs: list[OpSpec | UnimplementedOp] = []
         self.spyre_kernel_args: list[Tuple[str, TensorArg]] = []
+        # Maps ``tmp_N`` sympy symbols produced by ``indirect_indexing`` to
+        # the ``TensorAccess`` that loaded the index value.  Used by
+        # ``store()`` to translate data-dependent coords into
+        # ``IndirectSource`` metadata on the emitted ``TensorArg``.
+        self.indirect_cse_origins: dict[sympy.Symbol, "TensorAccess"] = {}
+        self._indirect_counter: int = 0
+        # Maps id(TensorArg) -> list of tmp symbols present in the
+        # pre-concretization index.  Populated by ``create_tensor_arg``
+        # and consumed by ``_apply_indirect_from_cse`` in ``store``.
+        self._pending_indirect: dict[int, list[sympy.Symbol]] = {}
 
     def __enter__(self) -> Self:
         super().__enter__()
@@ -369,7 +421,23 @@ class SpyreKernel(Kernel[CSEVariable]):
         # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
         # can correctly isolate each loop variable's contribution.
 
-        index = concretize_index(tensor.index, set(it_space.keys()))
+        # Capture data-dependent (``tmp<N>``) symbols before
+        # concretize_index strips them, so we can translate them into
+        # ``IndirectSource`` metadata later.  Also substitute them to 0
+        # in the raw index so downstream coordinate math produces the
+        # same shape as the non-indirect case — the true runtime offset
+        # is applied by deeptools' IBR via ``indirect_source``.
+        indirect_syms: list[sympy.Symbol] = []
+        raw_index = tensor.index
+        tmp_subs: dict = {}
+        for s in raw_index.free_symbols:
+            if s in self.indirect_cse_origins:
+                indirect_syms.append(s)
+                tmp_subs[s] = 0
+        if tmp_subs:
+            raw_index = raw_index.subs(tmp_subs)
+
+        index = concretize_index(raw_index, set(it_space.keys()))
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
             tensor.layout.device_layout.stride_map,
@@ -384,6 +452,11 @@ class SpyreKernel(Kernel[CSEVariable]):
             device_coords,
             tensor.layout.allocation,
         )
+        if indirect_syms:
+            # Stash the indirect symbols on the kernel keyed by tensor_arg
+            # identity so ``store()`` can translate them into
+            # ``IndirectSource`` metadata once it knows the final arg list.
+            self._pending_indirect[id(tensor_arg)] = list(indirect_syms)
         if not tensor.layout.allocation:
             self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
@@ -401,6 +474,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             elif arg.device_dtype not in [
                 DataFormats.IEEE_FP32,
                 DataFormats.SEN169_FP16,
+                DataFormats.IEEE_INT32,
             ]:
                 raise Unsupported(f"operation on {arg.device_dtype}")
 
@@ -496,6 +570,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             args.append(self.create_tensor_arg(False, real_dst_name, dst))
             op_info.update(value.op_info)
+            if self._pending_indirect:
+                self._apply_indirect_from_cse(args)
             self.op_specs.append(self.create_op_spec(value.op, False, args, op_info))
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
@@ -512,10 +588,103 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op = RESTICKIFY_OP
             else:
                 op = IDENTITY_OP
+            if self._pending_indirect:
+                self._apply_indirect_from_cse(args)
+                # A dataop with indirect access is actually a gather —
+                # deeptools' IBR-enabled compute ops expect an ``add``
+                # opcode.  Rewrite the op name so the emitted SDSC has
+                # ``opFuncName == "add"`` rather than ``identity`` /
+                # ``ReStickify``.
+                op = "add"
             op_spec = self.create_op_spec(op, False, args, op_info)
             self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
+
+    def _apply_indirect_from_cse(self, args: list[TensorArg]) -> None:
+        """Translate pending ``tmp_N`` symbols into ``IndirectSource`` metadata.
+
+        ``create_tensor_arg`` records which ``tmp_N`` symbols appeared in
+        each ``TensorArg``'s pre-concretization index (via
+        ``_pending_indirect``).  Here, for each such arg we:
+
+          1. Look up the originating ``TensorAccess`` (the index tensor's
+             load) via ``indirect_cse_origins``.
+          2. Build a ``TensorArg`` for the index tensor if it isn't
+             already in ``args``; append it so the emitted OpSpec has
+             the index tensor as an explicit input.
+          3. Determine the gather dimension (the first device-coord
+             position whose original pre-concretization form referenced
+             the ``tmp_N`` — for the initial scope we assume dim 0).
+          4. Compute ``page_size`` (product of all device dims except
+             ``gather_dim``, times the element size in bytes).
+          5. Attach ``IndirectSource`` to the value ``TensorArg``.
+        """
+        out_idx = len(args) - 1
+        bytes_per_elem = 2  # fp16 default; output is usually fp16.
+        output_arg = args[out_idx]
+        del args[out_idx]
+
+        for arg in list(args):
+            syms = self._pending_indirect.pop(id(arg), None)
+            if not syms:
+                continue
+            if len(syms) > 1:
+                raise Unsupported(
+                    "indirect_indexing: multi-axis indirect access not supported"
+                )
+            sym = syms[0]
+            origin = self.indirect_cse_origins[sym]
+
+            # Ensure the index tensor is an explicit input.
+            index_arg_idx = None
+            for i, existing in enumerate(args):
+                existing_name = next(
+                    (
+                        n
+                        for n, ta in self.spyre_kernel_args
+                        if ta is existing
+                    ),
+                    None,
+                )
+                if existing_name == origin.name:
+                    index_arg_idx = i
+                    break
+            if index_arg_idx is None:
+                index_tensor_arg = self.create_tensor_arg(
+                    True, origin.name, origin
+                )
+                # ``create_tensor_arg`` may have stashed pending indirect
+                # entries for the index tensor itself; drop them — an
+                # index tensor's own access is direct.
+                self._pending_indirect.pop(id(index_tensor_arg), None)
+                args.append(index_tensor_arg)
+                index_arg_idx = len(args) - 1
+
+            # Initial scope: gather_dim = 0.
+            gather_dim = 0
+
+            # page_size = product of device_size except gather_dim, × bytes.
+            page_size = 1
+            device_size = arg.device_size
+            for d in range(len(device_size) - 1):
+                if d != gather_dim:
+                    page_size *= device_size[d]
+            page_size *= device_size[-1] * bytes_per_elem
+
+            index_value = sympy.Symbol("index_value")
+            arg.indirect_source = IndirectSource(
+                index_arg_index=index_arg_idx,
+                gather_dim=gather_dim,
+                base_offset_expr=index_value * page_size,
+            )
+
+        # Clear now-consumed origins so subsequent kernels start fresh.
+        self.indirect_cse_origins.clear()
+        self._pending_indirect.clear()
+
+        # Re-append the output arg at the end.
+        args.append(output_arg)
 
     def store_reduction(
         self, name: str, index: sympy.Expr, value: ReductionOp | UnimplementedOp
@@ -645,6 +814,14 @@ class SpyreKernel(Kernel[CSEVariable]):
                                         + "],"
                                     )
                                     buf.writeline(f"allocation={arg.allocation!r},")
+                                    if arg.indirect_source is not None:
+                                        isrc = arg.indirect_source
+                                        buf.writeline(
+                                            "indirect_source=IndirectSource("
+                                            f"index_arg_index={isrc.index_arg_index}, "
+                                            f"gather_dim={isrc.gather_dim}, "
+                                            f"base_offset_expr={sympy_str(isrc.base_offset_expr)}),"
+                                        )
                                 buf.writeline("),")
                         buf.writeline("]")
                     buf.writeline("),")

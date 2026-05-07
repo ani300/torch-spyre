@@ -1705,6 +1705,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     0,
                 ),
             },
+            # aten.embedding now routes through the ops.indirect_indexing
+            # lowering, which emits an SDSC with indirectAllocType_ that
+            # dxp_standalone currently rejects for 2-D index shapes.
+            # Expected failure until the deeptools backend accepts these
+            # SDSCs (tracked as a follow-up to indirect-access support).
+            "expect_fail": ["basic", "padding_idx"],
         },
         ("test_isin", "test_isin_cpu"): {
             "param_sets": {

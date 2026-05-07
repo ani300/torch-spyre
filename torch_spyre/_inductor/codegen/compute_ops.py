@@ -205,8 +205,51 @@ def gen_coord_info_value(
     )
 
 
+def _alloc_node_name(i, tensor):
+    return f"allocate-Tensor{i}_{'hbm' if not tensor.allocation else 'lx'}"
+
+
+def _build_indirect_alloc_map(sdsc_spec):
+    """Build per-tensor indirect-access metadata for the SDSC allocate nodes.
+
+    Returns a dict mapping tensor index to
+    ``(alloc_type, related_alloc_name)`` where ``alloc_type`` is one of
+    ``"value_tensor"`` (this tensor is indirectly addressed), ``"index_tensor"``
+    (this tensor supplies indices for another tensor).  Tensors that do not
+    participate in indirect access are absent from the dict.
+    """
+    result: dict[int, tuple[str, str]] = {}
+    index_tensor_to_value: dict[int, int] = {}
+
+    for i, tensor in enumerate(sdsc_spec.args):
+        if tensor.indirect_src is not None:
+            idx_tensor_idx = tensor.indirect_src.index_tensor_idx
+            result[i] = (
+                "value_tensor",
+                _alloc_node_name(idx_tensor_idx, sdsc_spec.args[idx_tensor_idx]),
+            )
+            index_tensor_to_value[idx_tensor_idx] = i
+
+    for idx_idx, val_idx in index_tensor_to_value.items():
+        result[idx_idx] = (
+            "index_tensor",
+            _alloc_node_name(val_idx, sdsc_spec.args[val_idx]),
+        )
+
+    return result
+
+
 def generate_sdsc(idx, sdsc_spec):
     out_idx = len(sdsc_spec.args) - 1
+    indirect_alloc_map = _build_indirect_alloc_map(sdsc_spec)
+    index_arg_indices = {
+        a.indirect_src.index_tensor_idx
+        for a in sdsc_spec.args
+        if a.indirect_src is not None
+    }
+    indirect_access_index_labeled_ds = [
+        f"Tensor{j}-idx{j}" for j in sorted(index_arg_indices)
+    ]
     core_id_to_wk_slice = {
         str(c): {
             str(dim): int(expr.subs({Symbol("core_id"): c}))
@@ -285,7 +328,7 @@ def generate_sdsc(idx, sdsc_spec):
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",
-                                "name_": f"allocate-Tensor{i}_{'hbm' if not tensor.allocation else 'lx'}",
+                                "name_": _alloc_node_name(i, tensor),
                                 "prev_": "",
                                 "ldsIdx_": i,
                                 "component_": "hbm" if not tensor.allocation else "lx",
@@ -341,6 +384,20 @@ def generate_sdsc(idx, sdsc_spec):
                                     if tensor.backGap
                                     else {}
                                 ),
+                                "indirectAllocType_": (
+                                    indirect_alloc_map[i][0]
+                                    if i in indirect_alloc_map
+                                    else "no_indirection"
+                                ),
+                                **(
+                                    {
+                                        "relatedIndirectAccessAlloc_": indirect_alloc_map[
+                                            i
+                                        ][1],
+                                    }
+                                    if i in indirect_alloc_map
+                                    else {}
+                                ),
                                 "coordinates_": {
                                     "coordInfo": {
                                         str(dim): gen_coord_info_value(
@@ -374,7 +431,11 @@ def generate_sdsc(idx, sdsc_spec):
                             {
                                 "ldsIdx_": i,
                                 "dsName_": f"Tensor{i}",
-                                "dsType_": tensor.layout,
+                                "dsType_": (
+                                    "KERNEL_IDX"
+                                    if i in index_arg_indices
+                                    else tensor.layout
+                                ),
                                 "scale_": [
                                     tensor.scales[dim]
                                     for dim in sdsc_spec.layouts[tensor.layout][
@@ -409,8 +470,18 @@ def generate_sdsc(idx, sdsc_spec):
                                 "inputLabeledDs": [
                                     f"Tensor{i}-idx{i}"
                                     for i in range(sdsc_spec.num_inputs)
+                                    if i not in index_arg_indices
                                 ],
                                 "outputLabeledDs": [f"Tensor{out_idx}-idx{out_idx}"],
+                                **(
+                                    {
+                                        "indirectAccessIndexLabeledDs": (
+                                            indirect_access_index_labeled_ds
+                                        ),
+                                    }
+                                    if indirect_access_index_labeled_ds
+                                    else {}
+                                ),
                             }
                         ],
                     }

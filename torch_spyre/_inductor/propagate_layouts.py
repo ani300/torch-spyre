@@ -309,6 +309,14 @@ def _matmul_layouts(
     return [out_stl]
 
 
+def _is_indirect_dep(dep: MemoryDep) -> bool:
+    """True if ``dep.index`` contains a ``tmp<N>`` symbol from
+    ``ops.indirect_indexing``.  Such inputs are addressed at runtime via
+    deeptools' IBR and do not constrain the host-side stick layout.
+    """
+    return any(s.name.startswith("tmp") for s in dep.index.free_symbols)
+
+
 def _multi_arg_pointwise_layouts(
     op: Operation,
     output: FixedLayout,
@@ -321,10 +329,15 @@ def _multi_arg_pointwise_layouts(
        1. Compute set of output stick expressions possible given the input layouts
        2. Compute an out STL for each
        3. Construct the AllSameNode cost function since in and out sticks must always match
+
+    Inputs whose memory dep is indirectly addressed (contain a ``tmp`` symbol
+    from ``ops.indirect_indexing``) are excluded from stick-compatibility
+    reasoning — deeptools' IBR handles their layout at runtime.
     """
+    cost_args = [a for a in args if not _is_indirect_dep(a.dep)]
     stick_exprs = {
         device_coordinates(stl, arg.dep)[-1]
-        for arg in args
+        for arg in cost_args
         for stl in arg.layouts
         if device_coordinates(stl, arg.dep)[-1] != 0
     }
@@ -336,14 +349,14 @@ def _multi_arg_pointwise_layouts(
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
+    in_coords = [host_coordinates(arg.layout, arg.dep) for arg in cost_args]
     out_coords = host_coordinates(output, output_dep)
     can_use_same_layout = True
 
-    if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
+    if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in cost_args):
         can_use_same_layout = False
     else:
-        for arg, arg_coors in zip(args, in_coords):
+        for arg, arg_coors in zip(cost_args, in_coords):
             if (
                 arg_coors != out_coords
                 or arg.dep.index != output_dep.index
@@ -355,8 +368,8 @@ def _multi_arg_pointwise_layouts(
     results: list[SpyreTensorLayout] = []
     # Sort stick exprs for determinism
     for stick_expr in sorted(stick_exprs, key=iter_var_id) if stick_exprs else [None]:
-        if can_use_same_layout:
-            template_stl = next(iter(args[0].layouts))
+        if can_use_same_layout and cost_args:
+            template_stl = next(iter(cost_args[0].layouts))
             stl = SpyreTensorLayout(
                 template_stl.device_size,
                 template_stl.stride_map,
@@ -383,7 +396,7 @@ def _multi_arg_pointwise_layouts(
             c_stride = [concretize_expr(s) for s in output.stride]
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         results.append(stl)
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
+    op.restick_cost_fn = AllSameNode.from_args(cost_args, results, output_dep)
     return results
 
 

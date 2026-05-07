@@ -81,11 +81,22 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     is also zeroed.  This function replaces size symbols with their concrete
     hints so that coordinate expressions are structurally identical to static-shape
     compilation while loop variable symbols are preserved.
+
+    Upstream Inductor's ``tmp<N>`` (``SymT.TMP``) symbols represent
+    runtime-supplied indices from ``ops.indirect_indexing``; they cannot
+    be concretized via ``size_hint``.  For layout-propagation purposes
+    they collapse to 0 — the real offset is applied by deeptools' IBR at
+    runtime and tracked separately via ``TensorArg.indirect_source``.
     """
     size_syms = index.free_symbols - loop_vars
     if not size_syms:
         return index
-    subs = {s: V.graph.sizevars.size_hint(s) for s in size_syms}
+    subs: dict = {}
+    for s in size_syms:
+        if s.name.startswith("tmp"):
+            subs[s] = 0
+        else:
+            subs[s] = V.graph.sizevars.size_hint(s)
     result = index.subs(subs)
     return result
 

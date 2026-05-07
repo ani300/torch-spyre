@@ -14,7 +14,7 @@
 
 import dataclasses
 import math
-from typing import Any
+from typing import Any, Optional
 
 from sympy import Integer, Symbol, Expr, Mod, floor
 
@@ -40,6 +40,15 @@ logger = get_inductor_logger("codegen.superdsc")
 
 
 @dataclasses.dataclass
+class SDSCIndirectSrc:
+    """SDSC-level description of indirect (data-dependent) addressing."""
+
+    index_tensor_idx: int
+    base_offset_expr: str
+    address_mode: str = "ibr"
+
+
+@dataclasses.dataclass
 class SDSCArgs:
     layout: str
     data_format: DataFormats
@@ -50,13 +59,21 @@ class SDSCArgs:
     allocation: dict[str, Any]
     start_address: int | Symbol
     backGap: dict[Symbol, int]
+    indirect_src: Optional[SDSCIndirectSrc] = None
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
         strides = ", ".join(f"{k}={v}" for k, v in self.strides.items())
         offsets = ", ".join(f"{k}={v}" for k, v in self.offsets.items())
         max_dim_sizes = ", ".join(f"{k}={v}" for k, v in self.max_dim_sizes.items())
-        allocation = ", ".join(f"{k}={v}" for k, v in self.allocation.items())
+        allocation = (
+            ", ".join(f"{k}={v}" for k, v in self.allocation.items())
+            if self.allocation
+            else "None"
+        )
+        indirect = (
+            f"  indirect_src={self.indirect_src}\n" if self.indirect_src else ""
+        )
         return (
             f"SDSCArgs(\n"
             f"  layout={self.layout},\n"
@@ -68,6 +85,7 @@ class SDSCArgs:
             f"  allocation=[{allocation}],\n"
             f"  start_address={self.start_address}\n"
             f"  backGap={self.backGap}\n"
+            f"{indirect}"
             f")"
         )
 
@@ -125,6 +143,17 @@ class SDSCSpec:
         if self.constants:
             parts.append(
                 f"  constants=[{', '.join(f'{k}={v}' for k, v in self.constants.items())}]"
+            )
+        indirect_args = [a for a in self.args if a.indirect_src is not None]
+        if indirect_args:
+            parts.append(
+                "  indirect_tensors=["
+                + ", ".join(
+                    f"idx={a.indirect_src.index_tensor_idx}"
+                    f" expr={a.indirect_src.base_offset_expr}"
+                    for a in indirect_args
+                )
+                + "]"
             )
         return "SDSCSpec(\n" + "\n".join(parts) + "\n)"
 
@@ -327,6 +356,18 @@ def _create_sdsc_tensors(
             arg.device_dtype.elems_per_stick(),
             MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
         )
+
+        indirect_src = None
+        if arg.indirect_source is not None:
+            indirect_src = SDSCIndirectSrc(
+                index_tensor_idx=arg.indirect_source.index_arg_index,
+                base_offset_expr=str(arg.indirect_source.base_offset_expr),
+                address_mode="ibr",
+            )
+            if 0 <= arg.indirect_source.gather_dim < len(dim_order):
+                gather_dim_sym = dim_order[arg.indirect_source.gather_dim]
+                max_dim_sizes[gather_dim_sym] = 1
+
         sdsc_args.append(
             SDSCArgs(
                 layout=label,
@@ -338,8 +379,25 @@ def _create_sdsc_tensors(
                 allocation=arg.allocation,
                 start_address=addr if not arg.allocation else arg.allocation["lx"],
                 backGap=backGap,
+                indirect_src=indirect_src,
             )
         )
+
+    # Rewrite index-tensor SDSCArgs: bounded max_dim_sizes, INT32 dtype, and
+    # reorder dims so the gather dimension becomes the stick dimension.
+    for arg in op_spec.args:
+        if arg.indirect_source is None:
+            continue
+        idx_arg_pos = arg.indirect_source.index_arg_index
+        if idx_arg_pos < 0 or idx_arg_pos >= len(sdsc_args):
+            continue
+        idx_sdsc = sdsc_args[idx_arg_pos]
+        idx_layout = layouts[idx_sdsc.layout]
+        for dim in idx_layout["dim_order"]:
+            if dim in idx_sdsc.max_dim_sizes:
+                idx_sdsc.max_dim_sizes[dim] = iteration_space.get(dim, 1)
+
+        idx_sdsc.data_format = DataFormats.IEEE_INT32
 
     return sdsc_args, layouts, missing_dim
 

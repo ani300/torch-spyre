@@ -14,11 +14,36 @@
 
 
 import dataclasses
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 from sympy import Symbol, Expr
 from torch_spyre._C import DataFormats
 import torch
+
+
+@dataclasses.dataclass
+class IndirectSource:
+    """Describes data-dependent (indirect) addressing for a tensor argument.
+
+    When present on a TensorArg, the tensor's base address along
+    ``gather_dim`` is computed at runtime by reading values from another
+    tensor argument (the index tensor) rather than from a static affine
+    expression. This models the ``A[X[i]]`` pattern needed for
+    gather/index_select/embedding workloads.
+
+    Attributes:
+        index_arg_index: Position of the index tensor in the OpSpec's
+            ``args`` list. The index tensor supplies the runtime-computed
+            indices.
+        gather_dim: Which dimension of *this* tensor is indirectly addressed.
+        base_offset_expr: A sympy expression that maps each index value to a
+            byte offset. The free variable ``index_value`` represents the
+            value read from the index tensor at runtime.
+    """
+
+    index_arg_index: int
+    gather_dim: int
+    base_offset_expr: Expr
 
 
 @dataclasses.dataclass
@@ -34,6 +59,10 @@ class TensorArg:
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
         allocation: If present, the offset in scratchpad memory assigned to the Tensor.
+        indirect_source: If present, this tensor uses data-dependent
+            addressing. The tensor's base address along the gather dimension
+            is computed at runtime from values of another tensor argument
+            (the index tensor).
     """
 
     is_input: bool
@@ -42,6 +71,7 @@ class TensorArg:
     device_size: list[int]
     device_coordinates: list[Expr]
     allocation: Any
+    indirect_source: Optional[IndirectSource] = None
 
 
 @dataclasses.dataclass

@@ -711,3 +711,5 @@ def lower_constant(value, dtype, device):
         torch.ops.spyre.constant, V.graph.current_node.target._overloadname
     )
     return ir.TensorBox.create(SpyreConstantFallback(op_overload, value, dtype, device))
+
+
