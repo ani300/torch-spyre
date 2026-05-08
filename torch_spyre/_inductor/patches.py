@@ -100,9 +100,29 @@ def enable_spyre_context(
 
     from torch._inductor.ir import Loops
 
-    # Force all operations to be realized when LoopLevel IR is initially constructed
+    # Force all operations to be realized when LoopLevel IR is initially
+    # constructed — except for indirect-access source Pointwises, whose
+    # ``inner_fn`` reads through ``ops.indirect_indexing`` (upstream's
+    # ``SymT.TMP`` symbols appear as ``tmp<N>`` free symbols in the read
+    # indices).  Those must stay un-realized so they inline into their
+    # consumer; otherwise the gather and its consuming compute op end up
+    # in separate SDSC bundles and the indirect-access metadata lives on
+    # a single-operand ``add`` that deeptools rejects.
     old_loop = Loops.has_large_inner_fn
-    Loops.has_large_inner_fn = lambda self, threshold=None: True
+
+    def _spyre_has_large_inner_fn(self, threshold=None):
+        try:
+            for dep in self.get_reads():
+                idx = getattr(dep, "index", None)
+                if idx is None:
+                    continue
+                if any(s.name.startswith("tmp") for s in idx.free_symbols):
+                    return False
+        except Exception:
+            pass
+        return True
+
+    Loops.has_large_inner_fn = _spyre_has_large_inner_fn
 
     from torch._inductor.fx_passes import joint_graph
 

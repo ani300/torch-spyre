@@ -103,13 +103,26 @@ def _create_restickify_node(
             env[tb_fx_node] = tb
     graph_lowering.env.update(env)
 
+    def _safe_get_name(tb):
+        """Return ``tb.get_name()`` or None for un-realized tensors.
+
+        With ``has_large_inner_fn`` relaxed for indirect-access
+        Pointwises, some TensorBoxes in ``graph_lowering.env`` wrap
+        unnamed Loops (the gather Pointwise inlined into its consumer).
+        They can't be the restickify target anyway — skip them.
+        """
+        try:
+            return tb.get_name()
+        except NotImplementedError:
+            return None
+
     # Search env by buffer name to find the FX node to pass to restickify.
     fx_arg_node = next(
         fx_node
         for fx_node, tb in graph_lowering.env.items()
         if isinstance(fx_node, torch.fx.Node)
         and isinstance(tb, TensorBox)
-        and tb.get_name() == arg_name
+        and _safe_get_name(tb) == arg_name
     )
     # Insert at a valid position in the FX graph; the operations list order is
     # authoritative pre-scheduler, not position in the FX graph.

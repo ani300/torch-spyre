@@ -29,6 +29,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from .logging_utils import get_inductor_logger
 
+from .indirect_add_zero_pass import indirect_add_zero_pass
 from .padding import insert_padding
 from .temp_passes import (
     bmm_unflatten_pass,
@@ -132,6 +133,12 @@ class CustomPostPasses(CustomGraphPass):
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
         insert_padding,
+        # Inject ``+ 0.0`` after un-consumed indirect-indexing ops so the
+        # emitted SDSC has two ``inputLabeledDs`` entries (deeptools'
+        # ``add`` opcode requires operand count == 2).  Must run before
+        # convert_constant_with_graph_node so the zero gets promoted to
+        # a real spyre.constant tensor.
+        indirect_add_zero_pass,
         convert_constant_with_graph_node,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,

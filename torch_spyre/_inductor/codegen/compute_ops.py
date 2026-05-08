@@ -257,6 +257,32 @@ def generate_sdsc(idx, sdsc_spec):
         }
         for c in range(sdsc_spec.num_cores)
     }
+
+    # Build ``primaryDsInfo_`` with one entry per layout label, plus a
+    # ``KERNEL_IDX`` entry mirroring the index tensor's underlying layout
+    # when any labeledDs uses that dsType.  deeptools' SDSC JSON importer
+    # (designSpaceConfig.cpp:7769) does
+    # ``primaryDsInfo_.at(labeledDs->dsType_)`` so the map must contain a
+    # ``KERNEL_IDX`` key when the labeledDs uses it.
+    primary_ds_info: dict = {
+        label: {
+            "layoutDimOrder_": [str(d) for d in info["dim_order"]],
+            "stickDimOrder_": [str(info["stick_dim_order"])],
+            "stickSize_": [info["stick_size"]],
+            "stickRepl_": [1],
+        }
+        for label, info in sdsc_spec.layouts.items()
+    }
+    for j in sorted(index_arg_indices):
+        idx_arg = sdsc_spec.args[j]
+        info = sdsc_spec.layouts[idx_arg.layout]
+        primary_ds_info["KERNEL_IDX"] = {
+            "layoutDimOrder_": [str(d) for d in info["dim_order"]],
+            "stickDimOrder_": [str(info["stick_dim_order"])],
+            "stickSize_": [info["stick_size"]],
+            "stickRepl_": [1],
+        }
+
     return {
         f"{idx}_{sdsc_spec.opfunc}": {
             "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
@@ -315,16 +341,7 @@ def generate_sdsc(idx, sdsc_spec):
                                 },
                             }
                         },
-                        "primaryDsInfo_": {
-                            label: {
-                                "layoutDimOrder_": [
-                                    str(dim) for dim in layout_info["dim_order"]
-                                ],
-                                "stickDimOrder_": [str(layout_info["stick_dim_order"])],
-                                "stickSize_": [layout_info["stick_size"]],
-                            }
-                            for label, layout_info in sdsc_spec.layouts.items()
-                        },
+                        "primaryDsInfo_": primary_ds_info,
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",

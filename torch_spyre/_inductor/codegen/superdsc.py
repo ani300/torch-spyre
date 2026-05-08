@@ -367,6 +367,32 @@ def _create_sdsc_tensors(
             if 0 <= arg.indirect_source.gather_dim < len(dim_order):
                 gather_dim_sym = dim_order[arg.indirect_source.gather_dim]
                 max_dim_sizes[gather_dim_sym] = 1
+                # The gather dim's device coordinate is ``0`` (we zeroed the
+                # tmp symbol in ``create_tensor_arg``), which made the scale
+                # logic above treat it as a reduced/broadcast dim
+                # (scale == -1).  For indirect access the dim is read at
+                # runtime via IBR — it's neither broadcast nor reduced.
+                # Force scale = 1 so the labeledDs scale matches the paged
+                # dim semantics expected by deeptools (``dsc2.cpp:3753``
+                # asserts that no scale == -1 dim overlaps the paged dims).
+                scales[gather_dim_sym] = 1
+                # Also bound the stick dim (elements-per-stick) so
+                # deeptools' AllocateNode::getPageSize() reports both the
+                # gather dim AND the stick dim as paged.  That makes the
+                # innermost paged chunk loop == the stick dim == the index
+                # tensor's stick dim — satisfying
+                # L3DlOpsScheduler.cpp:6070's check
+                # ``innerIndexDimInChunkLoops == indexStickDim``.
+                # Reference SDSC (real_indirect_sdsc.json) uses the same
+                # pattern: ``maxDimSizes_ = [-1, 64, -1, 1]`` bounds mb=64
+                # (gather) AND y=1 (stick).  The ``1`` on the stick dim is
+                # in "sticks" (one stick per page); deeptools converts to
+                # elements via the lds's stickSize.  We mirror by setting
+                # the stick-dim page = one stick's worth of elements.
+                if effective_stick is not None and effective_stick != gather_dim_sym:
+                    max_dim_sizes[effective_stick] = (
+                        arg.device_dtype.elems_per_stick()
+                    )
 
         sdsc_args.append(
             SDSCArgs(
@@ -385,9 +411,11 @@ def _create_sdsc_tensors(
 
     # Rewrite index-tensor SDSCArgs: bounded max_dim_sizes, INT32 dtype, and
     # reorder dims so the gather dimension becomes the stick dimension.
-    for arg in op_spec.args:
+    value_sdsc = None
+    for i, arg in enumerate(op_spec.args):
         if arg.indirect_source is None:
             continue
+        value_sdsc = sdsc_args[i]
         idx_arg_pos = arg.indirect_source.index_arg_index
         if idx_arg_pos < 0 or idx_arg_pos >= len(sdsc_args):
             continue
@@ -397,7 +425,51 @@ def _create_sdsc_tensors(
             if dim in idx_sdsc.max_dim_sizes:
                 idx_sdsc.max_dim_sizes[dim] = iteration_space.get(dim, 1)
 
-        idx_sdsc.data_format = DataFormats.IEEE_INT32
+        # deeptools' senulator asserts the IBR-loaded data must be
+        # SENUINT32 (deeptools/senulator/memoryElement.cpp:768).
+        # IEEE_INT32 gets silently mis-decoded and the IBR register
+        # ends up holding garbage, which the hardware then dereferences
+        # into an unmapped segment — triggering a runtime page fault.
+        idx_sdsc.data_format = DataFormats.SENUINT32
+
+    # For an indirect-access DSC, realign all non-index, non-value-tensor
+    # SDSCArgs so their ``dsType`` (i.e. layout label) matches the value
+    # tensor's label — typically ``OUTPUT`` (stickDim=``out``, the
+    # non-gather axis).  Without this the output tensor ends up with
+    # ``dsType=KERNEL`` sticking on the gather dim (``mb``), which makes
+    # deeptools' SFP ``getMinParamForDim(gather_dim)`` return the stick
+    # size and raises the chunk-search ``lBound`` above the available
+    # IBR block, causing a "No valid candidate" assert at
+    # ``L3DlOpsScheduler.cpp:1075``.  Matching the reference SDSC
+    # (``real_indirect_sdsc.json``) — where every non-index tensor has
+    # ``dsType=OUTPUT`` — sidesteps that.
+    if value_sdsc is not None:
+        target_label = value_sdsc.layout
+        target_stick_dim = layouts[target_label]["stick_dim_order"]
+        index_arg_positions = {
+            a.indirect_source.index_arg_index
+            for a in op_spec.args
+            if a.indirect_source is not None
+        }
+        for i, sdsc_arg in enumerate(sdsc_args):
+            if i in index_arg_positions:
+                continue  # index tensor keeps its own ``KERNEL_IDX`` label
+            if op_spec.args[i].indirect_source is not None:
+                continue  # value tensor already has target_label
+            if sdsc_arg.layout == target_label:
+                continue  # already aligned
+            # The SDSCArg was assigned a different layout label whose
+            # stick dim differs from the value tensor's.  Rewrite the
+            # label to match the value tensor's (so its dsType flows
+            # into the same primaryDsInfo bucket) and translate any
+            # stick-reduction scale (-2) onto the new stick dim.
+            if -2 in sdsc_arg.scales.values():
+                for dim in list(sdsc_arg.scales.keys()):
+                    if sdsc_arg.scales[dim] == -2:
+                        sdsc_arg.scales[dim] = -1
+                if target_stick_dim in sdsc_arg.scales:
+                    sdsc_arg.scales[target_stick_dim] = -2
+            sdsc_arg.layout = target_label
 
     return sdsc_args, layouts, missing_dim
 

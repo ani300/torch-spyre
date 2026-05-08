@@ -281,9 +281,24 @@ def greedy_local_min_cost(operations: list) -> None:
         cost_fn = op.restick_cost_fn
 
         # Collect each input arg's committed layout (finalized by earlier topo iterations).
+        # Exclude indirectly-addressed reads (those whose index contains a
+        # ``tmp<N>`` symbol from ``ops.indirect_indexing``) AND the buffers
+        # that source those ``tmp`` symbols (index tensors themselves):
+        # both are routed through deeptools' IBR at runtime and don't
+        # participate in stick-compatibility reasoning.  This matches the
+        # filtering done in ``_multi_arg_pointwise_layouts``.
+        from .propagate_layouts import _indirect_index_source_buffers
+
+        index_sources = _indirect_index_source_buffers(op)
         in_layouts = []
         for dep in op.get_read_writes().reads:
             if isinstance(dep, MemoryDep):
+                if any(
+                    s.name.startswith("tmp") for s in dep.index.free_symbols
+                ):
+                    continue
+                if dep.name in index_sources:
+                    continue
                 buf = V.graph.get_buffer(dep.name)
                 assert hasattr(buf, "committed_stl"), (
                     f"buffer {dep.name} has no committed_stl — "

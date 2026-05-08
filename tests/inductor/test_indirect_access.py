@@ -178,11 +178,20 @@ class TestParseOpSpecIndirect(InductorTestCase):
         self.assertIn("32768", isrc.base_offset_expr)
         self.assertEqual(isrc.address_mode, "ibr")
 
-    def test_index_tensor_data_format_is_int32(self):
+    def test_index_tensor_data_format_is_senuint32(self):
+        """The index tensor's data format is rewritten to SENUINT32.
+
+        The senulator's L3_LDIMU handler asserts
+        ``srcStick.getType() == DataFormats::SENUINT32``
+        (``deeptools/senulator/memoryElement.cpp:768``) and the
+        reference SDSC from the paged-attention flow also uses
+        SENUINT32 for its KERNEL_IDX lds.  IEEE_INT32 is silently
+        mis-decoded and the IBR ends up holding garbage.
+        """
         op_spec = _make_indirect_op_spec()
         sdsc_spec = parse_op_spec(op_spec)
         self.assertEqual(
-            sdsc_spec.args[1].data_format, DataFormats.IEEE_INT32
+            sdsc_spec.args[1].data_format, DataFormats.SENUINT32
         )
 
 
@@ -348,7 +357,15 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
         return captured, restore
 
     def _assert_sdsc_has_indirect_fields(self, captured):
-        """Across all captured SDSCs, assert at least one has the indirect fields."""
+        """Across all captured SDSCs, assert at least one has the indirect fields.
+
+        Beyond the indirect-access fields (``indirectAllocType_``,
+        ``KERNEL_IDX`` dsType, ``indirectAccessIndexLabeledDs``), asserts
+        that ``computeOp_`` has the two-operand shape deeptools' ``add``
+        opcode requires: two ``inputLabeledDs`` entries (the indirect
+        value + the broadcast-zero constant injected by
+        ``indirect_add_zero_pass``) and ``opFuncName == "add"``.
+        """
         found_indirect = False
         for sdsc in captured:
             opfunc_key = next(iter(sdsc))
@@ -371,8 +388,17 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
                     lds for lds in dsc["labeledDs_"] if lds["dsType_"] == "KERNEL_IDX"
                 ]
                 self.assertEqual(len(kernel_idx), 1)
-                # indirectAccessIndexLabeledDs on the computeOp.
+                # computeOp_ shape: two inputLabeledDs (value + broadcast
+                # zero), indirectAccessIndexLabeledDs present, opFuncName
+                # == "add".
                 compute = dsc["computeOp_"][0]
+                self.assertEqual(compute["opFuncName"], "add")
+                self.assertEqual(
+                    len(compute["inputLabeledDs"]),
+                    2,
+                    "indirect-access SDSC must have 2 inputLabeledDs "
+                    "entries (value + broadcast-zero)",
+                )
                 self.assertIn("indirectAccessIndexLabeledDs", compute)
                 self.assertTrue(compute["indirectAccessIndexLabeledDs"])
         self.assertTrue(
@@ -396,8 +422,11 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
         return captured
 
     def test_index_select_1d_indices(self):
-        weight = torch.randn(8, 128, dtype=torch.float16).to("spyre")
-        idx = torch.zeros(4, dtype=torch.int64).to("spyre")
+        # Shapes chosen so the scheduler uses all 32 cores.  Smaller
+        # inputs produce a degenerate fold distribution that deeptools
+        # rejects downstream.
+        weight = torch.randn(1024, 2048, dtype=torch.float16).to("spyre")
+        idx = torch.zeros(512, dtype=torch.int64).to("spyre")
 
         def fn(w, i):
             return torch.index_select(w, 0, i) + 1.0
@@ -406,18 +435,53 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
         self._assert_sdsc_has_indirect_fields(captured)
 
     def test_index_select_without_add(self):
-        """index_select without a trailing add — SDSC op is ``add`` with a
-        zero second operand (v1 behavior preserved via the IR handler's
-        restickify-to-add rewrite).
+        """index_select without a user-written trailing add.
+
+        ``indirect_add_zero_pass`` appends ``+ 0.0`` at the FX level so
+        the emitted SDSC has the two-input shape deeptools requires.
         """
-        weight = torch.randn(8, 128, dtype=torch.float16).to("spyre")
-        idx = torch.zeros(4, dtype=torch.int64).to("spyre")
+        weight = torch.randn(1024, 2048, dtype=torch.float16).to("spyre")
+        idx = torch.zeros(512, dtype=torch.int64).to("spyre")
 
         def fn(w, i):
             return torch.index_select(w, 0, i)
 
         captured = self._compile_and_capture(fn, weight, idx)
         self._assert_sdsc_has_indirect_fields(captured)
+
+    def test_index_select_sdsc_matches_baseline_shape(self):
+        """The indirect-access SDSC mirrors the plain-add baseline's
+        ``computeOp_`` operand shape (2 inputs, 1 output, sfp exUnit).
+        """
+        weight = torch.randn(1024, 2048, dtype=torch.float16).to("spyre")
+        idx = torch.zeros(512, dtype=torch.int64).to("spyre")
+
+        def fn(w, i):
+            return torch.index_select(w, 0, i)
+
+        captured = self._compile_and_capture(fn, weight, idx)
+        indirect_dscs = []
+        for sdsc in captured:
+            key = next(iter(sdsc))
+            dsc_outer = sdsc[key]["dscs_"][0]
+            inner_key = next(iter(dsc_outer))
+            dsc = dsc_outer[inner_key]
+            if any(
+                n.get("indirectAllocType_") == "value_tensor"
+                for n in dsc["scheduleTree_"]
+            ):
+                indirect_dscs.append(dsc)
+        self.assertEqual(
+            len(indirect_dscs),
+            1,
+            "expected exactly one indirect-access DSC",
+        )
+        compute = indirect_dscs[0]["computeOp_"][0]
+        self.assertEqual(compute["exUnit"], "sfp")
+        self.assertEqual(compute["opFuncName"], "add")
+        self.assertEqual(len(compute["inputLabeledDs"]), 2)
+        self.assertEqual(len(compute["outputLabeledDs"]), 1)
+        self.assertEqual(len(compute["indirectAccessIndexLabeledDs"]), 1)
 
 
 if __name__ == "__main__":

@@ -317,6 +317,64 @@ def _is_indirect_dep(dep: MemoryDep) -> bool:
     return any(s.name.startswith("tmp") for s in dep.index.free_symbols)
 
 
+def _indirect_index_source_buffers(op: Operation) -> set[str]:
+    """Return the set of buffer names whose loaded values feed
+    ``ops.indirect_indexing`` inside ``op``'s ``inner_fn``.
+
+    For ``index_select`` / ``embedding`` / ``gather`` the index tensor
+    is read directly (its own ``MemoryDep.index`` has no ``tmp`` symbol),
+    but the loaded value becomes the ``tmp<N>`` used to index the value
+    tensor.  The index tensor's host-side layout is irrelevant — deeptools
+    loads it into the IBR register at runtime — so it must be excluded
+    from stick-compatibility reasoning, just like the value tensor is
+    excluded by :func:`_is_indirect_dep`.
+
+    Returns an empty set for ops without indirect indexing (including
+    non-Pointwise ops).
+    """
+    data = getattr(op, "data", None)
+    if not isinstance(data, (Pointwise, Reduction)):
+        return set()
+    inner_fn = getattr(data, "inner_fn", None)
+    if inner_fn is None:
+        return set()
+
+    index_buffers: set[str] = set()
+
+    class _Tracer(V.MockHandler):  # type: ignore[misc,valid-type]
+        def load(self, name, index):  # noqa: D401
+            return ("load", name, index)
+
+        def indirect_indexing(self, index_var, size, check=True, wrap_neg=True):
+            if isinstance(index_var, tuple) and index_var and index_var[0] == "load":
+                index_buffers.add(index_var[1])
+            # Return a fresh sympy symbol matching ``tmp<N>`` naming so the
+            # rest of inner_fn can proceed without type errors downstream.
+            import sympy
+
+            return sympy.Symbol(
+                f"tmp{len(index_buffers)}", integer=True, nonnegative=True
+            )
+
+    try:
+        with V.set_ops_handler(_Tracer()):
+            try:
+                args = data.inner_fn_args()
+            except Exception:
+                return set()
+            try:
+                inner_fn(*args)
+            except Exception:
+                # Best-effort: if the inner_fn uses ops we haven't mocked,
+                # we still captured whichever loads reached indirect_indexing
+                # before the failure.
+                pass
+    except Exception:
+        return set()
+
+    return index_buffers
+
+
 def _multi_arg_pointwise_layouts(
     op: Operation,
     output: FixedLayout,
@@ -332,9 +390,17 @@ def _multi_arg_pointwise_layouts(
 
     Inputs whose memory dep is indirectly addressed (contain a ``tmp`` symbol
     from ``ops.indirect_indexing``) are excluded from stick-compatibility
-    reasoning — deeptools' IBR handles their layout at runtime.
+    reasoning — deeptools' IBR handles their layout at runtime.  The
+    buffers that *source* those ``tmp`` symbols (the index tensors
+    themselves) are also excluded: their content is loaded into the IBR
+    register directly and their host-side stick layout doesn't constrain
+    the compute op.
     """
-    cost_args = [a for a in args if not _is_indirect_dep(a.dep)]
+    index_sources = _indirect_index_source_buffers(op)
+    cost_args = [
+        a for a in args
+        if not _is_indirect_dep(a.dep) and a.dep.name not in index_sources
+    ]
     stick_exprs = {
         device_coordinates(stl, arg.dep)[-1]
         for arg in cost_args

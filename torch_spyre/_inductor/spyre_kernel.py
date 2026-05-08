@@ -404,7 +404,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         # Maps id(TensorArg) -> list of tmp symbols present in the
         # pre-concretization index.  Populated by ``create_tensor_arg``
         # and consumed by ``_apply_indirect_from_cse`` in ``store``.
-        self._pending_indirect: dict[int, list[sympy.Symbol]] = {}
+        # Maps id(TensorArg) -> list of (tmp_symbol, device_coord_position)
+        # pairs.  The position is the axis whose coordinate carried the
+        # symbol in the pre-concretization device coords — i.e., the
+        # gather dim.
+        self._pending_indirect: dict[int, list[tuple[sympy.Symbol, int]]] = {}
 
     def __enter__(self) -> Self:
         super().__enter__()
@@ -434,6 +438,35 @@ class SpyreKernel(Kernel[CSEVariable]):
             if s in self.indirect_cse_origins:
                 indirect_syms.append(s)
                 tmp_subs[s] = 0
+
+        # Determine which *device-coordinate position* each tmp symbol
+        # lands in.  We need this later to set ``gather_dim`` on the
+        # ``IndirectSource``: the gather axis is the device dim whose
+        # coordinate carries the data-dependent tmp symbol.
+        # ``compute_coordinates`` skips vars not in ``var_ranges``, so
+        # extend the iteration-space copy used here with one fake entry
+        # per tmp symbol (range = full device size of that tmp's stride
+        # class) so the tmp symbol flows through into the coord output.
+        indirect_positions: dict[sympy.Symbol, int] = {}
+        if indirect_syms:
+            preserved = set(it_space.keys()) | set(indirect_syms)
+            extended_it_space = dict(it_space)
+            for sym in indirect_syms:
+                # Any positive range > 1 suffices; we only care about
+                # which coord the symbol lands in, not its magnitude.
+                extended_it_space.setdefault(sym, sympy.Integer(2))
+            raw_dev_coords = compute_coordinates(
+                tensor.layout.device_layout.device_size,
+                tensor.layout.device_layout.stride_map,
+                extended_it_space,
+                concretize_index(raw_index, preserved),
+            )
+            for sym in indirect_syms:
+                for pos, coord in enumerate(raw_dev_coords):
+                    if sym in coord.free_symbols:
+                        indirect_positions[sym] = pos
+                        break
+
         if tmp_subs:
             raw_index = raw_index.subs(tmp_subs)
 
@@ -456,7 +489,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             # Stash the indirect symbols on the kernel keyed by tensor_arg
             # identity so ``store()`` can translate them into
             # ``IndirectSource`` metadata once it knows the final arg list.
-            self._pending_indirect[id(tensor_arg)] = list(indirect_syms)
+            self._pending_indirect[id(tensor_arg)] = [
+                (sym, indirect_positions.get(sym, 0)) for sym in indirect_syms
+            ]
         if not tensor.layout.allocation:
             self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
@@ -589,12 +624,15 @@ class SpyreKernel(Kernel[CSEVariable]):
             else:
                 op = IDENTITY_OP
             if self._pending_indirect:
+                # Safety net — normally pre-empted by ``indirect_add_zero_pass``
+                # which appends a consuming ``aten.add`` so we hit the
+                # PointwiseOp branch above.  A dataop with indirect
+                # access reaching here still needs ``opFuncName == "add"``
+                # (deeptools' IBR compute ops reject ``identity`` /
+                # ``ReStickify``), but note the emitted SDSC will have a
+                # single ``inputLabeledDs`` entry and fail in the
+                # backend compiler.
                 self._apply_indirect_from_cse(args)
-                # A dataop with indirect access is actually a gather —
-                # deeptools' IBR-enabled compute ops expect an ``add``
-                # opcode.  Rewrite the op name so the emitted SDSC has
-                # ``opFuncName == "add"`` rather than ``identity`` /
-                # ``ReStickify``.
                 op = "add"
             op_spec = self.create_op_spec(op, False, args, op_info)
             self.op_specs.append(op_spec)
@@ -626,14 +664,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         del args[out_idx]
 
         for arg in list(args):
-            syms = self._pending_indirect.pop(id(arg), None)
-            if not syms:
+            entries = self._pending_indirect.pop(id(arg), None)
+            if not entries:
                 continue
-            if len(syms) > 1:
+            if len(entries) > 1:
                 raise Unsupported(
                     "indirect_indexing: multi-axis indirect access not supported"
                 )
-            sym = syms[0]
+            sym, gather_dim_detected = entries[0]
             origin = self.indirect_cse_origins[sym]
 
             # Ensure the index tensor is an explicit input.
@@ -661,8 +699,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                 args.append(index_tensor_arg)
                 index_arg_idx = len(args) - 1
 
-            # Initial scope: gather_dim = 0.
-            gather_dim = 0
+            # ``gather_dim_detected`` is the device-coord position of the
+            # tmp symbol — i.e., the axis being indirectly addressed.
+            gather_dim = gather_dim_detected
 
             # page_size = product of device_size except gather_dim, × bytes.
             page_size = 1
