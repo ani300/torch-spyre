@@ -289,6 +289,67 @@ class TestIndirectAccessSDSC(InductorTestCase):
         self.assertNotIn("indirectAccessIndexLabeledDs", compute_ops[0])
 
 
+def _gather_idx_convert(
+    raw_indices: torch.Tensor,
+    value_base_addr: int,
+    value_shape: list[int],
+    layout_dim_order: list[str],
+    dim_ids: list[str],
+    stick_dims: list[str],
+    stick_sizes: list[int],
+    gather_dim_id: str,
+    is_sen1p5: bool = False,
+) -> torch.Tensor:
+    """Port of ``Dsm::fillGiiAttributes`` + ``ConvertData_gather_idx``.
+
+    See ``deeptools/dsm/host_node_senops.cpp:2816`` (attribute fill) and
+    ``deeptools/util/sen_data_convert.cpp:3022`` (per-index transform).
+    Converts plain integer indices into the absolute device addresses
+    the IBR expects.
+
+    This is a quick/dirty host-side transform used only to validate the
+    end-to-end flow; the proper fix is to emit a ``ConvertData_gather_idx``
+    node in the bundle itself so the runtime handles the conversion.
+    """
+    raw = raw_indices.cpu().to(torch.int64).tolist()
+
+    # fillGiiAttributes:
+    #   dimIdToElems[dim] = shape[i]
+    #   dimIdToShape[dim] = shape[i] (/ stickSize for stick dims)
+    dim_id_to_elems = {d: value_shape[i] for i, d in enumerate(dim_ids)}
+    dim_id_to_shape = dict(dim_id_to_elems)
+    for sd, ss in zip(stick_dims, stick_sizes):
+        dim_id_to_shape[sd] = dim_id_to_shape[sd] // ss
+
+    base_addr = value_base_addr
+    if is_sen1p5:
+        assert base_addr % 2 == 0
+        base_addr //= 2
+
+    # Compute skip_addr_ / idx_prev_cum_size_ for the (single) gather dim.
+    # ``layout_dim_order`` is inner → outer.  skip_addr accumulates the
+    # stick-unit sizes of all dims INNER to the gather dim.
+    idx_prev_cum_sizes: list[int] = []
+    skip_addrs: list[int] = []
+    prev_cum = 1
+    idx_prev_cum_sizes.append(prev_cum)
+    skip = 1
+    for entry in layout_dim_order:
+        if entry == gather_dim_id:
+            prev_cum *= dim_id_to_elems[entry]
+            break
+        skip *= dim_id_to_shape[entry]
+    if is_sen1p5:
+        assert skip % 2 == 0
+        skip //= 2
+    skip_addrs.append(skip)
+
+    # ConvertData_gather_idx (single-dim case):
+    #   addr[j] = base_addr + idx_val[j] * skip_addr[0]
+    out = [base_addr + int(v) * skip_addrs[0] for v in raw]
+    return torch.tensor(out, dtype=torch.int64)
+
+
 class TestIndirectAccessEndToEnd(InductorTestCase):
     """End-to-end ``torch.compile`` tests for gather / embedding / index_select.
 
@@ -439,9 +500,36 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
 
         ``indirect_add_zero_pass`` appends ``+ 0.0`` at the FX level so
         the emitted SDSC has the two-input shape deeptools requires.
+
+        Indices are pre-transformed host-side by the python port of
+        ``Dsm::fillGiiAttributes`` + ``ConvertData_gather_idx`` so the
+        IBR receives absolute device addresses.  This is a temporary
+        test fixture; the proper fix is to emit a
+        ``ConvertData_gather_idx`` node in the bundle itself.
         """
         weight = torch.randn(1024, 2048, dtype=torch.float16).to("spyre")
-        idx = torch.zeros(512, dtype=torch.int64).to("spyre")
+        # Weight tensor at arg_index=1 → segment 1 at 0x400000000.
+        value_base_addr = 0x400000000
+        # For a 2-D fp16 [1024, 2048] tensor with row-major layout and the
+        # innermost dim (out) sticked at 64 elems: layoutDimOrder is
+        # inner→outer = [out, mb].  Gather dim = mb (row).
+        #
+        #   dim_id_to_shape = {out: 32 sticks, mb: 1024 rows}
+        #   skip_addr for mb = dim_id_to_shape[out] = 32 (sticks per row)
+        #   addr[i] = base_addr + idx[i] * 32
+        raw_idx = torch.zeros(512, dtype=torch.int64)
+        idx_addrs = _gather_idx_convert(
+            raw_indices=raw_idx,
+            value_base_addr=value_base_addr,
+            value_shape=[2048, 1024],  # matches dim_ids order = [out, mb]
+            layout_dim_order=["out", "mb"],
+            dim_ids=["out", "mb"],
+            stick_dims=["out"],
+            stick_sizes=[64],
+            gather_dim_id="mb",
+            is_sen1p5=False,
+        )
+        idx = idx_addrs.to("spyre")
 
         def fn(w, i):
             return torch.index_select(w, 0, i)

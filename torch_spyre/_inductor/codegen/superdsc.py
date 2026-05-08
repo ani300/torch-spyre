@@ -376,23 +376,6 @@ def _create_sdsc_tensors(
                 # dim semantics expected by deeptools (``dsc2.cpp:3753``
                 # asserts that no scale == -1 dim overlaps the paged dims).
                 scales[gather_dim_sym] = 1
-                # Also bound the stick dim (elements-per-stick) so
-                # deeptools' AllocateNode::getPageSize() reports both the
-                # gather dim AND the stick dim as paged.  That makes the
-                # innermost paged chunk loop == the stick dim == the index
-                # tensor's stick dim — satisfying
-                # L3DlOpsScheduler.cpp:6070's check
-                # ``innerIndexDimInChunkLoops == indexStickDim``.
-                # Reference SDSC (real_indirect_sdsc.json) uses the same
-                # pattern: ``maxDimSizes_ = [-1, 64, -1, 1]`` bounds mb=64
-                # (gather) AND y=1 (stick).  The ``1`` on the stick dim is
-                # in "sticks" (one stick per page); deeptools converts to
-                # elements via the lds's stickSize.  We mirror by setting
-                # the stick-dim page = one stick's worth of elements.
-                if effective_stick is not None and effective_stick != gather_dim_sym:
-                    max_dim_sizes[effective_stick] = (
-                        arg.device_dtype.elems_per_stick()
-                    )
 
         sdsc_args.append(
             SDSCArgs(
@@ -431,6 +414,42 @@ def _create_sdsc_tensors(
         # ends up holding garbage, which the hardware then dereferences
         # into an unmapped segment — triggering a runtime page fault.
         idx_sdsc.data_format = DataFormats.SENUINT32
+
+        # Give the index tensor a dedicated layout that sticks on the
+        # GATHER DIM (the axis being indirectly addressed) rather than on
+        # whatever axis happens to be innermost in the value tensor's
+        # layout.  Rationale:
+        #
+        # `L3DlOpsScheduler.cpp:6070` asserts
+        # ``innerIndexDimInChunkLoops == indexStickDim``, i.e. the
+        # innermost chunk loop iterating a paged dim must match the
+        # index tensor's stick dim.  Since the gather dim is the ONLY
+        # dim that's actually paged (value tensor has ``maxDims`` == 1
+        # on the gather dim only — see above), forcing the index stick
+        # onto the gather dim trivially satisfies that check, without
+        # needing to page extra dims and introduce duplicate L3_LDIMU
+        # emissions in the ProgIR.
+        # ``arg.indirect_source.gather_dim`` indexes into the VALUE
+        # tensor's dim_order; resolve it to the actual dim symbol.
+        value_dim_order = layouts[value_sdsc.layout]["dim_order"]
+        if 0 <= arg.indirect_source.gather_dim < len(value_dim_order):
+            gather_dim_sym = value_dim_order[arg.indirect_source.gather_dim]
+            # Move the gather dim to the end of the index's dim_order
+            # (innermost / stick position), but only if it's actually in
+            # the index's layout.
+            if gather_dim_sym in idx_layout["dim_order"]:
+                new_dim_order = [
+                    d for d in idx_layout["dim_order"] if d != gather_dim_sym
+                ] + [gather_dim_sym]
+                new_stick_size = idx_sdsc.data_format.elems_per_stick()
+                new_label = _get_layout_label(
+                    layouts,
+                    new_dim_order,
+                    gather_dim_sym,
+                    new_stick_size,
+                    LAYOUT_LABELS,
+                )
+                idx_sdsc.layout = new_label
 
     # For an indirect-access DSC, realign all non-index, non-value-tensor
     # SDSCArgs so their ``dsType`` (i.e. layout label) matches the value
