@@ -321,7 +321,14 @@ def _gather_idx_convert(
     for sd, ss in zip(stick_dims, stick_sizes):
         dim_id_to_shape[sd] = dim_id_to_shape[sd] // ss
 
-    base_addr = value_base_addr
+    # The IBR hardware uses 32-bit values as stick-level HBM offsets
+    # (verified empirically in the senulator: LDIMU computes
+    # ``hbm_addr = EAR + IBR_value * granularity`` and the resulting
+    # address is interpreted in sticks, not bytes).  ``value_base_addr``
+    # is a byte address; convert to sticks (128 bytes each) so the
+    # final output fits in uint32 and matches what the hardware
+    # expects.
+    base_addr = value_base_addr // 128
     if is_sen1p5:
         assert base_addr % 2 == 0
         base_addr //= 2
