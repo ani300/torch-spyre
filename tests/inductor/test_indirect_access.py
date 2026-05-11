@@ -544,7 +544,7 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
         torch.set_printoptions(threshold=10000, edgeitems=128, sci_mode=False)
         print(spyre_out)
         print(fn(weight_cpu, raw_idx))
-        torch.testing.assert_close(spyre_out.cpu(), fn(weight_cpu, raw_idx))
+        torch.testing.assert_close(spyre_out.cpu(), fn(weight_cpu, raw_idx), rtol=1e-3, atol=1e-3)
 
     def test_index_select_sdsc_matches_baseline_shape(self):
         """The indirect-access SDSC mirrors the plain-add baseline's

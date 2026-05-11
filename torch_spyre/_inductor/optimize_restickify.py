@@ -431,7 +431,25 @@ def beam_global_min_cost(operations: list) -> None:
             continue
 
         cost_fn = op.restick_cost_fn
-        deps = [dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)]
+        # Mirror the filtering in ``commit_restick_decisions`` — both
+        # indirectly-addressed deps (``tmp<N>`` in ``dep.index``) and
+        # the buffers that SOURCE those tmp symbols (index tensors)
+        # are excluded from stick-compatibility reasoning, since
+        # deeptools' IBR handles their layout at runtime.  This must
+        # match the filtering used to build ``cost_fn.edge_costs``
+        # (``_multi_arg_pointwise_layouts``'s ``cost_args``), otherwise
+        # ``zip(edge_costs, in_layouts)`` misaligns and the wrong STL
+        # is passed to ``EdgeCostMap.cost``.
+        from .propagate_layouts import _indirect_index_source_buffers
+
+        _index_sources = _indirect_index_source_buffers(op)
+        deps = [
+            dep
+            for dep in op.get_read_writes().reads
+            if isinstance(dep, MemoryDep)
+            and not any(s.name.startswith("tmp") for s in dep.index.free_symbols)
+            and dep.name not in _index_sources
+        ]
 
         next_states = []
         for state in frontier.states:
