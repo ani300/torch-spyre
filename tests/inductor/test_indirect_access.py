@@ -410,12 +410,12 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
             stdout = b""
             stderr = b""
 
-        def fake_run(cmd, *args, **kwargs):
-            if cmd and isinstance(cmd, (list, tuple)) and cmd[0] == "dxp_standalone":
-                return _CompleteProc()
-            return original_subprocess_run(cmd, *args, **kwargs)
+        # def fake_run(cmd, *args, **kwargs):
+        #     if cmd and isinstance(cmd, (list, tuple)) and cmd[0] == "dxp_standalone":
+        #         return _CompleteProc()
+        #     return original_subprocess_run(cmd, *args, **kwargs)
 
-        subprocess.run = fake_run
+        # subprocess.run = fake_run
 
         def restore():
             bundle_mod.generate_bundle = original_bundle
@@ -481,10 +481,7 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
             # from disk (we stubbed out dxp_standalone).  Accept any
             # resulting runtime error — the compile-time SDSC capture is
             # all this test cares about.
-            try:
-                comp_fn(*inputs)
-            except Exception:
-                pass
+            comp_fn(*inputs)
         finally:
             restore()
         return captured
