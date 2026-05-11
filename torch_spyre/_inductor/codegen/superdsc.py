@@ -314,18 +314,22 @@ def _create_sdsc_tensors(
         use_adjusted_size = op_spec.op == "overwrite" and not arg.is_input
         if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
-            # Append reduced dims while keeping ``stick_dim`` innermost.
-            # Important for indirect-access value tensors, where the
-            # gather dim's device coord is zero (tmp→0), causing
-            # ``_get_device_dim_order`` to skip it and produce
-            # ``dim_order=[stick_dim]``.  Naive ``dim_order +
-            # reduced_dims`` would put the reduced (gather) dim AFTER
-            # the stick dim — inverting the outer→inner convention and
-            # making downstream realignment/padding mis-map the
-            # tensor's device_size positions.
-            if stick_dim is not None and stick_dim in dim_order:
-                non_stick = [d for d in dim_order if d != stick_dim]
-                dim_order = non_stick + reduced_dims + [stick_dim]
+            # For indirect-access value tensors the gather dim's device
+            # coord is zero (tmp→0), causing ``_get_device_dim_order``
+            # to skip it and yield ``dim_order=[stick_dim]``.  Naive
+            # ``dim_order + reduced_dims`` then puts the reduced
+            # (gather) dim AFTER the stick dim — inverting the
+            # outer→inner convention and making downstream
+            # realignment/padding mis-map the tensor's device_size
+            # positions.  Only re-interleave when all dims visible in
+            # the walk collapse to just the stick dim; for tensors
+            # with full-rank walks we must preserve the walk order.
+            if (
+                reduced_dims
+                and stick_dim is not None
+                and dim_order == [stick_dim]
+            ):
+                dim_order = reduced_dims + [stick_dim]
             else:
                 dim_order = dim_order + reduced_dims
 
@@ -335,31 +339,23 @@ def _create_sdsc_tensors(
             dim_order = dim_order + [stick_dim]
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
             reduced_dims = [stick_dim]
-        # ``device_size`` is laid out in the canonical
-        # ``get_generic_stick_layout`` order — non-stick dims first (in
-        # host-dim-order), then the stick dim's element size last — e.g.
-        # ``[out_stick_count, mb, elems_per_stick]`` for a 2-D fp16
-        # tensor stickied on the inner axis.  The ``dev_dim_size =
-        # arg.device_size[-stride_idx - 2]`` formula below assumes
-        # ``stride_dim_order`` is the same outer→inner order with the
-        # stick dim LAST.  For indirect-access value tensors, the
-        # gather dim's device-coord is ``0`` (tmp→0), so it falls into
-        # ``reduced_dims`` and ends up appended AFTER the stick dim in
-        # ``dim_order`` — pushing the stick dim off the last position
-        # and producing a bogus ``dev_dim_size`` (reads ``mb`` slot as
-        # if it were out-stick count, yielding a huge ``backGap`` on
-        # the stick dim).  Re-order so reduced dims precede the stick
-        # dim, keeping the stick dim innermost.
-        non_reduced_non_stick = [
-            d for d in dim_order
-            if d not in reduced_dims and d != stick_dim
-        ]
-        if stick_dim is not None and stick_dim in dim_order:
-            stride_dim_order = non_reduced_non_stick + reduced_dims + [stick_dim]
+        # ``dev_dim_size = arg.device_size[-stride_idx - 2]`` below
+        # assumes ``stride_dim_order`` is outer→inner with the stick
+        # dim LAST.  For indirect-access value tensors whose walk
+        # collapsed to just ``[stick_dim]`` (gather dim zeroed), the
+        # default ``non_reduced + reduced`` ordering puts ``stick_dim``
+        # FIRST, which mis-maps the device_size positions and yields a
+        # bogus ``backGap`` on the stick dim.  Keep the stick dim last
+        # in that case.
+        non_reduced = [d for d in dim_order if d not in reduced_dims]
+        if (
+            reduced_dims
+            and stick_dim is not None
+            and non_reduced == [stick_dim]
+        ):
+            stride_dim_order = reduced_dims + [stick_dim]
         else:
-            stride_dim_order = [
-                d for d in dim_order if d not in reduced_dims
-            ] + reduced_dims
+            stride_dim_order = non_reduced + reduced_dims
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
             if dim in reduced_dims and op_spec.op != "layernormscale":
