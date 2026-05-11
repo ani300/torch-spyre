@@ -364,8 +364,19 @@ def _create_sdsc_tensors(
                 base_offset_expr=str(arg.indirect_source.base_offset_expr),
                 address_mode="ibr",
             )
-            if 0 <= arg.indirect_source.gather_dim < len(dim_order):
+            # ``arg.indirect_source.gather_dim`` is the position in the
+            # tensor's device_coordinates where the ``tmp<N>`` symbol
+            # was (now replaced by 0).  Since that coord is now 0, the
+            # symbol doesn't appear in ``_get_device_dim_order``'s walk
+            # and gets appended as a ``reduced_dim`` (in
+            # ``reduced_dims``).  There's exactly one such dim for a
+            # 1-axis gather.
+            gather_dim_sym = None
+            if reduced_dims:
+                gather_dim_sym = reduced_dims[0]
+            elif 0 <= arg.indirect_source.gather_dim < len(dim_order):
                 gather_dim_sym = dim_order[arg.indirect_source.gather_dim]
+            if gather_dim_sym is not None:
                 max_dim_sizes[gather_dim_sym] = 1
                 # The gather dim's device coordinate is ``0`` (we zeroed the
                 # tmp symbol in ``create_tensor_arg``), which made the scale
@@ -429,11 +440,19 @@ def _create_sdsc_tensors(
         # onto the gather dim trivially satisfies that check, without
         # needing to page extra dims and introduce duplicate L3_LDIMU
         # emissions in the ProgIR.
-        # ``arg.indirect_source.gather_dim`` indexes into the VALUE
-        # tensor's dim_order; resolve it to the actual dim symbol.
-        value_dim_order = layouts[value_sdsc.layout]["dim_order"]
-        if 0 <= arg.indirect_source.gather_dim < len(value_dim_order):
-            gather_dim_sym = value_dim_order[arg.indirect_source.gather_dim]
+        # Resolve gather_dim_sym: look up the value tensor's paged
+        # dim (we set ``max_dim_sizes[gather_dim_sym] = 1`` in the
+        # loop above).  Using ``max_dim_sizes`` rather than
+        # ``arg.indirect_source.gather_dim`` as a dim_order index is
+        # robust to dim_order reordering (the gather dim's device
+        # coord is 0 which makes ``_get_device_dim_order`` skip it,
+        # so its position in dim_order depends on where
+        # ``reduced_dims`` are inserted).
+        value_paged = [
+            d for d, s in value_sdsc.max_dim_sizes.items() if s == 1
+        ]
+        gather_dim_sym = value_paged[0] if value_paged else None
+        if gather_dim_sym is not None:
             # Move the gather dim to the end of the index's dim_order
             # (innermost / stick position), but only if it's actually in
             # the index's layout.

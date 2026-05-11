@@ -408,15 +408,32 @@ def _multi_arg_pointwise_layouts(
         if device_coordinates(stl, arg.dep)[-1] != 0
     }
 
-    if len(stick_exprs) > 1:
-        logger.info(
-            f"Multi-stick pointwise ({op.get_name()}): producing {len(stick_exprs)} output layouts."
-        )
-
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
     in_coords = [host_coordinates(arg.layout, arg.dep) for arg in cost_args]
     out_coords = host_coordinates(output, output_dep)
+
+    # Indirectly-addressed inputs (value tensor of an index_select /
+    # gather / embedding) are excluded from cost_args because the IBR
+    # handles their layout at runtime.  But their NON-indirect dims
+    # still constrain the output's stick expression: e.g. for
+    # ``arg[tmp0, d1]`` stickied on d1, the output must also be
+    # stickied on the dim matching ``d1``.  Collect those stick
+    # expressions here so the output STL rank/dim_order stays sane.
+    for arg in args:
+        if not _is_indirect_dep(arg.dep) or arg.dep.name in index_sources:
+            continue
+        for stl in arg.layouts:
+            stick_expr = device_coordinates(stl, arg.dep)[-1]
+            if stick_expr == 0:
+                continue
+            if matching_dim(out_coords, stick_expr) is not None:
+                stick_exprs.add(stick_expr)
+
+    if len(stick_exprs) > 1:
+        logger.info(
+            f"Multi-stick pointwise ({op.get_name()}): producing {len(stick_exprs)} output layouts."
+        )
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in cost_args):

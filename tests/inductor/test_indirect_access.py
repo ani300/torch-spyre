@@ -481,10 +481,10 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
             # from disk (we stubbed out dxp_standalone).  Accept any
             # resulting runtime error — the compile-time SDSC capture is
             # all this test cares about.
-            comp_fn(*inputs)
+            out = comp_fn(*inputs)
         finally:
             restore()
-        return captured
+        return captured, out
 
     def test_index_select_1d_indices(self):
         # Shapes chosen so the scheduler uses all 32 cores.  Smaller
@@ -496,7 +496,7 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
         def fn(w, i):
             return torch.index_select(w, 0, i) + 1.0
 
-        captured = self._compile_and_capture(fn, weight, idx)
+        captured, spyre_out = self._compile_and_capture(fn, weight, idx)
         self._assert_sdsc_has_indirect_fields(captured)
 
     def test_index_select_without_add(self):
@@ -511,7 +511,8 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
         test fixture; the proper fix is to emit a
         ``ConvertData_gather_idx`` node in the bundle itself.
         """
-        weight = torch.randn(1024, 2048, dtype=torch.float16).to("spyre")
+        weight_cpu = torch.randn(1024, 2048, dtype=torch.float16)
+        weight = weight_cpu.to("spyre")
         # Weight tensor at arg_index=1 → segment 1 at 0x400000000.
         value_base_addr = 0x400000000
         # For a 2-D fp16 [1024, 2048] tensor with row-major layout and the
@@ -538,8 +539,12 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
         def fn(w, i):
             return torch.index_select(w, 0, i)
 
-        captured = self._compile_and_capture(fn, weight, idx)
+        captured, spyre_out = self._compile_and_capture(fn, weight, idx)
         self._assert_sdsc_has_indirect_fields(captured)
+        torch.set_printoptions(threshold=10000, edgeitems=128, sci_mode=False)
+        print(spyre_out)
+        print(fn(weight_cpu, raw_idx))
+        torch.testing.assert_close(spyre_out.cpu(), fn(weight_cpu, raw_idx))
 
     def test_index_select_sdsc_matches_baseline_shape(self):
         """The indirect-access SDSC mirrors the plain-add baseline's
@@ -551,7 +556,7 @@ class TestIndirectAccessEndToEnd(InductorTestCase):
         def fn(w, i):
             return torch.index_select(w, 0, i)
 
-        captured = self._compile_and_capture(fn, weight, idx)
+        captured, _ = self._compile_and_capture(fn, weight, idx)
         indirect_dscs = []
         for sdsc in captured:
             key = next(iter(sdsc))
