@@ -71,7 +71,7 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     if isinstance(expr, sympy.Integer):
         return int(expr)
     if hasattr(expr, "free_symbols") and expr.free_symbols:
-        return V.graph.sizevars.size_hint(expr)
+        return V.graph.sizevars.optimization_hint(expr)
     return int(expr)
 
 
@@ -88,7 +88,7 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     size_syms = index.free_symbols - loop_vars
     if not size_syms:
         return index
-    subs = {s: V.graph.sizevars.size_hint(s) for s in size_syms}
+    subs = {s: V.graph.sizevars.optimization_hint(s) for s in size_syms}
     result = index.subs(subs)
     return result
 
