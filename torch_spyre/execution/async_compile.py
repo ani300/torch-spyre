@@ -17,6 +17,7 @@ from typing import Any
 import os
 import subprocess
 
+from torch._inductor.async_compile import AsyncCompile
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec, UnimplementedOp
@@ -33,10 +34,7 @@ def get_output_dir(kernel_name: str):
     return kernel_output_dir
 
 
-class SpyreAsyncCompile:
-    def __init__(self) -> None:
-        pass
-
+class SpyreAsyncCompile(AsyncCompile):
     def sdsc(self, kernel_name: str, specs: list[OpSpec | UnimplementedOp]):
         unimp = [s for s in specs if isinstance(s, UnimplementedOp)]
         if len(unimp) != 0:
