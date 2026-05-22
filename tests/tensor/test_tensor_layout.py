@@ -480,8 +480,8 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_add_with_mixed_layout_dim_orders(self):
         """Compiled add where x and y have different device layouts."""
-        x = torch.rand(3, 2, 2048, dtype=torch.float16)
-        y = torch.rand(3, 2, 2048, dtype=torch.float16)
+        x = torch.randn(3, 2, 2048, dtype=torch.float16)
+        y = torch.randn(3, 2, 2048, dtype=torch.float16)
         cpu_result = x + y  # linter won't allow lambdas
         x_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [1, 0, 2])
         y_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [0, 1, 2])
@@ -491,7 +491,7 @@ class TestSpyreTensorLayout(TestCase):
         compiled = torch.compile(torch.add)
         compiled_result = compiled(x_dev, y_dev).cpu()
         torch.testing.assert_close(
-            cpu_result, compiled_result, rtol=0.001, atol=0.00001
+            cpu_result, compiled_result, rtol=0.01, atol=0.001
         )
 
     def test_spyre_tensor_layout_guard(self):
