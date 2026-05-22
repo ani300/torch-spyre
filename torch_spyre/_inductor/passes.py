@@ -89,7 +89,7 @@ def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
         return pass_fn(graph)
 
 
-class CustomPreGradPasses:
+class CustomPreGradPasses(CustomGraphPass):
     """
     This inductor extension point enables Spyre-specific passes to run on the
     pre-grad FX graph.
@@ -100,6 +100,11 @@ class CustomPreGradPasses:
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         for p in self.passes:
             p(graph)
+
+    def uuid(self) -> Optional[Any]:
+        files = [inspect.getfile(c) for c in CustomPreGradPasses.passes]
+        # Use dict.fromkeys instead of set for deterministic order
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
 
 
 class CustomPrePasses(CustomGraphPass):
