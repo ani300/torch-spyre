@@ -12,227 +12,136 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
+"""Spyre-specific decompositions and PrivateUse1 dispatch-key kernels.
+
+There is exactly one public entry point: ``register_spyre_decompositions``.
+It records a decomposition for ``torch.compile`` (consumed via Inductor's
+``get_decomp_fn``); for aten ops, a PrivateUse1 kernel reaching the same
+implementation is auto-installed at runtime init so eager-mode dispatch
+reaches it too. Eager-only registration is intentionally not exposed.
+
+The Spyre decomposition table built by ``get_spyre_decomp_table`` is
+independent from PyTorch's global ``torch._inductor.decomposition.decompositions``
+registry; Spyre never mutates the global table.
+"""
 
 import math
-from typing import Optional, Union, Sequence, Callable, TypeVar
-from typing_extensions import ParamSpec
+from typing import Any, Callable, Optional, Sequence, Union
+
 import torch
-from torch.utils import _pytree as pytree
 import torch._decomp as decomp
 
 from .constants import DEVICE_NAME
 from .errors import Unsupported
-from . import customops  # noqa: F401
 
-import threading
 
-# A module-level lock to make the CM thread-safe
-_decompositions_lock = threading.RLock()
-
-# Dictionary for Spyre-specific decompositions
+# Spyre-specific decompositions, populated by ``@register_spyre_decompositions``.
 spyre_decompositions: dict = {}
 
-# Exclude specific Inductor default decompositions on Spyre.
-# Some Inductor decompositions do not work reliably on the Spyre backend yet.
-# We disable them here and rely on implicit fallbacks to eager ops instead. Once
-# the blocking issues are resolved, these exclusions can be removed.
+# Inductor default decompositions to drop on Spyre. They produce code the
+# backend cannot lower today; falling through to the CPU fallback is preferable
+# until those issues are fixed.
 spyre_decompositions_to_exclude = [
     torch.ops.aten.triu,
     torch.ops.aten.tril,
 ]
 
-# Dict for Spyre-specific decompositions to be registered via DispatchKey
-spyre_decompositions_via_dispatchkey: dict = {}
+OpOrOps = Union[
+    torch._ops.OperatorBase, Sequence[torch._ops.OperatorBase]
+]
 
-# Module-level Library objects kept alive permanently so that the registered
-# PrivateUse1 / AutogradPrivateUse1 kernels are never unregistered by garbage collector.
-# (torch.library.Library uses weakref.finalize → m.reset() on GC, which would
-# silently remove the kernels from the C++ dispatcher.)
+# Module-level Library handles, kept alive for the lifetime of the process.
+# ``torch.library.Library`` uses ``weakref.finalize`` to call ``m.reset()`` on
+# GC, which would silently unregister every kernel from the C++ dispatcher.
 _spyre_autograd_lib = None
 _spyre_lib = None
 _dispatchkey_kernels_registered = False
 
-_T = TypeVar("_T")
-_P = ParamSpec("_P")
 
+def register_spyre_decompositions(ops: OpOrOps):
+    """Register a Spyre-specific decomposition for one or more operators.
 
-def register_spyre_decomposition(
-    ops: Union[torch._ops.OperatorBase, list],
-) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    The function is added to the Spyre decomposition table; Inductor reads it
+    via ``get_decomp_fn`` during ``torch.compile`` / ``make_fx``. For aten ops,
+    ``_register_spyre_dispatchkey_kernels_permanently`` additionally installs a
+    PrivateUse1 kernel pointing at the same function at runtime init, so
+    eager-mode dispatch reaches it too. This is required for
+    ``CompositeImplicitAutograd`` ops (``rms_norm``, ``layer_norm``, ...); it
+    is harmless for the rest.
     """
-    Register decompositions specifically for Spyre device.
-    These will only be active when compiling for the Spyre device.
+    return decomp.register_decomposition(ops, spyre_decompositions)
 
-    For ``aten`` ops, this also registers a PrivateUse1 dispatch kernel
-    (via ``register_spyre_decompositions_via_dispatchkey``) so that
-    eager-mode dispatch on a Spyre tensor reaches the Spyre implementation.
-    This is necessary for ops with CompositeImplicitAutograd (CIA) in
-    upstream PyTorch, and harmless for non-CIA ops.
+
+def get_spyre_decomp_table() -> dict[Any, Callable[..., Any]]:
+    """Return the decomposition table Inductor sees when compiling for Spyre.
+
+    Builds a fresh dict on each call from ``select_decomp_table()`` (Inductor's
+    default, itself cached upstream) plus Spyre additions and exclusions.
+    Independent from ``torch._inductor.decomposition.decompositions`` — Spyre
+    never mutates the global registry.
+    """
+    from torch._inductor.decomposition import select_decomp_table
+    from torch._ops import OpOverload, OpOverloadPacket
+    from torch_spyre.ops.fallbacks import fallback_ops
+
+    table = dict(select_decomp_table())
+
+    def _drop(op):
+        if isinstance(op, OpOverloadPacket):
+            for overload_name in op.overloads():
+                table.pop(getattr(op, overload_name), None)
+        elif isinstance(op, OpOverload):
+            table.pop(op, None)
+
+    for op in spyre_decompositions_to_exclude:
+        _drop(op)
+    for op in fallback_ops:
+        _drop(op)
+    table.update(spyre_decompositions)
+    return table
+
+
+class _OPWrapper:
+    """PrivateUse1 kernel that lazily ``torch.compile``-s a Spyre decomposition.
+
+    The first eager call compiles the decomposition (with ``dynamic=False``);
+    subsequent eager calls reuse the compiled entry point. When invoked from
+    inside an active ``torch.compile`` context, the wrapped function is called
+    directly — re-entering ``torch.compile`` would be wrong.
     """
 
-    def decorator(fn: Callable[_P, _T]) -> Callable[_P, _T]:
-        # 1. Register in the Spyre decomposition table (for compile mode / make_fx)
-        decomp.register_decomposition(ops, spyre_decompositions)(fn)
+    def __init__(self, fn):
+        self._fn = fn
+        self._compiled_fn = None
 
-        # 2. For aten ops, also register via PrivateUse1 dispatch key (for eager mode).
-        #    Non-aten ops (e.g. spyre::compact) are custom Spyre ops that don't need
-        #    PrivateUse1 kernel registration.
-        #    Skip ops that already have a PrivateUse1 kernel (e.g. from eager.py) to
-        #    avoid registration conflicts.
-        ops_list = ops if isinstance(ops, list) else [ops]
-        aten_ops = [
-            op
-            for op in ops_list
-            if getattr(op, "namespace", None) == "aten"
-            and not torch._C._dispatch_has_kernel_for_dispatch_key(
-                op._name, "PrivateUse1"
+    def __call__(self, *args, **kwargs):
+        from torch.utils import _pytree as pytree
+
+        leaves = pytree.tree_leaves(args) + pytree.tree_leaves(kwargs)
+        if any(
+            isinstance(x, torch.Tensor)
+            and getattr(x.device, "type", None) != DEVICE_NAME
+            for x in leaves
+        ):
+            devs = [x.device if isinstance(x, torch.Tensor) else None for x in leaves]
+            raise RuntimeError(
+                f"Spyre decomposition function called with inputs on a different "
+                f"device! Args devices: {devs=}"
             )
-        ]
-        if aten_ops:
-            register_spyre_decompositions_via_dispatchkey(aten_ops)(fn)
-
-        return fn
-
-    return decorator
-
-
-# Context manager that enables spyre specific decompositions in addition to PyTorch in-tree decompositions
-@contextmanager
-def enable_spyre_decompositions(
-    decomps: Optional[dict[torch._ops.OperatorBase, Callable]] = None,
-):
-    """
-    CM that enables Spyre decompositions:
-      - Temporarily adds relevant Spyre decompositions to provided decomposition table `decomps`
-      - Restore original decompositions table on exit
-
-    This CM is reentrant and safe under nested usage.
-
-    Args:
-        decomps: Decomposition table to modify. Maps operator overloads to their
-            decomposition implementations. Defaults to PyTorch Inductor's global
-            decomposition registry (torch._inductor.decomposition.decompositions).
-    """
-    if decomps is None:
-        decomps = torch._inductor.decomposition.decompositions
-
-    with _decompositions_lock:
-        from torch_spyre.ops.fallbacks import fallback_ops
-        from torch._ops import OpOverload, OpOverloadPacket
-
-        # Helper function to remove ops from decompositions
-        def _fetch_and_remove_op(ops):
-            _removed = {}
-            for op in ops:
-                if isinstance(op, OpOverloadPacket):
-                    for overload_name in op.overloads():
-                        opo = getattr(op, overload_name)
-                        op_ret = decomps.pop(opo, None)
-                        if op_ret is not None:
-                            _removed[opo] = op_ret
-                elif isinstance(op, OpOverload):
-                    op_ret = decomps.pop(op, None)
-                    if op_ret is not None:
-                        _removed[op] = op_ret
-            return _removed
-
-        # 1. Add/override spyre-specific decompositions
-        saved_intree_decompositions = {}
-        for (
-            spyre_decompositions_op,
-            spyre_decompositions_impl,
-        ) in spyre_decompositions.items():
-            if spyre_decompositions_op in decomps:
-                saved_intree_decompositions[spyre_decompositions_op] = decomps[
-                    spyre_decompositions_op
-                ]
-            decomps[spyre_decompositions_op] = spyre_decompositions_impl
-
-        # Attach to the function so we can restore on last exit
-        enable_spyre_decompositions._saved_decompositions = saved_intree_decompositions
-
-        # 2. Remove selected decompositions from Inductor's registry for spyre
-        _removed_decompositions_to_exclude = _fetch_and_remove_op(
-            spyre_decompositions_to_exclude
-        )
-
-        # Attach to the function so we can restore on last exit
-        enable_spyre_decompositions._removed_decompositions_to_exclude = (
-            _removed_decompositions_to_exclude
-        )
-
-        # 3. Remove selected decompositions for fallback ops defined in fallbacks.py
-        _removed_decompositions_fallback_ops = _fetch_and_remove_op(fallback_ops)
-
-        # Attach to the function so we can restore on last exit
-        enable_spyre_decompositions._removed_decompositions_fallback_ops = (
-            _removed_decompositions_fallback_ops
-        )
-
-        try:
-            yield decomps
-        finally:
-            # Inverse order compared to when entering the context manager
-
-            # 1. Revert selected decompositions that have been marked for fallback ops
-            removed_decompositions_fallback_ops = getattr(
-                enable_spyre_decompositions,
-                "_removed_decompositions_fallback_ops",
-                {},
-            )
-            [
-                torch._decomp._add_op_to_registry(decomps, op, fn)
-                for op, fn in removed_decompositions_fallback_ops.items()
-            ]
-
-            # 2. Revert selected decompositions that have been removed from Inductor's registry for spyre
-            removed_decompositions_to_exclude = getattr(
-                enable_spyre_decompositions,
-                "_removed_decompositions_to_exclude",
-                {},
-            )
-            [
-                torch._decomp._add_op_to_registry(decomps, op, fn)
-                for op, fn in removed_decompositions_to_exclude.items()
-            ]
-
-            # 3. Reset the saved in-tree lowerings if needed
-            saved_intree_decompositions = getattr(
-                enable_spyre_decompositions, "_saved_decompositions", {}
-            )
-            for (
-                spyre_decompositions_op,
-                spyre_decompositions_impl,
-            ) in spyre_decompositions.items():
-                if spyre_decompositions_op in saved_intree_decompositions:
-                    decomps[spyre_decompositions_op] = saved_intree_decompositions[
-                        spyre_decompositions_op
-                    ]
-                else:
-                    decomps.pop(spyre_decompositions_op, None)
-
-            # Clean up
-            enable_spyre_decompositions._saved_decompositions = {}
-            enable_spyre_decompositions._removed_decompositions_to_exclude = {}
-            enable_spyre_decompositions._removed_decompositions_fallback_ops = {}
+        if torch.compiler.is_compiling():
+            return self._fn(*args, **kwargs)
+        if self._compiled_fn is None:
+            self._compiled_fn = torch.compile(self._fn, dynamic=False)
+        return self._compiled_fn(*args, **kwargs)
 
 
 def _register_spyre_dispatchkey_kernels_permanently():
-    """
-    Permanently register PrivateUse1 / AutogradPrivateUse1 kernels for all ops
-    in ``spyre_decompositions_via_dispatchkey``.
+    """Install PrivateUse1 / AutogradPrivateUse1 kernels for every aten op
+    that has a Spyre decomposition and no pre-existing PrivateUse1 kernel.
 
-    This must be called once before any eager-mode dispatch can reach the Spyre
-    kernels (typically from ``_SpyreImpl._lazy_init()``).  It is idempotent:
-    subsequent calls are no-ops.
-
-    The ``Library`` objects are stored in module-level globals so they are never
-    garbage-collected (and therefore never unregistered from the C++ dispatcher).
-
-    After registration, ``OPWrapper.__call__`` uses ``torch.compiler.is_compiling()``
-    to route dispatch: inside a ``torch.compile`` context the Spyre function is called
-    directly; outside (eager mode) the pre-compiled wrapper is used.
+    Idempotent; called from ``_SpyreImpl._lazy_init`` after eager ops and
+    custom ops have been imported, so the existing-kernel check sees the final
+    set of registered backends.
     """
     global _spyre_autograd_lib, _spyre_lib, _dispatchkey_kernels_registered
 
@@ -243,67 +152,22 @@ def _register_spyre_dispatchkey_kernels_permanently():
 
     _spyre_autograd_lib = Library("aten", "IMPL", "AutogradPrivateUse1")
     _spyre_lib = Library("aten", "IMPL", "PrivateUse1")
+    has_pu1 = torch._C._dispatch_has_kernel_for_dispatch_key
 
-    for op, wrapper_cls in spyre_decompositions_via_dispatchkey.items():
-        # Autograd key: fall through so that the PrivateUse1 kernel is reached.
+    for op, fn in spyre_decompositions.items():
+        if op.namespace != "aten" or has_pu1(op._name, "PrivateUse1"):
+            continue
+        # Autograd key: fall through so PrivateUse1 is reached.
         _spyre_autograd_lib.impl(op._name, fallthrough_kernel)
-        # PrivateUse1 key: the OPWrapper dispatches to spyre_fn.
-        _spyre_lib.impl(op._name, wrapper_cls)
+        # PrivateUse1 key: dispatch into a lazy-compile wrapper.
+        _spyre_lib.impl(op._name, _OPWrapper(fn))
 
     _dispatchkey_kernels_registered = True
 
 
-def register_spyre_decompositions_via_dispatchkey(
-    ops: Union[torch._ops.OperatorBase, list],
-) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
-    """
-    Register decompositions specifically for Spyre device via the PyTorch dispatcher
-    This replaces the need for global patching of operations in order to enable them for
-    eager mode.
-    """
-
-    def decomposition_decorator(fn: Callable[_P, _T]) -> Callable[_P, _T]:
-        class OPWrapper:
-            def __init__(self, op, spyre_fn):
-                self.op = op
-                self.spyre_fn = spyre_fn
-                # Pre-compile once so that repeated eager-mode calls reuse the
-                # same compiled entry point rather than constructing a new
-                # torch.compile wrapper on every invocation.
-                self._compiled_fn = torch.compile(spyre_fn, dynamic=False)
-
-            def __call__(self, *args, **kwargs):
-                # We are about to execute the op on spyre, hence the inputs are expected to be on spyre
-                if any(
-                    isinstance(x, torch.Tensor)
-                    and getattr(x.device, "type", None) != DEVICE_NAME
-                    for x in (pytree.tree_leaves(args) + pytree.tree_leaves(kwargs))
-                ):
-                    args_device = [
-                        x.device if isinstance(x, torch.Tensor) else None
-                        for x in (pytree.tree_leaves(args) + pytree.tree_leaves(kwargs))
-                    ]
-                    raise RuntimeError(
-                        f"Spyre decomposition function called with inputs being on a different device! Args devices: {args_device=}"
-                    )
-
-                # Inside a torch.compile context (make_fx tracing, Inductor
-                # lowering, etc.) call the function directly — wrapping it in
-                # another torch.compile call would be incorrect.
-                if torch.compiler.is_compiling():
-                    return self.spyre_fn(*args, **kwargs)
-                else:
-                    # Eager mode: use the pre-compiled wrapper.
-                    return self._compiled_fn(*args, **kwargs)
-
-        def register(op):
-            spyre_decompositions_via_dispatchkey[op] = OPWrapper(op, fn)
-
-        # To handle allowing multiple aten_ops at once
-        pytree.tree_map_(register, ops)
-        return fn
-
-    return decomposition_decorator
+###############################################################################
+##                       Spyre decompositions                                ##
+###############################################################################
 
 
 # TODO (imaihal): Inductor applies constant folding to torch.full, which allocates
@@ -313,7 +177,7 @@ def register_spyre_decompositions_via_dispatchkey(
 #
 # Implement ones via identity broadcast: create a size-1 tensor (ones_scalar), expand to
 # target size, then clone (identity) to materialize. Clone op with identity is merged.
-@register_spyre_decomposition([torch.ops.aten.ones.default])
+@register_spyre_decompositions([torch.ops.aten.ones.default])
 def ones_decomp(
     size: Union[list, tuple],
     *,
@@ -328,7 +192,7 @@ def ones_decomp(
     return scalar.reshape(()) if not size else scalar.expand(size).clone()
 
 
-@register_spyre_decomposition([torch.ops.aten.new_ones.default])
+@register_spyre_decompositions([torch.ops.aten.new_ones.default])
 def new_ones_decomp(
     self: torch.Tensor,
     size: Union[list, tuple],
@@ -349,7 +213,7 @@ def new_ones_decomp(
 # To avoid constant folding, we introduce a custom op `spyre::full` that runs
 # torch.full on CPU and copies the result to Spyre. Remove this workaround once
 # Spyre supports one-element tensors.
-@register_spyre_decomposition([torch.ops.aten.full])
+@register_spyre_decompositions([torch.ops.aten.full])
 def full_decomp(
     size: list[Union[int, torch.SymInt]],
     fill_value: torch.types.Number,
@@ -363,7 +227,7 @@ def full_decomp(
     return torch.ops.spyre.full(size, fill_value, device, dtype=dtype)
 
 
-@register_spyre_decomposition([torch.ops.aten.logical_not])
+@register_spyre_decompositions([torch.ops.aten.logical_not])
 def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
     # Currently falling back to torch.zeros_like for dtypes other than bool
     # This is needed until scalar False/0.0 or constant tensor [False]/[0.0] is supported
@@ -374,7 +238,7 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
     return torch.eq(input, zero)
 
 
-@register_spyre_decomposition([torch.ops.aten.addmm.default, torch.ops.aten.addmm.out])
+@register_spyre_decompositions([torch.ops.aten.addmm.default, torch.ops.aten.addmm.out])
 def addmm_decomp(
     input: torch.Tensor,
     mat1: torch.Tensor,
@@ -410,15 +274,13 @@ def addmm_decomp(
     return result
 
 
-###############################################################################################
-##                           Spyre decompositions for aten ops                               ##
-###############################################################################################
-# For aten ops, ``register_spyre_decomposition`` automatically registers both a
-# decomposition table entry (for compile mode / make_fx) and a PrivateUse1
-# dispatch kernel (for eager mode).  The latter is essential for ops with
-# CompositeImplicitAutograd (CIA) in upstream PyTorch (e.g. rms_norm,
-# layer_norm), and harmless for non-CIA ops (e.g. gelu, softplus).
-@register_spyre_decomposition([torch.ops.aten.rms_norm.default])
+###############################################################################
+##                    Spyre decompositions for aten ops                      ##
+###############################################################################
+# For aten ops, ``register_spyre_decompositions`` automatically installs a
+# PrivateUse1 dispatch kernel as well (essential for CIA ops like rms_norm,
+# layer_norm; harmless for the rest).
+@register_spyre_decompositions([torch.ops.aten.rms_norm.default])
 def spyre_rms_norm(
     input: torch.Tensor,
     normalized_shape: list[int],
@@ -439,7 +301,7 @@ def spyre_rms_norm(
     return output
 
 
-@register_spyre_decomposition([torch.ops.aten.layer_norm.default])
+@register_spyre_decompositions([torch.ops.aten.layer_norm.default])
 def spyre_layer_norm(
     input: torch.Tensor,
     normalized_shape: Sequence[int],
@@ -463,7 +325,7 @@ def spyre_layer_norm(
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 
 
-@register_spyre_decomposition([torch.ops.aten.topk])
+@register_spyre_decompositions([torch.ops.aten.topk])
 def spyre_topk(
     input: torch.Tensor,
     k: int,
@@ -476,7 +338,7 @@ def spyre_topk(
     )
 
 
-@register_spyre_decomposition([torch.ops.aten.gelu.default])
+@register_spyre_decompositions([torch.ops.aten.gelu.default])
 def spyre_gelu(
     input: torch.Tensor,
     approximate: str = "none",
@@ -484,14 +346,14 @@ def spyre_gelu(
     return torch.ops.spyre.gelu(input, approximate)
 
 
-@register_spyre_decomposition([torch.ops.aten.softplus.default])
+@register_spyre_decompositions([torch.ops.aten.softplus.default])
 def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
     return torch.ops.spyre.softplus(input, beta, threshold)
 
 
-@register_spyre_decomposition([torch.ops.aten.linear.default])
+@register_spyre_decompositions([torch.ops.aten.linear.default])
 def spyre_linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -504,7 +366,7 @@ def spyre_linear(
     return out
 
 
-@register_spyre_decomposition(
+@register_spyre_decompositions(
     [torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default]
 )
 def spyre__sdpa_overrideable(
@@ -596,7 +458,7 @@ def spyre__sdpa_overrideable(
 ## TODO(imaihal): Need to fix scalar tensor shape mismatch during Spyre-to-CPU transfer.
 ## See: https://github.com/torch-spyre/torch-spyre/issues/1172
 ## This will be enabled after solving this.
-# @register_spyre_decomposition([torch.ops.aten.max.default])
+# @register_spyre_decompositions([torch.ops.aten.max.default])
 # def spyre_max_default_decomp(input):
 #    """
 #    Decompose torch.max(input) with conditional CPU fallback for int64.
@@ -615,7 +477,7 @@ def spyre__sdpa_overrideable(
 #        return torch.ops.aten.amax(input)
 
 
-@register_spyre_decomposition([torch.ops.aten.max.dim])
+@register_spyre_decompositions([torch.ops.aten.max.dim])
 def spyre_max_dim_decomp(input, dim, keepdim=False):
     """
     Decompose torch.max(input, dim) with conditional CPU fallback for int64.
@@ -639,7 +501,7 @@ def spyre_max_dim_decomp(input, dim, keepdim=False):
         return torch.return_types.max((values, indices))
 
 
-@register_spyre_decomposition([torch.ops.aten.min.dim])
+@register_spyre_decompositions([torch.ops.aten.min.dim])
 def spyre_min_dim_decomp(input, dim, keepdim=False):
     """
     Decompose torch.min(input, dim) with conditional CPU fallback for int64.
@@ -656,7 +518,7 @@ def spyre_min_dim_decomp(input, dim, keepdim=False):
         return torch.return_types.min((values, indices))
 
 
-@register_spyre_decomposition([torch.ops.aten.cat.default])
+@register_spyre_decompositions([torch.ops.aten.cat.default])
 def decompose_cat(
     tensors: list[torch.Tensor],
     dim: int = 0,
@@ -680,7 +542,7 @@ def decompose_cat(
         return orig_decomp
 
 
-@register_spyre_decomposition([torch.ops.aten.constant_pad_nd.default])
+@register_spyre_decompositions([torch.ops.aten.constant_pad_nd.default])
 def pad_decomp(
     input: torch.Tensor,
     pad: list[int],
@@ -737,7 +599,7 @@ def pad_decomp(
     return output
 
 
-@register_spyre_decomposition([torch.ops.aten.bitwise_not])
+@register_spyre_decompositions([torch.ops.aten.bitwise_not])
 def bitwise_not(input: torch.Tensor) -> torch.Tensor:
     if input.dtype is torch.bool:
         return torch.logical_not(input)
@@ -746,7 +608,7 @@ def bitwise_not(input: torch.Tensor) -> torch.Tensor:
         return torch.ops.aten.bitwise_xor(input, neg_one)
 
 
-@register_spyre_decomposition([torch.ops.aten.bitwise_and])
+@register_spyre_decompositions([torch.ops.aten.bitwise_and])
 def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
     if input1.dtype is torch.bool and input2.dtype is torch.bool:
         return torch.ops.aten.logical_and(input1, input2)
@@ -758,7 +620,7 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
-@register_spyre_decomposition([torch.ops.aten.sub.Tensor])
+@register_spyre_decompositions([torch.ops.aten.sub.Tensor])
 def sub_with_alpha(
     self: torch.Tensor, other: torch.Tensor, *, alpha: float = 1
 ) -> torch.Tensor:
@@ -776,15 +638,3 @@ def sub_with_alpha(
         # Decompose: sub(a, b, alpha) = sub(a, mul(b, alpha))
         scaled_other = torch.mul(other, alpha)
         return torch.sub(self, scaled_other)
-
-
-###############################################################################################
-##                           Register custom kernels for Spyre.                              ##
-###############################################################################################
-# Kernels are registered permanently in the C++ dispatcher by
-# ``_register_spyre_dispatchkey_kernels_permanently()`` (idempotent).
-# Once registered, ``OPWrapper.__call__`` uses ``torch.compiler.is_compiling()``
-# to route dispatch: inside a ``torch.compile`` context the Spyre function is
-# called directly; outside (eager mode) the pre-compiled wrapper is used.
-# Note: This has to stay at the end of the file.
-_register_spyre_dispatchkey_kernels_permanently()
