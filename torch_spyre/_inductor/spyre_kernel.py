@@ -277,7 +277,10 @@ class SpyreOpFuncs:
         return PointwiseOp("tanh", [x])
 
     @staticmethod
-    def to_dtype(x, dtype, src_dtype):
+    def to_dtype(x, dtype, src_dtype, use_compute_types=False):
+        # PT 2.12 passes a new `use_compute_types` kwarg through OpsHandler.
+        # Spyre maps directly to fixed hardware ops via DtypeOpTable and
+        # cannot honor compute-type promotion, so accept and ignore.
         assert dtype != src_dtype
 
         op = DtypeOpTable.get_operator(src_dtype, dtype)
