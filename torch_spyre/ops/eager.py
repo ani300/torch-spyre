@@ -201,7 +201,7 @@ def spyre__copy_from(self, dst, non_blocking=False):
         # Fall back to a CPU roundtrip copy in that case.
         if torch._C._dispatch_tls_is_dispatch_key_excluded("Python"):
             cpu_tmp = self.to("cpu")
-            _C.copy_tensor(cpu_tmp, dst, non_blocking)
+            torch_spyre._C.copy_tensor(cpu_tmp, dst, non_blocking)
         else:
             torch.ops.spyre.copy_from_d2d(self, dst)
         return dst
