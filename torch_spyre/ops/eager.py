@@ -197,7 +197,14 @@ def spyre__copy_from(self, dst, non_blocking=False):
         _C.copy_tensor(self, dst, non_blocking)
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
-        torch.ops.spyre.copy_from_d2d(self, dst)
+        # copy_from_d2d requires torch.compile, which cannot run inside
+        # no_dispatch() (e.g. during FakeTensorMode constant propagation).
+        # Fall back to a CPU roundtrip copy in that case.
+        if torch._C._dispatch_tls_is_dispatch_key_excluded("Python"):
+            cpu_tmp = self.to("cpu")
+            _C.copy_tensor(cpu_tmp, dst, non_blocking)
+        else:
+            torch.ops.spyre.copy_from_d2d(self, dst)
         return dst
     else:
         if non_blocking:

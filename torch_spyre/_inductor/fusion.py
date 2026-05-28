@@ -21,7 +21,7 @@ from torch._inductor.virtualized import V
 from torch._inductor.ir import FallbackKernel
 from torch_spyre._inductor.logging_utils import _get_env_bool
 from .ir import FixedTiledLayout
-from .constants import SEGMENT_OFFSETS
+from .constants import SEGMENT_OFFSETS, DEVICE_NAME
 
 # TODO: Temporary hook to easily disable
 _FUSION_ENABLED = _get_env_bool("SPYRE_INDUCTOR_ENABLE_FUSION", True)
@@ -68,7 +68,13 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     cur_non_intermediate_count: int = 0
 
     for n in nodes:
-        if isinstance(n, SchedulerNode):
+        n_device = n.get_device()
+        is_spyre_node = (
+            isinstance(n, SchedulerNode)
+            and n_device is not None
+            and n_device.type == DEVICE_NAME
+        )
+        if is_spyre_node:
             n_tensors = {dep.name for dep in n.read_writes.reads_and_writes()}
             new_tensors = n_tensors - cur_tensors
             new_non_intermediate = sum(

@@ -100,7 +100,7 @@ def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
         return pass_fn(graph)
 
 
-class CustomPreGradPasses:
+class CustomPreGradPasses(CustomGraphPass):
     """
     This inductor extension point enables Spyre-specific passes to run on the
     pre-grad FX graph.

@@ -18,10 +18,43 @@ from . import config
 
 import threading
 from functools import wraps
+from typing import Any, Callable
 
 from .propagate_hints import spyre_hint, get_op_hints  # noqa: F401
 
 _autoload_lock = threading.Lock()
+
+
+def _spyre_get_decomp_fn() -> dict[Any, Callable[..., Any]]:
+    """Module-level decomp-table getter for use as Inductor's get_decomp_fn.
+
+    Returns Inductor's global decomposition registry. While compiling a Spyre
+    graph, ``enable_spyre_decompositions`` (entered by ``enable_spyre_context``)
+    mutates this dict in place to add Spyre-specific decompositions and remove
+    decompositions for ops Spyre wants to fall back. By exposing a *module-level*
+    callable here (instead of letting compile_fx wrap our dict in a local
+    closure) we keep the FX graph cache key picklable.
+    """
+    import torch
+
+    return torch._inductor.decomposition.decompositions
+
+
+def _spyre_inner_compile(*args: Any, **kwargs: Any) -> Any:
+    """Wrapper around upstream ``compile_fx_inner`` that pins ``get_decomp_fn``.
+
+    Inductor wraps the user's inner_compile with
+    ``functools.partial(inner_compile, get_decomp_fn=<closure>)`` (compile_fx.py),
+    where the closure captures whatever ``decompositions=`` was passed to
+    ``compile_fx``. That closure is unpicklable, which would bypass the FX
+    graph cache. By overriding the kwarg at call time we ensure that
+    Inductor's ``_InProcessFxCompile`` reads our picklable module-level
+    ``_spyre_get_decomp_fn`` instead.
+    """
+    from torch._inductor.compile_fx import compile_fx_inner
+
+    kwargs["get_decomp_fn"] = _spyre_get_decomp_fn
+    return compile_fx_inner(*args, **kwargs)
 
 
 def enable_spyre_compile_fx_wrapper():
@@ -94,28 +127,21 @@ def enable_spyre_compile_fx_wrapper():
 
         @wraps(_orig)
         def _wrapper(gm, example_inputs, *args, **kwargs):
-            decomps = kwargs.setdefault(
-                "decompositions", torch._inductor.decomposition.decompositions
-            )
-
             if _uses_spyre(gm, example_inputs):
                 torch.spyre._impl._lazy_init()
 
-                with enable_spyre_context(
-                    example_inputs, decomps=decomps
-                ) as spyre_context_decompositions:
-                    # The `decomps` is the updated in the context manager
-                    # with the appropriate spyre decompositions
-                    # and yielded as `spyre_context_decompositions` from the CM
+                # Pass decomps=None so enable_spyre_context mutates Inductor's
+                # global decomposition registry in place. We do NOT forward
+                # a `decompositions=` kwarg to compile_fx because doing so
+                # makes compile_fx wrap the dict in an unpicklable local
+                # closure that bypasses the FX graph cache. Instead we
+                # override `inner_compile` with a module-level wrapper that
+                # pins get_decomp_fn to a picklable module-level callable
+                # returning Inductor's (now spyre-augmented) global registry.
+                kwargs.setdefault("inner_compile", _spyre_inner_compile)
 
-                    kwargs["decompositions"] = spyre_context_decompositions
-
-                    return _orig(
-                        gm,
-                        example_inputs,
-                        *args,
-                        **kwargs,
-                    )
+                with enable_spyre_context(example_inputs, decomps=None):
+                    return _orig(gm, example_inputs, *args, **kwargs)
 
             return _orig(gm, example_inputs, *args, **kwargs)
 
