@@ -91,7 +91,7 @@ disable_error_code = ["attr-defined"]
 filterwarnings = [
     # Suppress torch.jit.script_method DeprecationWarning triggered by
     # importing torch._inductor.compile_fx (which transitively imports torch.utils.mkldnn).
-    # https://github.com/pytorch/pytorch/blob/v2.12.0/torch/jit/_script.py#L366
+    # https://github.com/pytorch/pytorch/blob/0d62256/torch/jit/_script.py#L366
     "ignore::DeprecationWarning:torch.jit._script",
 ]
 norecursedirs = ['tests/models']
