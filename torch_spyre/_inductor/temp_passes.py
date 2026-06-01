@@ -424,18 +424,29 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
     operations which was consuming the scalar value at lowering.
     Deduplication of identical constants happens later at the IR level via
     dedup_and_promote_constants.
+
+    Both ``.Tensor`` and ``.Scalar`` overloads of the supported binary ops are
+    handled. For ``.Scalar`` overloads, the node is retargeted to the matching
+    ``.Tensor`` overload after the scalar argument is rewritten into a
+    ``spyre.constant`` tensor node.
     """
 
-    ops_support_list = [
-        torch.ops.aten.add.Tensor,
-        torch.ops.aten.sub.Tensor,
-        torch.ops.aten.mul.Tensor,
-        torch.ops.aten.true_divide.Tensor,
-        torch.ops.aten.div.Tensor,
-    ]
+    # Map .Scalar overloads to their .Tensor counterparts. The .Tensor entries
+    # also map to themselves so the downstream rewrite is uniform.
+    scalar_to_tensor_overload = {
+        torch.ops.aten.add.Tensor: torch.ops.aten.add.Tensor,
+        torch.ops.aten.add.Scalar: torch.ops.aten.add.Tensor,
+        torch.ops.aten.sub.Tensor: torch.ops.aten.sub.Tensor,
+        torch.ops.aten.sub.Scalar: torch.ops.aten.sub.Tensor,
+        torch.ops.aten.mul.Tensor: torch.ops.aten.mul.Tensor,
+        torch.ops.aten.mul.Scalar: torch.ops.aten.mul.Tensor,
+        torch.ops.aten.true_divide.Tensor: torch.ops.aten.true_divide.Tensor,
+        torch.ops.aten.div.Tensor: torch.ops.aten.div.Tensor,
+        torch.ops.aten.div.Scalar: torch.ops.aten.div.Tensor,
+    }
 
     for node in graph.nodes:
-        if node.target not in ops_support_list:
+        if node.target not in scalar_to_tensor_overload:
             continue
         for idx, in_arg in enumerate(node.args):
             if isinstance(in_arg, torch.fx.node.Node):
@@ -460,5 +471,7 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
                     node.type,
                 )
             node.update_arg(idx, const_node)
+        # Retarget .Scalar overloads to .Tensor now that the scalar arg is a tensor.
+        node.target = scalar_to_tensor_overload[node.target]
 
     graph.lint()
