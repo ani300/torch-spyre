@@ -89,7 +89,7 @@ disable_error_code = ["attr-defined"]
 
 [tool.pytest.ini_options]
 filterwarnings = [
-    # PyTorch 2.12.0+: Suppress torch.jit.script_method DeprecationWarning triggered by
+    # Suppress torch.jit.script_method DeprecationWarning triggered by
     # importing torch._inductor.compile_fx (which transitively imports torch.utils.mkldnn).
     # https://github.com/pytorch/pytorch/blob/v2.12.0/torch/jit/_script.py#L366
     "ignore::DeprecationWarning:torch.jit._script",

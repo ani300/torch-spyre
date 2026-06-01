@@ -108,7 +108,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
     _pre_scheduling_pass = CustomPreSchedulingPasses()
 
     def _spyre_update_scheduler(self: GraphLowering) -> None:
-        _pre_scheduling_pass(self.operations)
+        _pre_scheduling_pass(self)
         old_update_scheduler(self)
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]

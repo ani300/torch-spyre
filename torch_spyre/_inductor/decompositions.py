@@ -188,8 +188,7 @@ def ones_decomp(
 ) -> torch.Tensor:
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
-    scalar = torch.ops.spyre.ones_scalar(device, dtype=dtype)
-    return scalar.reshape(()) if not size else scalar.expand(size).clone()
+    return torch.ops.aten.full(size, 1, dtype=dtype, layout=layout, device=device)
 
 
 @register_spyre_decompositions([torch.ops.aten.new_ones.default])
@@ -236,6 +235,16 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
     else:
         zero = torch.zeros_like(input)
     return torch.eq(input, zero)
+
+
+@register_spyre_decompositions([torch.ops.aten.sign.default])
+def spyre_sign(input: torch.Tensor) -> torch.Tensor:
+    zero = torch.zeros_like(input)
+    return torch.where(
+        torch.gt(input, zero),
+        torch.ones_like(input),
+        torch.where(torch.lt(input, zero), -torch.ones_like(input), zero),
+    )
 
 
 @register_spyre_decompositions([torch.ops.aten.addmm.default, torch.ops.aten.addmm.out])
@@ -597,6 +606,13 @@ def pad_decomp(
         input=input, output=output, dims=dims, offsets=offsets
     )
     return output
+
+
+@register_spyre_decompositions([torch.ops.aten.ceil.default])
+def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
+    return torch.ops.aten.neg.default(
+        torch.ops.aten.floor.default(torch.ops.aten.neg.default(input))
+    )
 
 
 @register_spyre_decompositions([torch.ops.aten.bitwise_not])
