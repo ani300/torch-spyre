@@ -36,9 +36,8 @@ def _spyre_inner_compile(*args: Any, **kwargs: Any) -> Any:
     Workaround: we never pass ``decompositions=``. Instead we override
     ``inner_compile`` with this wrapper, which clobbers ``get_decomp_fn`` at
     call time with the module-level ``get_spyre_decomp_table`` — a picklable,
-    name-resolvable callable. Removable once upstream lets us pass a
-    picklable decomp table directly (see findings doc / proposed
-    ``CustomDecompositionTable`` ABC).
+    name-resolvable callable.
+    NOTE: We are working on improving this in upstream PyTorch
     """
     from torch._inductor.compile_fx import compile_fx_inner
     from torch_spyre._inductor.decompositions import get_spyre_decomp_table
