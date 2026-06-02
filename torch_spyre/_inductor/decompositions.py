@@ -46,9 +46,7 @@ spyre_decompositions_to_exclude = [
     torch.ops.aten.tril,
 ]
 
-OpOrOps = Union[
-    torch._ops.OperatorBase, Sequence[torch._ops.OperatorBase]
-]
+OpOrOps = Union[torch._ops.OperatorBase, Sequence[torch._ops.OperatorBase]]
 
 # Module-level Library handles, kept alive for the lifetime of the process.
 # ``torch.library.Library`` uses ``weakref.finalize`` to call ``m.reset()`` on

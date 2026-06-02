@@ -18,7 +18,7 @@ from . import config
 
 import threading
 from functools import wraps
-from typing import Any, Callable
+from typing import Any
 
 from .propagate_hints import spyre_hint, get_op_hints  # noqa: F401
 
@@ -26,15 +26,19 @@ _autoload_lock = threading.Lock()
 
 
 def _spyre_inner_compile(*args: Any, **kwargs: Any) -> Any:
-    """Wrapper around upstream ``compile_fx_inner`` that pins ``get_decomp_fn``.
+    """Wrapper around ``compile_fx_inner`` that pins a picklable ``get_decomp_fn``.
 
-    Inductor wraps the user's inner_compile with
-    ``functools.partial(inner_compile, get_decomp_fn=<closure>)``
-    (compile_fx.py), where the closure captures whatever ``decompositions=``
-    was passed to ``compile_fx``. That closure is unpicklable, which would
-    bypass the FX graph cache. By overriding the kwarg at call time with the
-    module-level ``get_spyre_decomp_table`` we keep the cache key picklable
-    while still feeding Inductor the Spyre-augmented decomposition table.
+    Background: passing ``decompositions=<dict>`` to ``compile_fx`` causes it
+    to wrap the dict in a local ``def get_decomp_fn`` closure (compile_fx.py).
+    That closure is unpicklable, so the FX graph cache silently bypasses
+    itself with ``BypassFxGraphCache("Failed to pickle cache key")``.
+
+    Workaround: we never pass ``decompositions=``. Instead we override
+    ``inner_compile`` with this wrapper, which clobbers ``get_decomp_fn`` at
+    call time with the module-level ``get_spyre_decomp_table`` — a picklable,
+    name-resolvable callable. Removable once upstream lets us pass a
+    picklable decomp table directly (see findings doc / proposed
+    ``CustomDecompositionTable`` ABC).
     """
     from torch._inductor.compile_fx import compile_fx_inner
     from torch_spyre._inductor.decompositions import get_spyre_decomp_table
@@ -115,15 +119,8 @@ def enable_spyre_compile_fx_wrapper():
         def _wrapper(gm, example_inputs, *args, **kwargs):
             if _uses_spyre(gm, example_inputs):
                 torch.spyre._impl._lazy_init()
-
-                # We do NOT forward a `decompositions=` kwarg to compile_fx:
-                # that would make compile_fx wrap the dict in an unpicklable
-                # local closure and bypass the FX graph cache. Instead we
-                # override `inner_compile` with a module-level wrapper that
-                # pins `get_decomp_fn` to `get_spyre_decomp_table`, a
-                # picklable module-level callable.
+                # Route inner compilation through _spyre_inner_compile.
                 kwargs.setdefault("inner_compile", _spyre_inner_compile)
-
                 with enable_spyre_context(example_inputs):
                     return _orig(gm, example_inputs, *args, **kwargs)
 
