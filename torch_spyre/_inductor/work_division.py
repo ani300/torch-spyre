@@ -60,6 +60,13 @@ aten = torch.ops.aten
 spyreop = torch.ops.spyre
 
 
+def _is_restickify_op(op: ComputedBuffer) -> bool:
+    return any(
+        getattr(origin, "target", None) is spyreop.restickify.default
+        for origin in getattr(op, "origins", [])
+    )
+
+
 @dataclasses.dataclass
 class TensorDep:
     """Bundles a MemoryDep with its FixedTiledLayout and pre-computes device coordinates."""
@@ -768,6 +775,8 @@ def span_reduction(operations: list[Operation]) -> None:
     for op in _iter_computed_buffers(operations):
         rw = op.get_read_writes()
         args = get_mem_deps_from_rw(rw)
+        if _is_restickify_op(op):
+            continue
         if isinstance(op.data, Pointwise):
             divide_pointwise_op(op, args, max_cores, span_reduction_pass)
         elif isinstance(op.data, Reduction):
@@ -789,6 +798,8 @@ def work_distribution(
             continue
         rw = op.get_read_writes()
         args = get_mem_deps_from_rw(rw)
+        if _is_restickify_op(op):
+            continue
         if isinstance(op.data, Pointwise):
             divide_pointwise_op(op, args, max_cores, work_distribution_pass)
         elif isinstance(op.data, Reduction):

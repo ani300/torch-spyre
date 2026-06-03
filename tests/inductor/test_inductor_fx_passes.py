@@ -219,6 +219,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             result = concretize_index(index, loop_vars)
             assert result == index, f"Expected {index}, got {result}"
 
+    def test_restickify_device_size_substick_target_uses_one_outer_stick(self):
+        from torch_spyre._inductor.pass_utils import restickify_device_size
+
+        result = restickify_device_size(
+            old_device_size=[4, 64, 4, 2, 64],
+            old_sd_outer_dim=3,
+            old_sd_host_size=2,
+            new_sd_outer_dim=1,
+            new_sd_host_size=32,
+            stick_size=64,
+        )
+
+        assert result[3] == 1
+        assert all(size > 0 for size in result)
+
 
 if __name__ == "__main__":
     unittest.main()

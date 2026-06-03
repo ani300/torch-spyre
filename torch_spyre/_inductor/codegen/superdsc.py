@@ -22,6 +22,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
+    RESTICKIFY_OP,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
     LAYOUT_LABELS,
@@ -338,7 +339,7 @@ def _create_sdsc_tensors(
         max_dim_sizes: dict = {}
         reduced_dims: list = []
         if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
-            reduced_dims = [d for d in op_dim_order if d not in dim_order]
+            reduced_dims = [d for d in dims if d not in dim_order]
             dim_order = dim_order + reduced_dims
 
         if op_stick_dim is None:
@@ -526,14 +527,41 @@ def _extend_matmul_k_to_padded(
         sdsc_iteration_space[k_sym] = k_padded
 
 
+def _restickify_drop_dims(op_spec: OpSpec) -> set[Symbol]:
+    if op_spec.op != RESTICKIFY_OP or len(op_spec.iteration_space) <= 5:
+        return set()
+
+    drop: set[Symbol] = set()
+    extra = len(op_spec.iteration_space) - 5
+    for sym, (size, split) in reversed(op_spec.iteration_space.items()):
+        if extra == 0:
+            break
+        if size == 1 and split == 1:
+            drop.add(sym)
+            extra -= 1
+    if extra != 0:
+        raise RuntimeError(
+            f"ReStickifyOpHBM SDSC requires at most 5 dimensions, got "
+            f"{len(op_spec.iteration_space)} and could not drop {extra} size-1 dimensions"
+        )
+    return drop
+
+
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
-    ndim = len(op_spec.iteration_space)
+    dropped_dims = _restickify_drop_dims(op_spec)
+    effective_iteration_space = {
+        sym: value
+        for sym, value in op_spec.iteration_space.items()
+        if sym not in dropped_dims
+    }
+    ndim = len(effective_iteration_space)
 
     dim_labels = _get_op_dim_labels(ndim, is_matmul)
-    symbol_mapping = {
-        sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
-    }
+    symbol_mapping = {sym: Integer(0) for sym in dropped_dims}
+    symbol_mapping.update(
+        {sym: Symbol(dim_labels[i]) for i, sym in enumerate(effective_iteration_space)}
+    )
     logger.debug(
         "symbol mapping: %s",
         ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),
@@ -541,17 +569,18 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     sdsc_iteration_space = {
         symbol_mapping[sym]: _concretize_for_sdsc(size)
-        for sym, (size, _) in op_spec.iteration_space.items()
+        for sym, (size, _) in effective_iteration_space.items()
     }
 
     dim_splits = {
-        symbol_mapping[dim]: value[-1] for dim, value in op_spec.iteration_space.items()
+        symbol_mapping[dim]: value[-1]
+        for dim, value in effective_iteration_space.items()
     }
     num_cores = math.prod(dim_splits.values())
 
     work_slices = {
         symbol_mapping[sym]: wk_slice
-        for sym, (_, wk_slice) in op_spec.iteration_space.items()
+        for sym, (_, wk_slice) in effective_iteration_space.items()
     }
 
     ref_arg = _ref_arg(op_spec)

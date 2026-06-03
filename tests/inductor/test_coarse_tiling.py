@@ -538,6 +538,40 @@ class TestDivideRanges(unittest.TestCase):
         op = _make_op(MagicMock(spec=Operation))
         _divide_ranges(op, Integer(4), tiled_dims=[0])
 
+    def test_fixed_tiled_layout_preserves_stick_host_dim_after_tiling(self):
+        import torch
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        data = _make_pointwise([Integer(12), Integer(32), Integer(256), Integer(256)])
+        op = _make_op(data)
+        size = [Integer(12), Integer(32), Integer(256), Integer(256)]
+        stride = [Integer(2097152), Integer(65536), Integer(256), Integer(1)]
+        origin = MagicMock()
+        origin.target = torch.ops.spyre.restickify.default
+        op.origins = OrderedSet([origin])
+        op.layout = FixedTiledLayout(
+            torch.device("spyre"),
+            torch.float16,
+            size,
+            stride,
+            SpyreTensorLayout(
+                [12, 32, 256, 256],
+                [2097152, 65536, 256, 1],
+                torch.float16,
+                [0, 1, 3, 2],
+            ),
+        )
+
+        _divide_ranges(op, Integer(6), tiled_dims=[0])
+        _divide_ranges(op, Integer(8), tiled_dims=[1])
+        _divide_ranges(op, Integer(4), tiled_dims=[3])
+
+        self.assertEqual(
+            op.layout.size, [Integer(2), Integer(4), Integer(256), Integer(64)]
+        )
+        self.assertEqual(list(op.layout.device_layout.stride_map)[-1], 256)
+
 
 class TestCoarseTile(unittest.TestCase):
     def _run(self, all_ops, groups, **kwargs):
@@ -1121,6 +1155,68 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
             has_strides,
             f"Expected non-empty affine_strides; got {affine_strides}.",
         )
+
+    def test_restickify_layouts_fit_fixed_dim_contract(self):
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        c2 = Symbol("c2")
+        c3 = Symbol("c3")
+        z0 = Symbol("z0")
+        z1 = Symbol("z1")
+        op_spec = OpSpec(
+            op="ReStickifyOpHBM",
+            is_reduction=False,
+            iteration_space={
+                c0: (Integer(2), 2),
+                c1: (Integer(4), 4),
+                c2: (Integer(256), 4),
+                c3: (Integer(64), 1),
+                z0: (Integer(1), 1),
+                z1: (Integer(1), 1),
+            },
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=-1,
+                    device_dtype=_FP16,
+                    device_size=[4, 64, 4, 1, 32, 64],
+                    device_coordinates=[
+                        z0,
+                        c3,
+                        sympify("floor(c2/64)"),
+                        c0,
+                        c1,
+                        sympify("Mod(c2, 64)"),
+                    ],
+                    allocation={"pool": 0x1000},
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=-1,
+                    device_dtype=_FP16,
+                    device_size=[1, 1, 4, 256, 2, 64],
+                    device_coordinates=[
+                        sympify("floor(c3/64)"),
+                        z0,
+                        c1,
+                        c2,
+                        c0,
+                        sympify("Mod(c3, 64)"),
+                    ],
+                    allocation={"pool": 0x2000},
+                ),
+            ],
+            op_info={},
+            tiled_symbols=[c0, c1, c3],
+        )
+
+        sdsc_json, _, _ = compile_op_spec(0, op_spec, [], use_symbols=False)
+        dsc = next(iter(sdsc_json.values()))["dscs_"][0]["ReStickifyOpHBM"]
+        n_dims = [str(k).rstrip("_") for k in dsc["N_"] if str(k) != "name_"]
+
+        self.assertEqual(len(n_dims), 5)
+        for layout in dsc["primaryDsInfo_"].values():
+            self.assertEqual(len(layout["layoutDimOrder_"]), len(n_dims))
 
     def test_generate_bundle_emits_affine_apply_for_tiled_loop(self):
         op_spec = _make_tiled_op_spec()

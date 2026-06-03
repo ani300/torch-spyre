@@ -490,6 +490,7 @@ def align_tensors(
         coordinates.append(
             (var % dim_size if var is not None else sympy.S.Zero) + offset
         )
+        size = [sympy.S.One if s == 0 else s for s in size]
         new_tensors.append({"size": size, "coordinates": coordinates})
 
     # decide desired rank for all tensors
