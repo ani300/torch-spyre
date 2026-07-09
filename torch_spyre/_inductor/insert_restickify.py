@@ -18,10 +18,19 @@ from collections import defaultdict
 import torch
 
 from .constants import ELIDED_COPY_BACK_ATTR
+from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
-from .pass_utils import copy_fx_custom_meta
+from .pass_utils import (
+    copy_fx_custom_meta,
+    find_reduction_var,
+    host_coordinates,
+    identify_matmul_inputs,
+    _is_matmul_op,
+)
+from .propagate_hints import _HINT_RE
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -47,6 +56,119 @@ def _fixed_tiled(layout: FixedLayout, stl: SpyreTensorLayout) -> FixedTiledLayou
     return FixedTiledLayout(
         layout.device, layout.dtype, layout.size, layout.stride, stl
     )
+
+
+def _lone_sym(coord):
+    """Return the single free symbol of a coord expr, or None."""
+    syms = coord.free_symbols
+    return next(iter(syms)) if len(syms) == 1 else None
+
+
+def _remap_matmul_input_named_dims(
+    op, arg_name: str, out_named: list[str]
+) -> "list[str] | None":
+    """Remap a matmul's output-ordered ``named_dims`` to one matmul INPUT's axes.
+
+    A consumer matmul's ``spyre_hint(named_dims=[...])`` describes the OUTPUT
+    axes.  A restickify inserted for one of its inputs consumes ``named_dims``
+    positionally against that input's OWN axes (``propagate_named_dims`` zips it
+    with the restickify buffer's output coords), so copying the output list
+    verbatim mislabels a transposed input — e.g. ``keys_T = [B, H, head_dim,
+    Skv]`` gets ``max_seqlen_kv`` on the head_dim axis, which coarse tiling then
+    divides below one stick.
+
+    Return an input-axis-ordered name list: batch dims and the single matmul dim
+    this input contributes keep their names (matched by loop variable); the
+    reduction (contraction) dim and any unmapped/size-1 dim get an
+    ``_untracked_<size>`` placeholder so they stay effectively unnamed.  Return
+    ``None`` if the op cannot be classified as a matmul with two inputs (caller
+    falls back to the verbatim copy).
+    """
+    rw = op.get_read_writes()
+    reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
+    writes = [d for d in rw.writes if isinstance(d, MemoryDep)]
+    if len(reads) != 2 or len(writes) != 1:
+        return None
+    out_dep = writes[0]
+    x_dep, y_dep = identify_matmul_inputs(reads, out_dep)
+    if x_dep is None or y_dep is None:
+        return None
+    try:
+        reduction_var = find_reduction_var(x_dep, out_dep)
+    except Unsupported:
+        return None
+
+    in_dep = next((d for d in reads if d.name == arg_name), None)
+    if in_dep is None:
+        return None
+    in_buf = V.graph.get_buffer(arg_name)
+    if in_buf is None:
+        return None
+
+    # Both coord lists live in the matmul's loop-var namespace (input/output deps
+    # of the same op), so matching by loop var is valid — the same bridge used in
+    # padding.py::_pad_matmul_operands.
+    in_coords = host_coordinates(in_buf.get_layout(), in_dep, None)
+    out_coords = host_coordinates(op.get_layout(), out_dep, None)
+    if len(out_named) != len(out_coords):
+        return None  # rank mismatch: cannot map positionally
+
+    name_by_outsym: dict = {}
+    for coord, name in zip(out_coords, out_named):
+        sym = _lone_sym(coord)
+        if sym is not None:
+            name_by_outsym[sym] = name
+
+    sizes = [int(s) for s in in_buf.get_layout().size]
+    result: list[str] = []
+    for i, coord in enumerate(in_coords):
+        sym = _lone_sym(coord)
+        if sym is None or sym == reduction_var or sym not in name_by_outsym:
+            # size-1 / reduction (contraction) / unmapped → leave unnamed
+            result.append(f"_untracked_{sizes[i]}")
+        else:
+            result.append(name_by_outsym[sym])
+    return result
+
+
+def _copy_hint_meta_to_restickify(
+    op, arg_name: str, consumer_fx_node, restick_fx_node
+) -> None:
+    """Copy the consumer's ``custom`` hint meta onto the restickify node.
+
+    For a matmul consumer, ``named_dims`` (output-ordered) is remapped to the
+    restickified input's axis order so it names the right axes and leaves the
+    reduction dim unnamed; other hint keys (tiles/slices/work_div) are name-keyed
+    and copied unchanged.  For any other consumer, or if the matmul cannot be
+    classified, the whole meta is copied verbatim (unchanged behavior).
+    """
+    if not _is_matmul_op(op):
+        copy_fx_custom_meta(consumer_fx_node, restick_fx_node)
+        return
+
+    import copy
+
+    custom = consumer_fx_node.meta["custom"]
+    new_custom = copy.deepcopy(custom)
+    remapped_cache: dict = {}  # id(out_named) tuple -> remapped, avoid recompute
+    for key, val in new_custom.items():
+        if not (_HINT_RE.match(key) and isinstance(val, dict)):
+            continue
+        out_named = val.get("named_dims")
+        if not out_named:
+            continue
+        cache_key = tuple(out_named)
+        if cache_key not in remapped_cache:
+            remapped_cache[cache_key] = _remap_matmul_input_named_dims(
+                op, arg_name, list(out_named)
+            )
+        remapped = remapped_cache[cache_key]
+        if remapped is None:
+            # Could not classify — safest is to keep the whole copy verbatim.
+            copy_fx_custom_meta(consumer_fx_node, restick_fx_node)
+            return
+        val["named_dims"] = remapped
+    restick_fx_node.meta["custom"] = new_custom
 
 
 def _record_restickify(
@@ -127,10 +249,9 @@ def _create_restickify_node(
         )
     # Propagate hint metadata from the consumer op so assign_dim_hints can assign
     # dim_hints to the restickify buffer after insertion.
-    for consumer_fx_node in op.origins:
-        if "custom" in consumer_fx_node.meta:
-            copy_fx_custom_meta(consumer_fx_node, restick_fx_node)
-            break
+    consumer_fx_node = next((n for n in op.origins if "custom" in n.meta), None)
+    if consumer_fx_node is not None:
+        _copy_hint_meta_to_restickify(op, arg_name, consumer_fx_node, restick_fx_node)
     # Lower the FX node; run_node registers the output in graph.buffers and graph.operations.
     restick_tb = graph_lowering.run_node(restick_fx_node)
     restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer

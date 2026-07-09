@@ -96,6 +96,13 @@ class FixedTiledLayout(FixedLayout):
         self.device_layout: SpyreTensorLayout = device_layout
         self.allocation: dict[str, Any] = {}
         self.per_tile_fixed: bool = False
+        # Snapshot the host strides at first construction.  Coarse tiling
+        # (_divide_ranges) overwrites self.stride with contiguous strides for the
+        # per-tile size, which loses the transpose information of a non-contiguous
+        # layout (e.g. a flash QK^T output).  This persistent copy lets the tiler
+        # recover the original stride ordering across every tile level to
+        # disambiguate same-size dims (which host dim is the stick dim).
+        self.orig_host_stride: tuple[Expr, ...] = tuple(stride)
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"
