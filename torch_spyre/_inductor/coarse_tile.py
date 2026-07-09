@@ -1656,7 +1656,13 @@ def _stamp_group(
     return retiled_infos
 
 
-def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: list[int]):
+def _resize_device_layout(
+    orig_stl,
+    old_host_size: list[int],
+    new_host_size: list[int],
+    old_host_stride: "list[int] | None" = None,
+    dtype: "torch.dtype | None" = None,
+):
     """Derive a new SpyreTensorLayout for a resized host buffer.
 
     Used in two directions:
@@ -1737,6 +1743,30 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
     new_hs = [int(s) for s in FlexibleLayout.contiguous_strides(new_host_size)]
 
+    # Effective host strides for stride-based matching.  The device layout
+    # encodes which host dim is the stick dim via its strides, but two host dims
+    # of the same size are only distinguishable by their *real* host strides
+    # (e.g. a transposed QK^T output where Sq and Skv are both 512).  When the
+    # caller supplies the real strides, use them; otherwise fall back to
+    # contiguous (the historical behavior for row-major buffers).
+    eff_hs = (
+        [int(s) for s in old_host_stride] if old_host_stride is not None else old_hs
+    )
+
+    # Candidate stick host dim, from the inner-stick device stride.  By
+    # construction (dim_map_to_stride_map assigns the stick host dim's stride to
+    # the innermost device slot) the stick host dim d satisfies
+    # orig_host_stride[d] == stride_map[ndev-1].  This is the ONLY reliable way
+    # to recover which host dim is sticked when two share a size — the stick is
+    # not necessarily the densest dim (e.g. keys_T sticks Skv, not head_dim).
+    # It is validated by the round-trip guard below before being trusted.
+    stick_by_stride: int | None = None
+    if old_host_stride is not None:
+        inner_stick_sm = orig_sm[ndev - 1]
+        stick_hits = [p for p in range(ndim) if eff_hs[p] == inner_stick_sm]
+        if len(stick_hits) == 1:
+            stick_by_stride = stick_hits[0]
+
     new_ds = list(orig_ds)
     new_sm = list(orig_sm)
 
@@ -1757,11 +1787,27 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
                 # provisional; may be reclassified as tile-count in Pass 1b
                 matched_host[j] = size_cands[0]
             elif len(size_cands) > 1:
-                stride_cands = [p for p in size_cands if old_hs[p] == orig_sm[j]]
+                # Same-size host dims.  Primary: match by stride (eff_hs, which
+                # is the real host stride when threaded, else contiguous) — this
+                # is the original tiebreaker and handles contiguous layouts.
+                stride_cands = [p for p in size_cands if eff_hs[p] == orig_sm[j]]
                 if len(stride_cands) == 1:
                     matched_host[j] = stride_cands[0]
                 else:
-                    unmatched_j.append(j)
+                    # Stride is ambiguous (e.g. transposed QK^T with Sq == Skv,
+                    # where a prior tile level clobbered exact magnitudes).  A
+                    # plain non-stick device dim never represents the stick host
+                    # dim, so exclude the stick candidate (stick_by_stride, from
+                    # the inner-stick stride; validated by the guard below).
+                    free = [
+                        p
+                        for p in size_cands
+                        if p not in matched_host.values() and p != stick_by_stride
+                    ]
+                    if len(free) == 1:
+                        matched_host[j] = free[0]
+                    else:
+                        unmatched_j.append(j)
             else:
                 unmatched_j.append(j)  # no size match → tile-count
 
@@ -1808,16 +1854,53 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
         pstar_cands = [p for p in unmatched_all if old_host_size[p] > 1]
         if not pstar_cands:
             pstar_cands = unmatched_all
+        if len(pstar_cands) > 1 and stick_by_stride in pstar_cands:
+            # Multiple same-size unmatched candidates: pick the one identified by
+            # the inner-stick stride (validated by the round-trip guard below).
+            pstar_cands = [stick_by_stride]
         if len(pstar_cands) != 1:
             raise RuntimeError(
                 f"_resize_device_layout: cannot uniquely identify the stick host dim "
-                f"by elimination in {orig_stl!r} (old_host_size={old_host_size}); "
+                f"by elimination in {orig_stl!r} (old_host_size={old_host_size}, "
+                f"old_host_stride={old_host_stride}); "
                 f"unmatched host dims={unmatched_all} "
                 f"(non-singleton candidates={pstar_cands}), "
                 f"non-stick device dims={matched_host}. "
                 f"This layout is not supported by the device-native reconstruction."
             )
         pstar = pstar_cands[0]
+
+    # Guard against a silently-wrong pstar (which would corrupt Pass 3/4 and emit
+    # a valid-looking but wrong layout — far worse than a crash).  A full stride
+    # round-trip at the current (already-tiled) size is unsound: transposed
+    # layouts legitimately leave non-contiguous strides invariant across a tile
+    # level (the Pass 2/3/4 else-branches below), so reconstructed magnitudes may
+    # differ.  Instead validate structurally, which is magnitude-free and holds
+    # at every level: the persisted device layout must show pstar sticked, i.e.
+    #   * its inner stick (device dim ndev-1) has device_size == eps, and
+    #   * exactly the expected tile-count device dims of size ceil(host/eps) exist
+    #     for pstar and were left unmatched (they are in unmatched_j),
+    # and pstar was chosen from the inner-stick stride, which equals
+    # host_stride[pstar] by construction (dim_map_to_stride_map) and is stable
+    # across tiling.  Cross-check: pstar's original stride must equal the
+    # inner-stick device stride (stick_by_stride), the invariant we selected on.
+    if old_host_stride is not None and pstar is not None and old_host_size[pstar] > 1:
+        expected_tc = -(-old_host_size[pstar] // eps)  # ceil
+        inner_is_stick = orig_ds[ndev - 1] == eps
+        # A separate tile-count device dim only exists when pstar spans more than
+        # one stick (expected_tc > 1); when pstar fits in a single stick
+        # (expected_tc == 1) there is no tile-count dim to find.
+        tc_ok = expected_tc == 1 or any(orig_ds[j] == expected_tc for j in unmatched_j)
+        if stick_by_stride != pstar or not tc_ok or not inner_is_stick:
+            raise RuntimeError(
+                f"_resize_device_layout: structural guard rejected stick host dim "
+                f"{pstar} (stick_by_stride={stick_by_stride}, expected tile-count "
+                f"{expected_tc}, unmatched device dims={unmatched_j}, "
+                f"inner_stick_size={orig_ds[ndev - 1]} vs eps={eps}) for "
+                f"old_host_size={old_host_size}, orig_host_stride="
+                f"{list(old_host_stride)} in {orig_stl!r}. "
+                f"Refusing to emit a possibly-wrong tiled layout."
+            )
 
     # Pass 2: update non-stick dims.
     for j, p in matched_host.items():
@@ -1967,8 +2050,21 @@ def _divide_ranges(
     for i in tiled_dims:
         old_host_size[i] = int(new_size[i] * loop_count)
     new_size_ints = [int(s) for s in new_size]
+    # Thread the ORIGINAL host strides (snapshotted at first construction), not
+    # layout.stride: the latter was already overwritten with contiguous strides
+    # at L1989 on an earlier tile level, losing the transpose info.  The absolute
+    # stride values are for the untiled size, but their relative ORDERING (which
+    # dim is densest / the stick dim) is invariant across tile levels, which is
+    # all _resize_device_layout needs to disambiguate same-size host dims.
+    orig_host_stride = getattr(layout, "orig_host_stride", None)
     layout.device_layout = _resize_device_layout(
-        layout.device_layout, old_host_size, new_size_ints
+        layout.device_layout,
+        old_host_size,
+        new_size_ints,
+        old_host_stride=(
+            [int(s) for s in orig_host_stride] if orig_host_stride is not None else None
+        ),
+        dtype=layout.dtype,
     )
     return retiled_info
 

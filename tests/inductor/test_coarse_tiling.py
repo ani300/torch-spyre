@@ -987,6 +987,44 @@ class TestDivideRanges(unittest.TestCase):
         expected = SpyreTensorLayout([64], [1], torch.float16, [0])
         self.assertEqual(result, expected)
 
+    def test_resize_device_layout_transposed_same_size_dims(self):
+        """Two host dims of the same size in a transposed layout are disambiguated
+        by the real host strides (threaded via old_host_stride), not by contiguous
+        strides.
+
+        This is the flash attention QK^T output: logical [B, H, Sq, Skv] with
+        Sq == Skv == 512, stored transposed.  The device layout
+        (device_size=[32,512,8,1,64], stride_map=[512,16384,64,-1,1]) is
+        byte-identical whether Sq or Skv is the stick dim, so size-based
+        elimination alone cannot tell them apart.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        dev = SpyreTensorLayout([1, 1], torch.float16).device_dtype
+        # Transposed QK^T output: Skv (dim3) is the stick (host stride 1); Sq
+        # (dim2) is a non-stick dim with host stride 16384.
+        stl = SpyreTensorLayout([32, 512, 8, 1, 64], [512, 16384, 64, -1, 1], dev)
+        host_size = [1, 32, 512, 512]
+        host_stride = [8388608, 512, 16384, 1]
+
+        # Without the real strides the two size-512 dims are ambiguous → raise.
+        with self.assertRaises(RuntimeError):
+            _resize_device_layout(stl, host_size, [1, 32, 256, 512])
+
+        # With the real strides, tiling Sq (512 → 256) reconstructs correctly:
+        # the non-stick Sq device dim (j=1) shrinks; the transposed stride_map is
+        # left invariant (physical layout unchanged); the stick (Skv) is untouched.
+        result = _resize_device_layout(
+            stl,
+            host_size,
+            [1, 32, 256, 512],
+            old_host_stride=host_stride,
+            dtype=torch.float16,
+        )
+        self.assertEqual(list(result.device_size), [32, 256, 8, 1, 64])
+        self.assertEqual(list(result.stride_map), [512, 16384, 64, -1, 1])
+
 
 def _mock_op_out_coords(op):
     """Return pre-built coords stored on op by _make_hinted_op, or empty list."""
