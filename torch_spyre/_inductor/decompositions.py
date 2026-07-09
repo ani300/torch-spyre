@@ -612,39 +612,15 @@ def spyre__sdpa_overrideable(
                     with spyre_hint(
                         work_div={"num_heads": 4, "max_seqlen_q": 2, "max_seqlen_kv": 2}
                     ):
-                        scaled_keys = (
-                            key * scaling_factor
-                        )  # batch_size, num_heads, max_seqlen_kv, head_dim
-                        keys_T = scaled_keys.transpose(
-                            -1, -2
-                        )  # batch_size, num_heads, head_dim, max_seqlen_kv
-                        # Pre-scale the query OUTSIDE the named_dims scope below.
-                        # spyre_hint(named_dims=...) is a traceback.annotate
-                        # context manager that stamps EVERY node created in
-                        # scope; if this [.., max_seqlen_q, head_dim] mul were
-                        # inside it, the 4-name list would misregister
-                        # max_seqlen_kv as head_dim's size.  Only the matmul
-                        # output must carry the hint.
-                        scaled_query = query * scaling_factor
-                        # Name the QK^T output dims in-graph so the tiles hints
-                        # above resolve.  A matmul output carries no names from
-                        # its inputs (BatchMatmul is neither Pointwise nor
-                        # Reduction), so this named_dims hint is the only way to
-                        # establish them.  max_seqlen_kv is an OUTPUT dim here
-                        # (it is the reduction dim of the attn @ value matmul, so
-                        # it must be named on this op, not that one).  The list
-                        # length must equal the output rank (4).
-                        with spyre_hint(
-                            named_dims=[
-                                "batch_size",
-                                "num_heads",
-                                "max_seqlen_q",
-                                "max_seqlen_kv",
-                            ]
-                        ):
-                            scores = torch.matmul(
-                                scaled_query, keys_T
-                            )  # batch_size, num_heads, max_seqlen_q, max_seqlen_kv
+                        with spyre_hint(named_dims=["batch_size", "num_heads", "max_seqlen_q", "head_dim"]):
+                            scaled_query = query * scaling_factor
+                        with spyre_hint(named_dims=["batch_size", "num_heads", "max_seqlen_kv", "head_dim"]):
+                            scaled_keys = key * scaling_factor
+                        keys_T = scaled_keys.transpose(-1, -2)
+                        # batch_size, num_heads, head_dim, max_seqlen_kv
+
+                        scores = torch.matmul(scaled_query, keys_T)
+                        # batch_size, num_heads, max_seqlen_q, max_seqlen_kv
 
                         if is_causal:
                             scores = scores + causal_mask
@@ -670,21 +646,9 @@ def spyre__sdpa_overrideable(
                             denominator * correction + exp_scores.sum(dim=-1),
                             denominator,
                         )  # batch_size, num_heads, max_seqlen_q sparse
-                        # Name the attn @ value output dims in-graph (same
-                        # reason as the QK^T matmul above).  Its output dims are
-                        # [batch, heads, seqq, head_dim]; max_seqlen_kv is this
-                        # op's reduction dim and is named on the QK^T output, so
-                        # its reduction name propagates here via the normal
-                        # reduction-name handling.
-                        with spyre_hint(
-                            named_dims=[
-                                "batch_size",
-                                "num_heads",
-                                "max_seqlen_q",
-                                "head_dim",
-                            ]
-                        ):
-                            attn_value = torch.matmul(exp_scores, value)
+
+                        attn_value = torch.matmul(exp_scores, value)
+
                         output = torch.ops.spyre.copy_f(
                             output * correction.unsqueeze(-1) + attn_value,
                             output,
