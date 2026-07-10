@@ -1675,6 +1675,15 @@ def _stamp_group(
 def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: list[int]):
     """Derive a new SpyreTensorLayout for a resized host buffer.
 
+    Called ONLY from the post-stickify span-overflow coarse-tiling path
+    (_maybe_coarse_tile_span_overflow).  The hint-driven path runs pre-stickify
+    and does not call this function: when coarse_tile shrinks a buffer's
+    data.ranges pre-stickify, no SpyreTensorLayout exists yet, and stickification
+    subsequently assigns the correct layout from the already-divided ranges.
+
+    For the span-overflow path, this function is still needed because stickification
+    has already run when span-overflow groups are formed.
+
     Used in two directions:
 
     * **shrink** (``_divide_ranges``): the buffer is the same physical
