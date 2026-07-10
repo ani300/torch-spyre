@@ -14,8 +14,10 @@
 
 """Split oversized pointwise ops into memory-safe chunks.
 
-Runs after ``propagate_spyre_tensor_layouts`` / ``insert_restickify`` and
-before ``span_reduction``.  Each chunk becomes a normal
+Runs after the stickification passes (``propagate_spyre_tensor_layouts`` /
+``insert_restickify``) because it requires ``FixedTiledLayout.device_layout``
+(``device_size``, ``stride_map``, ``elems_per_stick``) for span arithmetic.
+Runs before ``span_reduction``.  Each chunk becomes a normal
 ``ComputedBuffer`` that work-division handles without special-casing.
 """
 

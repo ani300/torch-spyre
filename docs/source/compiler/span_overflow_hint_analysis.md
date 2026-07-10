@@ -72,15 +72,28 @@ groups in the exact format consumed by `coarse_tile()`:
 [([op], [(hint_id, split_count, is_reduction_level)])]
 ```
 
-`passes.py` wires this into `_maybe_coarse_tile()` alongside user coarse-tiling hints:
+`passes.py` wires this into separate `_maybe_coarse_tile_hints()` (pre-stickify) and
+`_maybe_coarse_tile_span_overflow()` (post-stickify) passes.  The hint-driven path runs
+before stickification and uses the approach below.  The span-overflow path runs
+after stickification as a second coarse-tiling pass on ops with FixedTiledLayout:
+
+Hint-driven path (pre-stickify):
 
 ```python
 groups = []
 if not config.ignore_wsr_hints:
     reorder_unhinted_interlopers(graph)
     groups += hints_to_coarse_tile_groups(graph)
-if not config.ignore_span_overflow_hints:
-    groups += span_overflow_groups(graph)
+if groups:
+    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+    coarse_tile(graph, groups=groups)
+```
+
+Span-overflow path (post-stickify):
+
+```python
+groups = span_overflow_groups(graph)
 if groups:
     op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))

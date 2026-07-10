@@ -1456,7 +1456,7 @@ def _per_core_view_on_buf(
     # H split_count=8) — the tile factor is their product (size-1 dims
     # contribute ×1). Absent / untiled loop var → factor 1.
     # Fall back to the producer's dim_hints when op has none (e.g. combine/fill
-    # inserted by _maybe_coarse_tile after assign_dim_hints ran).
+    # inserted by coarse_tile after assign_dim_hints ran).
     # TODO: fix in coarse_tile.py — _insert_combine_op/_insert_reduction_copy_op
     # /fill path should copy dim_hints from the tiled op onto inserted ops.
     dim_hints = getattr(op, "dim_hints", None) or getattr(buf_op, "dim_hints", None)

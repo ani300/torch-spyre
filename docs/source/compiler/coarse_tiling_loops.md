@@ -607,6 +607,10 @@ wrapped in private helpers tagged with `@_runs(...)` for cache-key purposes:
 ```python
 self.passes = [
     deadcode_elimination,
+    # Working Set Reduction (hint-driven, pre-stickification)
+    propagate_named_dims,
+    assign_dim_hints,
+    _maybe_coarse_tile_hints,           # hint-driven path
     # Tensor Layout (Stickification)
     split_multi_ops,
     propagate_spyre_tensor_layouts,
@@ -618,12 +622,9 @@ self.passes = [
     insert_bmm_padding,
     #
     dedup_and_promote_constants,
-    # Working Set Reduction
+    # Working Set Reduction (device-layout-aware, post-stickification)
     _maybe_chunk_large_tensors,   # config-gated
-    propagate_named_dims,
-    assign_dim_hints,
-    _maybe_coarse_tile,           # reorder_unhinted_interlopers + hints_to_coarse_tile_groups
-                                  # + span_overflow_groups + coarse_tile
+    _maybe_coarse_tile_span_overflow,   # span-overflow path
     # Core Division
     span_reduction,
     _distribute_work,             # calls cost_model_matmul_division + work_distribution
