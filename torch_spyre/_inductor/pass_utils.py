@@ -307,9 +307,18 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
 
 
 def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
-    """Return host coordinates for the output dep of a ComputedBuffer."""
+    """Return host coordinates for the output dep of a ComputedBuffer.
+
+    For a buffer whose layout is ``MutationLayoutSHOULDREMOVE`` (e.g. a
+    ``spyre.copy_`` accumulator update, where the arithmetic is realized into
+    the mutating buffer), use the real underlying layout — the mutation layout
+    itself has no meaningful size/stride of its own.
+    """
     output_dep = next(iter(op.get_read_writes().writes))
-    return host_coordinates(op.get_layout(), output_dep, indirect_sizes_from_op(op))
+    layout = op.get_layout()
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    return host_coordinates(layout, output_dep, indirect_sizes_from_op(op))
 
 
 def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:

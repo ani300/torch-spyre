@@ -568,7 +568,14 @@ def spyre__sdpa_overrideable(
     kv_block_size = 128
     q_block_size = 128
 
-    output = torch.zeros_like(query)
+    # query is a transpose(1,2) VIEW: logical [B, H, Sq, D] but PHYSICALLY stored
+    # [B, Sq, H, D].  zeros_like(query) inherits that physical layout, so the
+    # named_dims hint must describe the buffer's physical dim order (Sq before H).
+    # Listing them in logical order poisons _named_dims with swapped sizes
+    # (num_heads:=Sq, max_seqlen_q:=H) via the first-writer setdefault, scrambling
+    # every downstream accumulator's tiling.  See propagate_named_dims hint branch.
+    with spyre_hint(named_dims=["batch_size", "max_seqlen_q", "num_heads", "head_dim"]):
+        output = torch.zeros_like(query)
 
     # FIXME: create a sparse M tensor via reduction
     M_reduced = torch.full(
@@ -577,7 +584,8 @@ def spyre__sdpa_overrideable(
         device=query.device,
         dtype=query.dtype,
     )
-    M = M_reduced.amax(dim=-1)  # batch_size, num_heads, max_seqlen_q sparse
+    with spyre_hint(named_dims=["batch_size", "num_heads", "max_seqlen_q"]):
+        M = M_reduced.amax(dim=-1)  # batch_size, num_heads, max_seqlen_q sparse
 
     # FIXME: create a sparse denominator tensor via reduction
     denominator_reduced = torch.zeros(
@@ -585,9 +593,8 @@ def spyre__sdpa_overrideable(
         device=query.device,
         dtype=query.dtype,
     )
-    denominator = denominator_reduced.amax(
-        dim=-1
-    )  # batch_size, num_heads, max_seqlen_q sparse
+    with spyre_hint(named_dims=["batch_size", "num_heads", "max_seqlen_q"]):  # sparse
+        denominator = denominator_reduced.amax(dim=-1)
 
     # Precompute the causal additive mask once before entering the tiled loops.
     # Shape [1, 1, max_seqlen_q, max_seqlen_kv]: 0.0 = keep, -inf = masked.

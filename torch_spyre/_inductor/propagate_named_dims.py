@@ -406,7 +406,16 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
         if op.is_no_op():
             _set_no_named_dims(op)
         elif isinstance(op, ComputedBuffer):
-            if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            # A MutationLayoutSHOULDREMOVE buffer that holds a real Pointwise /
+            # Reduction body (e.g. a spyre.copy_ accumulator update, where the
+            # arithmetic `output * correction + attn_value` is realized INTO the
+            # mutating buffer) must still be named/tiled — otherwise it becomes a
+            # hint-less coarse-tile group break and stays full-sized inside the
+            # flash loop.  Only skip the trivial mutation markers (no real
+            # compute body); op_out_coords resolves the real layout for the rest.
+            if isinstance(op.layout, MutationLayoutSHOULDREMOVE) and not isinstance(
+                op.data, (Pointwise, Reduction)
+            ):
                 continue
             hint = False
             for hint_dict in get_op_hints(op).values():
@@ -416,7 +425,12 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
                     break
             if hint:
                 coords = op_out_coords(op)
-                layout_size = op.get_layout().size
+                # Use the real layout for size (mutation-layout buffers have no
+                # meaningful size of their own); matches op_out_coords above.
+                out_layout = op.get_layout()
+                if isinstance(out_layout, MutationLayoutSHOULDREMOVE):
+                    out_layout = out_layout.real_layout()
+                layout_size = out_layout.size
                 # zip() below truncates to the shorter of named_dims/layout_size,
                 # so a name-count mismatch would silently drop names (leaving them
                 # unregistered) rather than fail loudly like the input path.  Warn
