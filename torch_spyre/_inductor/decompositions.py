@@ -565,8 +565,8 @@ def spyre__sdpa_overrideable(
         key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
 
-    kv_block_size = 128
-    q_block_size = 128
+    kv_block_size = 256
+    q_block_size = 256
 
     # query is a transpose(1,2) VIEW: logical [B, H, Sq, D] but PHYSICALLY stored
     # [B, Sq, H, D].  zeros_like(query) inherits that physical layout, so the
@@ -609,7 +609,7 @@ def spyre__sdpa_overrideable(
         )
 
     with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
-        with spyre_hint(tiles={"num_heads": max(1, num_heads // 4)}):
+        with spyre_hint(tiles={"num_heads": max(1, num_heads // 2)}):
             with spyre_hint(
                 tiles={"max_seqlen_q": max(1, max_seqlen_q // q_block_size)}
             ):
@@ -617,7 +617,7 @@ def spyre__sdpa_overrideable(
                     tiles={"max_seqlen_kv": max(1, max_seqlen_kv // kv_block_size)}
                 ):
                     with spyre_hint(
-                        work_div={"num_heads": 4, "max_seqlen_q": 2, "max_seqlen_kv": 2}
+                        work_div={"num_heads": 2, "max_seqlen_q": 2, "max_seqlen_kv": 2}
                     ):
                         with spyre_hint(named_dims=["batch_size", "num_heads", "max_seqlen_q", "head_dim"]):
                             scaled_query = query * scaling_factor
