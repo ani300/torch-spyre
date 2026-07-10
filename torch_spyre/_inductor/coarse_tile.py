@@ -568,6 +568,7 @@ def _clear_cache(obj: object, key: str) -> None:
 def coarse_tile(
     graph: GraphLowering,
     groups: list[tuple],
+    group_idx_offset: int = 0,
 ) -> None:
     """Stamp loop_group_id / loop_count on operations and scale their ranges.
 
@@ -581,6 +582,11 @@ def coarse_tile(
         Sequence of ``(ops, levels)`` tuples produced by
         ``hints_to_coarse_tile_groups``.  ``levels`` is a list of
         ``(hint_id, count)`` pairs, outermost first.
+    group_idx_offset:
+        Starting index for group IDs assigned to the first group.  Use this
+        when making a second ``coarse_tile`` call on the same graph so that
+        the new group IDs do not collide with IDs already stamped by an
+        earlier call (e.g. hint-driven groups stamped pre-stickification).
     """
     operations = graph.operations
     op_to_position: dict[str, int] = {
@@ -590,7 +596,7 @@ def coarse_tile(
     retiled_infos_by_group: list[
         tuple[tuple[int, ...], list[Operation], dict[str, _RetiledBufferInfo]]
     ] = []
-    for group_idx, (group_ops, levels) in enumerate(groups):
+    for group_idx, (group_ops, levels) in enumerate(groups, start=group_idx_offset):
         group_id: tuple[int, ...] = (group_idx,)
         retiled_infos = _stamp_group(group_ops, group_id, levels, op_to_position)
         stamped_group_id = group_id + (0,) * (len(levels) - 1)
