@@ -220,7 +220,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         # Mock size_hint to raise TypeError for tmp0
         with patch("torch_spyre._inductor.pass_utils.V") as mock_v:
-            mock_v.graph.sizevars.size_hint.side_effect = TypeError(
+            mock_v.graph.sizevars.optimization_hint.side_effect = TypeError(
                 "Cannot convert symbols to int"
             )
 

@@ -16,7 +16,8 @@ import os
 from pathlib import Path
 import yaml
 import pytest
-import re
+import regex as re
+
 
 import shared_config
 from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES

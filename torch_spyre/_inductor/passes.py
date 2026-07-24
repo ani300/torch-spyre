@@ -41,6 +41,7 @@ from .logging_utils import get_inductor_logger
 from .padding import insert_bmm_padding
 from .temp_passes import (
     bmm_unflatten_pass,
+    decompose_addmm,
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
@@ -236,6 +237,12 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
         super().__init__(
             [
                 recover_spyre_hints,
+                # Undo the post-grad re-fusion of add(input, mm(a, b)) back into
+                # aten.addmm, so the resulting mul.Scalar alpha/beta nodes (whose
+                # constants are materialized later by the LoopLevel IR multi-ops
+                # pass) and the mm flow through the Spyre lowerings instead of
+                # falling back to extern_kernels.addmm.
+                decompose_addmm,
                 mm_to_bmm_pass.apply,
                 mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
@@ -392,6 +399,12 @@ class CustomPreSchedulingPasses:
                     "elapsed %5dms  %s",
                     (time.perf_counter() - t0) * 1000,
                     _get_pass_name(pass_fn),
+                )
+
+            pass_name = _get_pass_name(pass_fn)
+            if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
+                logger.debug(
+                    "AFTER %s\n%s", pass_name, _format_operations(graph.operations)
                 )
 
             pass_name = _get_pass_name(pass_fn)

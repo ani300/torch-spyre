@@ -253,10 +253,12 @@ class TestResolveSdscSize(InductorTestCase):
         s0 = sympy.Symbol("s0", integer=True, positive=True)
         self.assertEqual(_resolve_sdsc_size(s0, {"s0": (1024, 64)}), 1024)
 
-    def test_symbolic_not_in_bounds_falls_back_to_size_hint(self):
-        # Symbol absent from bounds → _concretize_for_sdsc → size_hint.
+    def test_symbolic_not_in_bounds_falls_back_to_optimization_hint(self):
+        # Symbol absent from bounds → _concretize_for_sdsc → optimization_hint.
+        # (PT 2.12 renamed the sizevars concretization entry point from
+        # ``size_hint`` to ``optimization_hint``.)
         s0 = sympy.Symbol("s0", integer=True, positive=True)
-        sizevars = SimpleNamespace(size_hint=lambda _: 128)
+        sizevars = SimpleNamespace(optimization_hint=lambda _: 128)
         mock_v = SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
         with patch("torch_spyre._inductor.codegen.superdsc.V", mock_v):
             self.assertEqual(_resolve_sdsc_size(s0, {}), 128)
