@@ -198,17 +198,22 @@ def _serialize_value(v):
         # Concretize: first try direct float conversion for concrete numerics,
         # then fall back to substituting size_hints for symbolic expressions.
         if hasattr(v, "free_symbols") and v.free_symbols:
-            # Substitute each symbol individually (optimization_hint handles simple
-            # Symbol lookups reliably), then evaluate.  This works for float
-            # expressions like 1.0/s97 where optimization_hint on the whole expression
-            # might not handle the float division correctly.
-            subs = {s: V.graph.sizevars.optimization_hint(s) for s in v.free_symbols}
+            # Substitute each symbol individually (guarding_hint_or_throw handles
+            # simple Symbol lookups reliably), then evaluate.  This works for float
+            # expressions like 1.0/s97 where a hint on the whole expression might
+            # not handle the float division correctly.  This value is baked into
+            # generated kernel source, so use the strict hint: resolve backed
+            # symbols to their true value and raise on unbacked ones rather than
+            # emitting an optimization fallback.
+            subs = {
+                s: V.graph.sizevars.guarding_hint_or_throw(s) for s in v.free_symbols
+            }
             concrete = float(v.subs(subs))
             return repr(concrete)
         try:
             return repr(float(v))
         except (TypeError, ValueError):
-            return repr(V.graph.sizevars.optimization_hint(v))
+            return repr(V.graph.sizevars.guarding_hint_or_throw(v))
     elif isinstance(v, dict):
         items = ", ".join(f"{repr(k)}: {_serialize_value(val)}" for k, val in v.items())
         return "{" + items + "}"

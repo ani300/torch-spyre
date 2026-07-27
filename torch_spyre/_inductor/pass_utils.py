@@ -287,7 +287,7 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
 
     Uses the ShapeEnv upper bound when one is recorded (i.e. the symbol was
     created with an explicit ``max=`` constraint using mark_dynamic API). Falls
-    back to ``size_hint`` when no finite upper bound exists.
+    back to ``optimization_hint`` when no finite upper bound exists.
 
     Needed for dynamic shape support.
     """
@@ -300,7 +300,11 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
     bound = finite_upper_or_none(expr)
     if bound is not None:
         return bound
-    return V.graph.sizevars.size_hint(expr)
+    # No finite ShapeEnv bound: fall back to the permissive hint. size_hint was
+    # removed in PT 2.12; optimization_hint is its replacement and keeps the
+    # intended "best-effort max estimate" semantics (a heuristic/fallback for
+    # unbacked symbols) rather than raising.
+    return V.graph.sizevars.optimization_hint(expr)
 
 
 def compute_symbolic_bounds(expr: Union[Expr, int]) -> "tuple[int, int] | None":
