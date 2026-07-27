@@ -501,7 +501,21 @@ def spyre__sdpa_overrideable(
                         )  # batch_size, num_heads, max_seqlen_q sparse
 
     output = torch.ops.spyre.copy_f(output / denominator.unsqueeze(-1), output)
-    output = output.contiguous().transpose(1, 2).contiguous().transpose(1, 2)
+    # The reference meta kernel for this op
+    # (torch._meta_registrations.meta__scaled_dot_product_fused_attention_
+    # overrideable -> alloc_with_matching_layout) declares the output layout to
+    # MATCH THE QUERY's layout, not a fixed [B, S, H, D]-contiguous physical
+    # layout. Inductor emits assert_size_stride against those meta strides, so the
+    # decomp output must carry the same strides as ``query``. For a contiguous
+    # query this is plain [B, H, S, D]-contiguous; for a transposed query
+    # (physical [B, S, H, D]) it is the swapped-dim layout. Reproduce the meta's
+    # dim-order permutation so both cases match exactly.
+    dim_order = sorted(
+        range(query.dim()), key=lambda i: query.stride()[i], reverse=True
+    )
+    permuted = output.permute(dim_order).contiguous()
+    inverse_permute = [dim_order.index(i) for i in range(len(dim_order))]
+    output = permuted.permute(inverse_permute)
     logsumexp = torch.empty(
         (batch_size, num_heads, max_seqlen_q), dtype=torch.float32, device="spyre"
     )

@@ -380,12 +380,6 @@ class CustomPreSchedulingPasses:
                     "AFTER %s\n%s", pass_name, format_operations(graph.operations)
                 )
 
-            pass_name = _get_pass_name(pass_fn)
-            if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
-                logger.debug(
-                    "AFTER %s\n%s", pass_name, _format_operations(graph.operations)
-                )
-
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", format_operations(graph.operations))
 
