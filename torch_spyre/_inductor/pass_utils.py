@@ -190,13 +190,13 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     min_default_g = config.min_default_granularity
 
     # When ShapeEnv has no finite upper bound, max_size came from
-    # size_hint (via compute_max_size below, merged in #2003), not from
+    # optimization_hint (via compute_max_size below, merged in #2003), not from
     # mark_dynamic(max=...). The granularity is then only as trustworthy
     # as that hint -- warn the user so they can pin it explicitly with
     # mark_dynamic(max=...).
     if finite_upper_or_none(expr) is None:
         warnings.warn(
-            f"max for symbolic dim {expr} came from size_hint, not from "
+            f"max for symbolic dim {expr} came from optimization_hint, not from "
             f"mark_dynamic(max=...). Proceeding with max={max_size} as a "
             f"best-effort estimate. Set max explicitly via mark_dynamic to "
             f"lock the bucket structure.",

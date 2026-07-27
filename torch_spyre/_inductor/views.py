@@ -509,7 +509,7 @@ def align_tensors(
     # Save original (possibly symbolic) range expressions before concretizing.
     # The algorithm below requires concrete ints for sorting and integer division,
     # but we must propagate symbolic expressions forward so downstream passes
-    # (work_division, SDSC codegen) see the symbols to extract fields, not size_hints.
+    # (work_division, SDSC codegen) see the symbols to extract fields, not hints.
     orig_ranges = {var: val[0] for var, val in iteration_space.items()}
     # local import: pass_utils imports compute_coordinates/matching_dim from
     # this module, so importing at module scope would create a cycle.

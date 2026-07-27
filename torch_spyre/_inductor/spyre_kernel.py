@@ -196,7 +196,7 @@ def _serialize_value(v):
         return repr(int(v))
     elif isinstance(v, sympy.Basic):
         # Concretize: first try direct float conversion for concrete numerics,
-        # then fall back to substituting size_hints for symbolic expressions.
+        # then fall back to substituting hints for symbolic expressions.
         if hasattr(v, "free_symbols") and v.free_symbols:
             # Substitute each symbol individually (guarding_hint_or_throw handles
             # simple Symbol lookups reliably), then evaluate.  This works for float

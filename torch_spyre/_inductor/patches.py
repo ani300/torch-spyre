@@ -48,8 +48,9 @@ def enable_spyre_context(example_inputs: list[InputType]):
       - Disabling incompatible optimizations (e.g., reduction splitting, permute fusion)
 
     Spyre-specific decompositions are *not* installed by this CM. They are
-    threaded into Inductor via ``get_decomp_fn`` (see ``_spyre_get_decomp_fn``
-    in ``torch_spyre._inductor``), which keeps the FX graph cache key picklable
+    threaded into Inductor via ``get_decomp_fn`` (see ``_spyre_inner_compile``,
+    which re-binds it to ``get_spyre_decomp_table`` in
+    ``torch_spyre._inductor``), which keeps the FX graph cache key picklable
     and avoids mutating PyTorch's global decomposition registry.
 
     Args:

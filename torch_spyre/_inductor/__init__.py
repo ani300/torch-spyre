@@ -34,10 +34,20 @@ def _spyre_inner_compile(*args: Any, **kwargs: Any) -> Any:
     That closure is unpicklable, so the FX graph cache silently bypasses
     itself with ``BypassFxGraphCache("Failed to pickle cache key")``.
 
-    Workaround: we never pass ``decompositions=``. Instead we override
-    ``inner_compile`` with this wrapper, which clobbers ``get_decomp_fn`` at
-    call time with the module-level ``get_spyre_decomp_table`` — a picklable,
-    name-resolvable callable.
+    Two-stage decomposition design (these are not contradictory):
+
+    * Outer stage — ``enable_spyre_compile_fx_wrapper``'s ``_wrapper`` DOES pass
+      ``decompositions=get_spyre_decomp_table()`` to ``compile_fx``. That dict
+      only feeds AOTAutograd's joint-graph decomposition; it is consumed before
+      the FX graph cache key is built, so its unpicklable ``get_decomp_fn``
+      closure is never part of the cache key.
+
+    * Inner stage — this wrapper (installed as ``inner_compile``) never receives
+      ``decompositions=``. Instead it clobbers ``get_decomp_fn`` at call time
+      with the module-level ``get_spyre_decomp_table`` — a picklable,
+      name-resolvable callable — so the post-AOT inner compile decomposes with
+      the same table while keeping the FX graph cache key picklable.
+
     NOTE: We are working on improving this in upstream PyTorch
     """
     from torch._inductor.compile_fx import compile_fx_inner
