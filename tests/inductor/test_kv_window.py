@@ -244,18 +244,27 @@ class TestRejection:
     def test_a_hand_built_read_is_validated(self):
         # The op takes its placement as plain ints, so a caller that does not
         # go through the plan can walk off the end of the cache.
+        shape = (BATCH, HEADS, 256, HEAD_DIM)
         ok = dict(
             read_start=0,
             buffer_width=128,
             seqlen_kv=256,
             num_heads=8,
             num_kv_heads=8,
+            key_shape=shape,
+            value_shape=shape,
         )
         assert check_window_read(**ok) is None
         assert check_window_read(**{**ok, "read_start": 128}) is None  # last legal
         assert "runs past the cache" in check_window_read(**{**ok, "read_start": 129})
         assert check_window_read(**{**ok, "read_start": -1}) is not None
         assert "whole multiple" in check_window_read(**{**ok, "num_kv_heads": 3})
+        # MLA-style: V's head_dim differs from K's -- the fake kernel's shape
+        # would otherwise silently come from the wrong tensor.
+        mismatched = (BATCH, HEADS, 256, HEAD_DIM * 2)
+        assert "does not match" in check_window_read(
+            **{**ok, "value_shape": mismatched}
+        )
 
 
 # --------------------------------------------------------------- 2. algorithm

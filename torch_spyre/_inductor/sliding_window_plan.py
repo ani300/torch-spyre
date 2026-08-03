@@ -98,6 +98,8 @@ def check_window_read(
     seqlen_kv: int,
     num_heads: int,
     num_kv_heads: int,
+    key_shape: tuple[int, ...],
+    value_shape: tuple[int, ...],
 ) -> str | None:
     """Why this read is invalid, or None.
 
@@ -120,6 +122,8 @@ def check_window_read(
             f"num_heads={num_heads} is not a whole multiple of "
             f"num_kv_heads={num_kv_heads}"
         )
+    if key_shape != value_shape:
+        return f"key.shape={key_shape} does not match value.shape={value_shape}"
     return None
 
 

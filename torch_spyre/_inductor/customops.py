@@ -917,13 +917,15 @@ def _(
         seqlen_kv=key.size(2),
         num_heads=num_heads,
         num_kv_heads=key.size(1),
+        key_shape=tuple(key.shape),
+        value_shape=tuple(value.shape),
     )
     if reason is not None:
         raise Unsupported(f"kv_window: {reason}")
 
     batch, _, _, head_dim = key.shape
     k_win = key.new_empty((batch, num_heads, head_dim, buffer_width))
-    v_win = key.new_empty((batch, num_heads, buffer_width, head_dim))
+    v_win = value.new_empty((batch, num_heads, buffer_width, head_dim))
     return k_win, v_win
 
 

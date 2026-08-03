@@ -557,6 +557,8 @@ def spyre_kv_window(
         seqlen_kv=key.size(2),
         num_heads=num_heads,
         num_kv_heads=key.size(1),
+        key_shape=tuple(key.shape),
+        value_shape=tuple(value.shape),
     )
     if reason is not None:
         raise Unsupported(f"kv_window: {reason}")
