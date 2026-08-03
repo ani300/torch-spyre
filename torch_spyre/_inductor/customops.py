@@ -755,6 +755,178 @@ def _(
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
 
 
+@torch.library.custom_op(
+    "spyre::sliding_window_attention", mutates_args=(), device_types="spyre"
+)
+def sliding_window_attention(  # type: ignore[empty-body]
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    window_size: int,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Sliding-window attention entry point.
+
+    query: [B, Hq, Lq, D]; key/value: [B, Hkv, Lk, D] (GQA expansion handled
+    internally when Hq != Hkv). window_size is a compile-time constant (not a
+    data-dependent tensor), matching flash-attention's window_size_left
+    convention. Query row r (KV-cache coordinate max(0, Lk - Lq) + i) may
+    attend to key position c iff 0 <= r - c < window_size (causal) or
+    abs(r - c) < window_size (bidirectional, not yet implemented --
+    is_causal=False raises Unsupported).
+
+    MUST be called under torch.compile(backend="inductor") on the spyre
+    device — see spyre_sliding_window_attention in decompositions.py for the
+    real (windowed, block-skipping) Inductor lowering. This eager body is
+    intentionally empty, matching spyre::exx2 / spyre::layernormscale.
+    """
+    pass
+
+
+@sliding_window_attention.register_fake
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    window_size: int,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    return query.new_empty(query.size())
+
+
+@torch.library.custom_op(
+    "spyre::window_band_mask", mutates_args=(), device_types="spyre"
+)
+def window_band_mask(
+    read_start: int,
+    q_block: int,
+    buffer_width: int,
+    q_row_origin: int,
+    window_size: int,
+    is_causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Additive band over one Q block's KV window.
+
+    Shape: [1, 1, q_block, buffer_width]; 0.0 = keep, -inf = masked. Both
+    leading axes are size 1 and broadcast over batch and heads, which keeps
+    this at q_block x buffer_width elements rather than one copy per head.
+
+    Query row ``q_row_origin + i`` (an absolute KV-cache coordinate: row 0 of
+    this block sits at ``seqlen_kv - seqlen_q + q_block*n``) may attend column
+    ``read_start + j`` iff, with ``delta`` the difference of those two absolute
+    coordinates:
+      - causal:        0 <= delta < window_size
+      - bidirectional: abs(delta) < window_size
+
+    The band removes what the buffer over-covers: the stagger between rows
+    inside the block, and the columns pulled in when a ragged first/last
+    window is shifted to stay inside the cache.
+
+    Takes ``read_start`` and ``q_row_origin`` -- an origin and an extent --
+    rather than a block index and the sequence lengths, so the op knows nothing
+    about how the caller blocks the query.
+
+    Built entirely on CPU so the in-place ops stay opaque to torch.compile,
+    matching spyre.causal_mask's rationale.
+    """
+    row = torch.arange(q_block, device="cpu") + q_row_origin
+    column = torch.arange(buffer_width, device="cpu") + read_start
+    delta = row.unsqueeze(-1) - column.unsqueeze(0)
+    if is_causal:
+        allowed = (delta >= 0) & (delta < window_size)
+    else:
+        allowed = delta.abs() < window_size
+    mask_cpu = torch.zeros(allowed.shape, dtype=dtype, device="cpu")
+    mask_cpu.masked_fill_(~allowed, float("-inf"))
+    return mask_cpu.unsqueeze(0).unsqueeze(0).to(device=device)
+
+
+@window_band_mask.register_fake
+def _(
+    read_start: int,
+    q_block: int,
+    buffer_width: int,
+    q_row_origin: int,
+    window_size: int,
+    is_causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(1, 1, q_block, buffer_width, dtype=dtype, device=device)
+
+
+@torch.library.custom_op("spyre::kv_window", mutates_args=(), device_types="spyre")
+def kv_window(  # type: ignore[empty-body]
+    key: torch.Tensor,
+    value: torch.Tensor,
+    read_start: int,
+    buffer_width: int,
+    num_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Read one Q block's slice of the KV cache.
+
+    key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win) covering cache rows
+    [read_start, read_start + buffer_width). k_win is [B, Hq, E, buffer_width],
+    already **transposed** -- that is the layout the scores matmul wants, and
+    doing it on the slice costs nothing.
+
+    **One block per call.** The caller loops over Q blocks and reuses the same
+    window buffer, so the extra memory is buffer_width rows for any query
+    length rather than one buffer per block. That reuse is granted by the
+    memory planner rather than expressed by the graph -- the blocks are
+    independent of each other -- and it is granted today: the planned pool
+    grows by one window per unit of buffer_width, not by one per block.
+
+    ``read_start`` comes from SlidingWindowPlan. Passing it in, rather than a
+    block index, keeps this op ignorant of how the query is blocked.
+
+    GQA expansion to num_heads happens here, applied to the window slice rather
+    than to the full-length cache (see the decomposition for why).
+
+    The mask that goes with this window is a separate op, spyre::window_band_mask
+    -- reading the cache and building a band have no arguments in common.
+
+    MUST be called under torch.compile(backend="inductor") on the spyre
+    device — this eager body is intentionally empty, matching
+    spyre::sliding_window_attention. The real logic is the
+    register_spyre_decomposition lowering in decompositions.py.
+    """
+    pass
+
+
+@kv_window.register_fake
+def _(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    read_start: int,
+    buffer_width: int,
+    num_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from .sliding_window_plan import check_window_read
+
+    reason = check_window_read(
+        read_start=read_start,
+        buffer_width=buffer_width,
+        seqlen_kv=key.size(2),
+        num_heads=num_heads,
+        num_kv_heads=key.size(1),
+    )
+    if reason is not None:
+        raise Unsupported(f"kv_window: {reason}")
+
+    batch, _, _, head_dim = key.shape
+    k_win = key.new_empty((batch, num_heads, head_dim, buffer_width))
+    v_win = key.new_empty((batch, num_heads, buffer_width, head_dim))
+    return k_win, v_win
+
+
 @torch.library.custom_op("spyre::prod_dim_int", mutates_args=(), device_types="spyre")
 def prod_dim_int(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     pass
