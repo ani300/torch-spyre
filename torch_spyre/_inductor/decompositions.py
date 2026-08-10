@@ -36,6 +36,7 @@ from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
 from .sliding_window_plan import (
     SlidingWindowPlan,
+    check_cache_geometry,
     check_window_read,
     plan_sliding_window,
     query_blocking,
@@ -557,7 +558,7 @@ def spyre_kv_window(
     reason = check_window_read(
         read_start=read_start,
         buffer_width=buffer_width,
-        seqlen_kv=key.size(2),
+        cache_capacity=key.size(2),
         num_heads=num_heads,
         num_kv_heads=key.size(1),
         key_shape=tuple(key.shape),
@@ -616,7 +617,12 @@ def _windowed_attention(
             None
             if fully_attended
             else torch.ops.spyre.window_band_mask(
-                read_start,
+                # Logical, not read_start: the row side of this op
+                # (q_row_origin) is a logical coordinate, and delta = row -
+                # column only means anything if both sides agree. Identical
+                # to read_start while buffer_origin is 0 -- every shape
+                # supported today -- and diverges once it isn't.
+                plan.read_start_logical(block_index),
                 q_block,
                 buffer_width,
                 plan.q_kv_offset + q_start,
@@ -695,6 +701,7 @@ def spyre_sliding_window_attention(
     window_size: int,
     is_causal: bool = True,
     scale: float | None = None,
+    cache_seqlen: int | None = None,
 ) -> torch.Tensor:
     """Sliding-window attention: each Q block attends only its own KV slice.
 
@@ -712,7 +719,15 @@ def spyre_sliding_window_attention(
     head_dim = query.size(3)
     batch_size = query.size(0)
     seqlen_q = query.size(2)
-    max_seqlen_kv = key.size(2)
+    cache_capacity = key.size(2)
+
+    # The cache's position, not its allocation. None means "exactly full",
+    # which is what reading key.size(2) as a position silently assumed.
+    if cache_seqlen is None:
+        cache_seqlen = cache_capacity
+    reason = check_cache_geometry(cache_seqlen, cache_capacity)
+    if reason is not None:
+        raise Unsupported(f"sliding_window_attention: {reason}")
 
     if scale is not None and scale < 0:
         # math.sqrt would otherwise raise a bare ValueError.
@@ -734,16 +749,22 @@ def spyre_sliding_window_attention(
     pad_rows = padded_seqlen_q - seqlen_q
     plan = plan_sliding_window(
         padded_seqlen_q,
-        max_seqlen_kv,
+        cache_seqlen,
         window_size,
         is_causal=is_causal,
         q_block=q_block,
+        cache_capacity=cache_capacity,
     )
     if plan is None:
         # Never None when the plan is, but the type says otherwise.
         reason = (
             rejection_reason(
-                padded_seqlen_q, max_seqlen_kv, window_size, is_causal, q_block
+                padded_seqlen_q,
+                cache_seqlen,
+                window_size,
+                is_causal,
+                q_block,
+                cache_capacity,
             )
             or "the window placement cannot express this shape"
         )

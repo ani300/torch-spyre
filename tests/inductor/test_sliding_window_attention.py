@@ -146,6 +146,21 @@ class TestSlidingWindowAttention(unittest.TestCase):
         query, key, value = _inputs(1, 8, 8, 128, 128)
         compare_with_cpu(_attention, query, key, value, 128, run_eager=False)
 
+    def test_explicit_cache_seqlen_matches_the_default(self):
+        # cache_seqlen defaults to the cache's allocated rows, so passing that
+        # same number explicitly must not move a single window.
+        query, key, value = _inputs(1, 8, 8, 128, 512)
+
+        def attention(q, k, v, window_size):
+            if q.device.type == "spyre":
+                return torch.ops.spyre.sliding_window_attention(
+                    q, k, v, window_size, True, None, k.size(2)
+                )
+            mask = _band_mask(q.size(2), k.size(2), window_size)
+            return F.scaled_dot_product_attention(q, k, v, mask)
+
+        compare_with_cpu(attention, query, key, value, 64, run_eager=False)
+
     def test_ragged_query_and_window_together(self):
         # An off-by-one in the pad arithmetic can survive either alone.
         query, key, value = _inputs(1, 8, 2, 100, 512)

@@ -41,6 +41,18 @@ class SlidingWindowPlan:
     """Coordinates are absolute cache positions: row ``i`` sits at
     ``q_kv_offset + i``, matching hf-adapters' convention. That is what makes
     prefill and decode share one formula.
+
+    ``seqlen_kv`` and ``cache_capacity`` used to be the same field doing two
+    jobs; they now say which job is which regardless of whether they agree.
+    ``seqlen_kv`` is the cache's logical position -- what a coordinate means,
+    so ``row_window`` clamps against it. ``cache_capacity`` is the rows
+    physically allocated -- what a *read* may not run past, so ``read_start``
+    clamps against it. ``check_cache_geometry`` allows either to be larger:
+    ``seqlen_kv < cache_capacity`` is a cache still filling its allocation
+    (left-aligned, ``buffer_origin`` 0); ``seqlen_kv > cache_capacity`` is a
+    compact buffer that has filled and is now sliding forward (rolled,
+    ``buffer_origin > 0``); equal is the full-length, exactly-full cache
+    every caller used before either parameter existed.
     """
 
     seqlen_q: int
@@ -51,6 +63,7 @@ class SlidingWindowPlan:
     buffer_width: int
     q_kv_offset: int
     is_causal: bool
+    cache_capacity: int
 
     def block_q_range(self, qi: int) -> tuple[int, int]:
         """Half-open query-row range of Q block ``qi``."""
@@ -64,14 +77,34 @@ class SlidingWindowPlan:
         hi = min(self.seqlen_kv, coord + 1)
         return lo, hi
 
+    @property
+    def buffer_origin(self) -> int:
+        """Logical position of the buffer's physical row 0.
+
+        0 whenever ``seqlen_kv <= cache_capacity`` -- every shape supported
+        today, where the cache fits inside its own allocation and physical
+        and logical coordinates coincide. Once ``seqlen_kv`` exceeds
+        ``cache_capacity`` -- a rolled buffer that has filled and is sliding
+        forward -- this is where its oldest resident row sits, on the
+        assumption the buffer holds exactly the most recent
+        ``cache_capacity`` logical positions (see ``check_cache_geometry``
+        and the "row order" precondition on ``kv_window``).
+        """
+        return max(0, self.seqlen_kv - self.cache_capacity)
+
     def block_is_fully_attended(self, qi: int) -> bool:
         """True when block ``qi``'s band masks nothing, so the add can be skipped.
 
         Decode qualifies only for a stick-aligned window: otherwise read_start
         floors the origin below the row's window start (W=100, kv=4096: buffer
         from 3968, row reaches 3996) and the band masks the difference.
+
+        Compares against ``read_start_logical``, not ``read_start``: this is
+        weighing the buffer's physical extent against ``row_window``, which
+        speaks logical coordinates, so both sides of the comparison need to
+        agree on which space they're in.
         """
-        start = self.read_start(qi)
+        start = self.read_start_logical(qi)
         stop = start + self.buffer_width
         q_start, q_end = self.block_q_range(qi)
         return all(
@@ -80,22 +113,49 @@ class SlidingWindowPlan:
         )
 
     def read_start(self, qi: int) -> int:
-        """Cache offset block ``qi`` reads from.
+        """Buffer-relative offset block ``qi`` reads from -- what a physical
+        slice of the cache tensor needs (``kv_window``'s argument).
 
         The clamps are the point: the ragged first and last blocks *shift*
         rather than shrink, so every block's buffer is one shape and one
         allocation serves them all. The band removes what the shift drags in.
+
+        ``window_origin`` is computed in logical coordinates (it comes from
+        ``q_kv_offset``, an absolute cache position); subtracting
+        ``buffer_origin`` converts it to a buffer-relative index before the
+        clamp, which is itself expressed in capacity terms. Skipping that
+        conversion silently returns the same answer for every block once
+        ``seqlen_kv`` and ``cache_capacity`` diverge, because a logical
+        coordinate (thousands) clamped against a small physical bound just
+        returns the bound -- this was wrong for two releases running before
+        being caught by a non-degenerate test case.
+
+        When ``cache_capacity == buffer_width`` (the buffer holds exactly one
+        window), ``buffer_origin`` tracks ``window_origin`` exactly, so this
+        collapses to ``min(0, 0) == 0`` for every block: there is nowhere to
+        shift to, correctly, because the buffer only ever holds "now".
         """
         q_start, _ = self.block_q_range(qi)
         first_coord = self.q_kv_offset + q_start
         window_origin = max(0, _floor_stick(first_coord - self.window_size + 1))
-        return min(window_origin, self.seqlen_kv - self.buffer_width)
+        physical_origin = window_origin - self.buffer_origin
+        return min(physical_origin, self.cache_capacity - self.buffer_width)
+
+    def read_start_logical(self, qi: int) -> int:
+        """``read_start``, converted back to a logical coordinate.
+
+        ``window_band_mask`` needs this, not ``read_start``: its row side
+        (``q_row_origin``) is logical, so the column side must be too for
+        ``delta = row - column`` to mean anything. A no-op whenever
+        ``buffer_origin`` is 0 -- every shape supported today.
+        """
+        return self.read_start(qi) + self.buffer_origin
 
 
 def check_window_read(
     read_start: int,
     buffer_width: int,
-    seqlen_kv: int,
+    cache_capacity: int,
     num_heads: int,
     num_kv_heads: int,
     key_shape: tuple[int, ...],
@@ -107,15 +167,26 @@ def check_window_read(
     can walk off the cache. Whether a *shape* is windowable is
     ``rejection_reason``'s question. Strings not exceptions, to keep this
     module free of torch and the backend's error classes.
+
+    ``cache_capacity`` is what both call sites have always passed here --
+    ``key.size(2)``, the rows physically allocated -- so the bound below was
+    already a capacity bound in practice; this only makes the parameter say
+    so. There is no ``cache_seqlen`` parameter: ``kv_window`` never receives
+    the logical position, only ``read_start``/``buffer_width`` computed from
+    it by the plan, so nothing here can yet distinguish "runs past the
+    allocation" from "runs into the allocation's unfilled tail" -- the
+    warmup case. That needs ``cache_seqlen`` threaded into ``kv_window``
+    itself, which ``check_cache_geometry``'s equality requirement makes
+    unreachable today regardless.
     """
     if read_start < 0:
         return f"read_start={read_start} is negative"
     if buffer_width <= 0:
         return f"buffer_width={buffer_width} must be positive"
-    if read_start + buffer_width > seqlen_kv:
+    if read_start + buffer_width > cache_capacity:
         return (
             f"window [{read_start}, {read_start + buffer_width}) runs past the "
-            f"cache (seqlen_kv={seqlen_kv})"
+            f"cache (cache_capacity={cache_capacity})"
         )
     if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
         return (
@@ -124,6 +195,44 @@ def check_window_read(
         )
     if key_shape != value_shape:
         return f"key.shape={key_shape} does not match value.shape={value_shape}"
+    return None
+
+
+def check_cache_geometry(cache_seqlen: int, cache_capacity: int) -> str | None:
+    """Why this (logical length, physical capacity) pair cannot be read, or None.
+
+    ``cache_seqlen`` is the true KV sequence position -- how many tokens the
+    cache has seen, HF's ``cumulative_length`` and vLLM's ``seq_lens``.
+    ``cache_capacity`` is ``key.size(2)``, the rows actually allocated.
+
+    Reading only cares which side of ``cache_capacity`` the cache is on, not
+    the write-side transition of crossing it -- HF's three states
+    (still-filling / becoming-full / full) collapse to two here, since
+    "becoming full" is a mid-update detail a reader never observes; it only
+    ever sees the state an update left behind.
+
+    ``cache_seqlen <= cache_capacity``: left-aligned, buffer row ``j`` holds
+    logical position ``j`` for ``j < cache_seqlen``; ``[cache_seqlen,
+    cache_capacity)`` is allocated but unwritten. No block's read ever
+    reaches that tail: ``rejection_reason`` requires ``cache_seqlen``
+    stick-aligned, and every block's read is built from stick-aligned
+    arithmetic that (by induction on ``buffer_width`` being sized to the
+    *widest* block, and per-block width being monotonic non-decreasing, so
+    the last block sets it exactly) lands the last, furthest-reaching block's
+    read exactly on ``cache_seqlen`` with no slack -- see
+    ``TestStillFilling.test_no_block_ever_reads_past_cache_seqlen`` for the
+    swept proof. No masking beyond the existing causal band is needed.
+
+    ``cache_seqlen > cache_capacity``: a compact buffer that has filled and
+    is now sliding forward, on the assumption (not checked here -- see
+    ``kv_window``'s docstring) that its rows stay contiguous and
+    time-ordered, oldest dropped from the front, so the buffer holds exactly
+    the most recent ``cache_capacity`` positions.
+    """
+    if cache_seqlen <= 0:
+        return f"cache_seqlen={cache_seqlen} must be positive"
+    if cache_capacity <= 0:
+        return f"cache_capacity={cache_capacity} must be positive"
     return None
 
 
@@ -168,11 +277,22 @@ def rejection_reason(
     window_size: int,
     is_causal: bool,
     q_block: int,
+    cache_capacity: int | None = None,
 ) -> str | None:
     """Why this shape cannot be planned, or None if it can.
 
     Single source of truth: ``plan_sliding_window`` decides with it and the op
     raises with it, so the message names what actually failed.
+
+    ``cache_capacity`` is optional and, when omitted, changes nothing -- every
+    caller before this parameter existed still sees exactly the checks it saw
+    before. When given, it enables three more: ``read_start``'s buffer-relative
+    arithmetic needs ``cache_capacity`` stick-aligned the same way it always
+    needed ``seqlen_kv`` aligned; needs at least one buffer's worth of room to
+    place a read in; and needs enough room for the *first* block specifically,
+    since a capacity that clears the previous check can still be too narrow
+    for a multi-block plan whose earliest block reaches further back than a
+    smaller-but-nonzero amount of slack covers.
     """
     if not is_causal:
         return "bidirectional windows are not implemented, only causal ones"
@@ -188,17 +308,50 @@ def rejection_reason(
     if window_size <= 0:
         return f"window_size={window_size} must be positive"
     if seqlen_kv % STICK != 0:
-        # The last row attends up to seqlen_kv-1, so the last block's read must
-        # satisfy start + buffer_width == seqlen_kv exactly. Both are stick
-        # multiples, so that has no solution unless seqlen_kv is one. Reading
-        # past the logical end into padding lanes is the only escape, and
-        # compiled attention is independently wrong there.
+        # seqlen_kv also fixes buffer_origin's alignment (seqlen_kv -
+        # cache_capacity, both stick multiples once cache_capacity is
+        # checked below), which read_start's physical conversion depends on.
+        # For the default cache_capacity == seqlen_kv case this is also the
+        # original reason: the last block's read must land exactly on
+        # cache_capacity, itself a stick multiple, so seqlen_kv must be one.
         return (
             f"seqlen_kv={seqlen_kv} must be a multiple of {STICK}; pad the KV "
             "cache to a stick boundary"
         )
     if seqlen_kv - seqlen_q < 0:
         return f"seqlen_q={seqlen_q} exceeds seqlen_kv={seqlen_kv}"
+    if cache_capacity is not None:
+        if cache_capacity % STICK != 0:
+            return (
+                f"cache_capacity={cache_capacity} must be a multiple of {STICK}; "
+                "pad the cache allocation to a stick boundary"
+            )
+        q_kv_offset = seqlen_kv - seqlen_q
+        buffer_width = _required_width(seqlen_q, window_size, q_block, q_kv_offset)
+        if cache_capacity < buffer_width:
+            return (
+                f"cache_capacity={cache_capacity} is narrower than the "
+                f"{buffer_width}-row buffer this window needs"
+            )
+        # The buffer_width check above only rules out a capacity too small for
+        # any single block. A multi-block plan's EARLIEST block can still
+        # reach further back than the buffer's oldest resident row, because
+        # buffer_origin is fixed by the cache's total span while later
+        # blocks' windows start later. window_origin is monotonic in qi
+        # (first_coord grows with q_start, floor_stick preserves order), so
+        # the earliest block (qi=0) is the only one that can fail this and
+        # checking it is sufficient. Uncaught, this surfaces later as a
+        # negative read_start -- not silent, but from a less specific error
+        # site than here.
+        buffer_origin = max(0, seqlen_kv - cache_capacity)
+        earliest_window_origin = max(0, _floor_stick(q_kv_offset - window_size + 1))
+        if earliest_window_origin < buffer_origin:
+            return (
+                f"cache_capacity={cache_capacity} does not reach far enough back "
+                f"for this {seqlen_q}-row query: the earliest block needs logical "
+                f"column {earliest_window_origin}, but the buffer's oldest "
+                f"resident row is {buffer_origin}"
+            )
 
     return None
 
@@ -209,10 +362,22 @@ def plan_sliding_window(
     window_size: int,
     is_causal: bool = True,
     q_block: int = STICK,
+    cache_capacity: int | None = None,
 ) -> SlidingWindowPlan | None:
-    """The placement, or None for a shape ``rejection_reason`` declines."""
-    if rejection_reason(seqlen_q, seqlen_kv, window_size, is_causal, q_block):
+    """The placement, or None for a shape ``rejection_reason`` declines.
+
+    ``cache_capacity`` is the rows the cache physically allocates, as
+    distinct from ``seqlen_kv``, its logical position. Defaults to
+    ``seqlen_kv`` -- a full-length cache that is exactly full, the only
+    geometry callers passed before this parameter existed -- so every
+    existing caller is unaffected.
+    """
+    if rejection_reason(
+        seqlen_q, seqlen_kv, window_size, is_causal, q_block, cache_capacity
+    ):
         return None
+    if cache_capacity is None:
+        cache_capacity = seqlen_kv
 
     q_kv_offset = seqlen_kv - seqlen_q
     buffer_width = _required_width(seqlen_q, window_size, q_block, q_kv_offset)
@@ -226,4 +391,5 @@ def plan_sliding_window(
         buffer_width=buffer_width,
         q_kv_offset=q_kv_offset,
         is_causal=is_causal,
+        cache_capacity=cache_capacity,
     )

@@ -814,6 +814,7 @@ def sliding_window_attention(  # type: ignore[empty-body]
     window_size: int,
     is_causal: bool = True,
     scale: Optional[float] = None,
+    cache_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Sliding-window attention entry point.
@@ -825,6 +826,16 @@ def sliding_window_attention(  # type: ignore[empty-body]
     attend to key position c iff 0 <= r - c < window_size (causal) or
     abs(r - c) < window_size (bidirectional, not yet implemented --
     is_causal=False raises Unsupported).
+
+    ``cache_seqlen`` is how many tokens the cache has seen -- HF's
+    ``cumulative_length``, vLLM's ``seq_lens`` -- as distinct from ``Lk``,
+    which counts the rows it allocates. The two are the same number only for
+    a full-length cache that is exactly full; a compact rolled buffer holds
+    W rows at position 5000, and a warm one holds 100 tokens in a 4096-row
+    allocation. Defaults to ``Lk``, which is what the placement assumed
+    before the parameter existed, so an existing caller is unaffected. A
+    value that differs from ``Lk`` raises today (see check_cache_geometry) --
+    the placement still reads Lk as both, and misplacing a window is silent.
 
     MUST be called under torch.compile(backend="inductor") on the spyre
     device — see spyre_sliding_window_attention in decompositions.py for the
@@ -842,6 +853,7 @@ def _(
     window_size: int,
     is_causal: bool = True,
     scale: Optional[float] = None,
+    cache_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     return query.new_empty(query.size())
 
@@ -936,6 +948,16 @@ def kv_window(  # type: ignore[empty-body]
     ``read_start`` comes from SlidingWindowPlan. Passing it in, rather than a
     block index, keeps this op ignorant of how the query is blocked.
 
+    **Precondition when key/value is a compact buffer narrower than the
+    cache's true length** (``SlidingWindowPlan.buffer_origin != 0``): rows
+    must stay contiguous and time-ordered, oldest dropped from the front --
+    row 0 is the oldest resident position, the last row is the newest. No
+    ring/modulo indexing. ``read_start``'s buffer-relative arithmetic
+    (``SlidingWindowPlan.buffer_origin``) assumes this; nothing here checks
+    it, since kv_window only ever sees offsets and never the tokens
+    themselves. Maintaining it -- rolling the buffer forward as new tokens
+    arrive -- is a write-side operation with no owner in torch-spyre today.
+
     GQA expansion to num_heads happens here, applied to the window slice rather
     than to the full-length cache (see the decomposition for why).
 
@@ -963,7 +985,7 @@ def _(
     reason = check_window_read(
         read_start=read_start,
         buffer_width=buffer_width,
-        seqlen_kv=key.size(2),
+        cache_capacity=key.size(2),
         num_heads=num_heads,
         num_kv_heads=key.size(1),
         key_shape=tuple(key.shape),
