@@ -860,16 +860,24 @@ def sliding_window_attention(  # type: ignore[empty-body]
     ``SlidingWindowPlan``'s class docstring), so this needs no separate
     handling for the causal-only path implemented today.
 
-    The allocation ``Lk`` must hold at least one buffer's worth of rows: the
-    op needs ``window_size`` for decode, or ``window_size + q_block`` for a
-    multi-row query block (rows within a block have staggered windows), for
-    the ``Lk`` it is actually given -- ``rejection_reason`` names the exact
-    row count when a passed allocation is too narrow. Rows at or past
-    ``cache_seqlen`` in a still-filling cache ARE read by a block whose
-    buffer overshoots the written prefix -- causal masking discards their
-    scores, but the multiply still happens, so they must hold finite
-    values. Zero-fill the allocation; an additive ``-inf`` cannot rescue a
-    ``NaN``.
+    **Allocation contract:** ``Lk >= round_up_to_64(window_size + Lq - 1)``,
+    where ``Lq`` is the query length of *this* call. That is HF's own
+    ``get_mask_sizes`` formula (``kv_length = sliding_window + query_length
+    - 1``) rounded up to a stick, and it holds for both regimes: decode
+    (``Lq=1``) needs exactly ``window_size``, matching what
+    ``StaticSlidingWindowLayer`` allocates; a chunk of ``Lq`` prefill rows
+    needs ``window_size + Lq - 1``, because the earliest row in the chunk
+    still reaches ``window_size`` columns back while the latest reaches the
+    newest -- a rolled buffer holding less has already evicted what the
+    earliest row needs. Prefill a long sequence in chunks sized to the
+    allocation rather than in one call. ``rejection_reason`` names the exact
+    row count when a passed ``Lk`` is too narrow.
+
+    Rows at or past ``cache_seqlen`` in a still-filling cache ARE read by a
+    block whose buffer overshoots the written prefix -- causal masking
+    discards their scores, but the multiply still happens, so they must hold
+    finite values. Zero-fill the allocation; an additive ``-inf`` cannot
+    rescue a ``NaN``.
 
     MUST be called under torch.compile(backend="inductor") on the spyre
     device — see spyre_sliding_window_attention in decompositions.py for the
