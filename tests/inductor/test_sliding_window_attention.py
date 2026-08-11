@@ -106,14 +106,11 @@ def _rolled_reference(query, key, value, window_size, cache_seqlen):
     ``spyre::kv_window``'s row-order precondition -- the band is built
     directly in that coordinate space.
 
-    The ``k_pos < cache_seqlen`` term states the definition directly ("only
-    written rows are real keys") and is deliberately kept even though it is
-    provably redundant with the causal term for these inputs -- every query
-    row's coordinate is ``< cache_seqlen`` by construction, so ``delta >= 0``
-    already forces it. ``spyre::window_band_mask`` drops it for exactly that
-    reason; keeping it here means this reference does not inherit that
-    argument, so if the production causal band ever regressed, the two would
-    disagree rather than agreeing on the same mistake.
+    The ``k_pos < cache_seqlen`` term is redundant with the causal one here,
+    and kept deliberately: ``spyre::window_band_mask`` drops it on the
+    argument that the two can never disagree, so stating it independently
+    means a regression in the production causal band shows up as a
+    disagreement rather than a shared mistake.
     """
     capacity = key.size(2)
     seqlen_q = query.size(2)
@@ -239,34 +236,22 @@ class TestSlidingWindowAttention(unittest.TestCase):
 
 
 class TestCompactCache(unittest.TestCase):
-    """cache_seqlen != key.size(2): a compact cache, rolled or still
-    filling. Every case here previously raised outright -- rolled at a
-    non-stick-aligned position, rejection_reason required cache_seqlen % 64
-    == 0 -- or was never exercised end to end (the earliest-block-reach
-    interaction for a multi-block rolled prefill). Shapes are pre-checked
-    against ``rejection_reason``/``plan_sliding_window`` before being
-    written here, so none of these are expected to raise Unsupported.
+    """cache_seqlen != key.size(2): a compact cache, rolled or still filling.
 
-    Not what these verify: a block's buffer physically overshooting
-    cache_seqlen (the still-filling case) is masked by the CAUSAL term
-    alone, not by window_band_mask's separate cache_seqlen term -- see that
-    op's docstring for why the two can never disagree while is_causal=True
-    is the only implemented mode. What these actually check is end-to-end
-    numeric correctness of placement + masking + attention against a
-    compact (not full-length) cache at these coordinates.
+    These check end-to-end numeric correctness of placement + masking +
+    attention against a compact (not full-length) cache. They do NOT isolate
+    the unwritten-tail question: an overshooting buffer is excluded by the
+    causal term alone, since window_band_mask carries no cache_seqlen term.
     """
 
     def setUp(self):
         torch._dynamo.reset()
 
     def test_rolled_decode_at_a_non_aligned_position(self):
-        # The design's actual goal: a compact W+64-row rolled buffer read at
-        # an arbitrary (non-stick) logical position -- 5001, not a multiple
-        # of 64. Before the physical-space floor fix this shape was refused
-        # outright; read_start is also identical for every such position
-        # (see TestArbitraryCacheSeqlen in test_kv_window.py for the swept
-        # proof), so this is one representative point on that line, verified
-        # end to end rather than just at the placement level.
+        # The design's goal: a compact rolled buffer read at an arbitrary
+        # (non-stick) logical position. read_start is identical for every
+        # such position -- TestArbitraryCacheSeqlen sweeps that; this is one
+        # point on the line, verified end to end.
         batch, heads, kvheads = 1, 8, 8
         capacity, cache_seqlen, window = 4160, 5001, 4096
         key, value = _compact_kv(batch, kvheads, capacity, cache_seqlen)
@@ -279,11 +264,9 @@ class TestCompactCache(unittest.TestCase):
 
     def test_warmup_cache_at_a_non_aligned_seqlen(self):
         # cache_seqlen=100 < capacity=256, not stick-aligned: the buffer
-        # physically reaches column 128, past what is written (rows
-        # [100, 128) are the zero-filled tail from _compact_kv). Causal
-        # masking alone already excludes those columns (see TestCompactCache's
-        # docstring) -- this checks that the placement and attention around
-        # that overshoot are still numerically correct end to end.
+        # reaches column 128, past what is written (rows [100, 128) are the
+        # zero-filled tail). Checks that placement and attention around that
+        # overshoot are numerically correct end to end.
         batch, heads, kvheads = 1, 8, 8
         capacity, cache_seqlen, window = 256, 100, 64
         key, value = _compact_kv(batch, kvheads, capacity, cache_seqlen)
@@ -295,12 +278,9 @@ class TestCompactCache(unittest.TestCase):
         )
 
     def test_capacity_equals_window_decode(self):
-        # HF's StaticSlidingWindowLayer allocates exactly window_size rows
-        # for decode -- the minimal allocation contract this op requires
-        # (see the "capacity >= window_size" note on
-        # spyre::sliding_window_attention). read_start collapses to 0 for
-        # every position once capacity == buffer_width, including this
-        # arbitrary, non-aligned one.
+        # HF's StaticSlidingWindowLayer geometry: exactly window_size rows for
+        # decode, the minimal allocation this op requires. read_start
+        # collapses to 0 once capacity == buffer_width, at any position.
         batch, heads, kvheads = 1, 8, 8
         capacity = window = 64
         cache_seqlen = 5001
@@ -314,10 +294,9 @@ class TestCompactCache(unittest.TestCase):
 
     def test_multiblock_rolled_prefill_with_distinct_read_starts(self):
         # 8 blocks of a 512-row prefill against a rolled, non-aligned
-        # cache_seqlen -- every block reads a DIFFERENT physical offset
-        # (448, 512, ..., 896 at this shape), the interaction hardest to get
-        # right: per-block window staggering on top of the physical-space
-        # floor and the earliest-block-reach check, together.
+        # cache_seqlen -- every block reads a different physical offset
+        # (448, 512, ..., 896 here). Window staggering on top of the
+        # physical-space floor and the earliest-block-reach check, together.
         batch, heads, kvheads = 1, 8, 8
         capacity, cache_seqlen, window = 1024, 5001, 64
         seqlen_q = 512
