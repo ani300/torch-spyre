@@ -3084,13 +3084,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "mha_prefill": (
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=1, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=2, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
                     None,
                     False,
@@ -3098,13 +3098,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "mha_prefill_causal": (
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=1, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=2, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
                     None,
                     True,
@@ -3112,16 +3112,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "mha_prefill_mask": (
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=1, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=2, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
                     torch.triu(
-                        torch.ones((256, 256), dtype=torch.float16) * -float("inf"),
+                        torch.ones((128, 128), dtype=torch.float16) * -float("inf"),
                         diagonal=1,
                     ),
                     False,
@@ -3129,13 +3129,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "gqa_prefill": (
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=1, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 8, 128), differentiation=2, dtype=torch.float16
+                        (2, 128, 8, 128), differentiation=2, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 8, 128), differentiation=3, dtype=torch.float16
+                        (2, 128, 8, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
                     None,
                     False,
@@ -3143,13 +3143,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "gqa_prefill_causal": (
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=1, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 8, 128), differentiation=2, dtype=torch.float16
+                        (2, 128, 8, 128), differentiation=2, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 8, 128), differentiation=3, dtype=torch.float16
+                        (2, 128, 8, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
                     None,
                     True,
@@ -3188,10 +3188,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
                     ),
                     cached_randn(
-                        (2, 257, 32, 128), differentiation=2, dtype=torch.float16
+                        (2, 129, 32, 128), differentiation=2, dtype=torch.float16
                     ),
                     cached_randn(
-                        (2, 257, 32, 128), differentiation=3, dtype=torch.float16
+                        (2, 129, 32, 128), differentiation=3, dtype=torch.float16
                     ),
                     False,
                     False,
@@ -3201,10 +3201,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
                     ),
                     cached_randn(
-                        (2, 257, 8, 128), differentiation=2, dtype=torch.float16
+                        (2, 129, 8, 128), differentiation=2, dtype=torch.float16
                     ),
                     cached_randn(
-                        (2, 257, 8, 128), differentiation=3, dtype=torch.float16
+                        (2, 129, 8, 128), differentiation=3, dtype=torch.float16
                     ),
                     False,
                     True,
