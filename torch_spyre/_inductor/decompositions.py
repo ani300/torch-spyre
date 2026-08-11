@@ -422,6 +422,7 @@ def spyre__sdpa_overrideable(
 
     kv_block_size = 64
     q_block_size = 64
+    num_kv_blocks = (max_seqlen_kv + kv_block_size - 1) // kv_block_size
 
     output = torch.zeros_like(query)
 
@@ -462,26 +463,32 @@ def spyre__sdpa_overrideable(
                 tiles={"max_seqlen_q": max(1, max_seqlen_q // q_block_size)}
             ):
                 with spyre_hint(
-                    tiles={"max_seqlen_kv": max(1, max_seqlen_kv // kv_block_size)}
+                    work_div={"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 8}
                 ):
-                    with spyre_hint(
-                        work_div={"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 8}
-                    ):
-                        scaled_keys = (
-                            key * scaling_factor
-                        )  # batch_size, num_heads, max_seqlen_kv, head_dim
+                    for blk in range(num_kv_blocks):
+                        start = blk * kv_block_size
+                        end = min(start + kv_block_size, max_seqlen_kv)
+
+                        k_blk = key[
+                            ..., start:end, :
+                        ]  # batch_size, num_heads, blk_len, head_dim
+                        v_blk = value[
+                            ..., start:end, :
+                        ]  # batch_size, num_heads, blk_len, head_dim
+
+                        scaled_keys = k_blk * scaling_factor
                         keys_T = scaled_keys.transpose(
                             -1, -2
-                        )  # batch_size, num_heads, head_dim, max_seqlen_kv
+                        )  # batch_size, num_heads, head_dim, blk_len
                         scores = torch.matmul(
                             query * scaling_factor, keys_T
-                        )  # batch_size, num_heads, max_seqlen_q, max_seqlen_kv
+                        )  # batch_size, num_heads, max_seqlen_q, blk_len
 
                         if is_causal:
-                            scores = scores + causal_mask
+                            scores = scores + causal_mask[..., :, start:end]
 
                         if attn_bias is not None:
-                            scores = scores + attn_bias
+                            scores = scores + attn_bias[..., :, start:end]
 
                         block_max = torch.amax(
                             scores, dim=-1
@@ -492,7 +499,7 @@ def spyre__sdpa_overrideable(
 
                         exp_scores = torch.exp(
                             scores - max_running.unsqueeze(-1)
-                        )  # batch_size, num_heads, max_seqlen_q, max_seqlen_kv
+                        )  # batch_size, num_heads, max_seqlen_q, blk_len
                         correction = torch.exp(
                             M - max_running
                         )  # batch_size, num_heads, max_seqlen_q sparse
@@ -503,7 +510,7 @@ def spyre__sdpa_overrideable(
                         )  # batch_size, num_heads, max_seqlen_q sparse
                         output = torch.ops.spyre.copy_f(
                             output * correction.unsqueeze(-1)
-                            + torch.matmul(exp_scores, value),
+                            + torch.matmul(exp_scores, v_blk),
                             output,
                         )  # batch_size, num_heads, max_seqlen_q, head_dim
 
