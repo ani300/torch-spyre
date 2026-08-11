@@ -415,6 +415,19 @@ def spyre__sdpa_overrideable(
     if dropout_p > 0.0:
         raise Unsupported("Attention dropout not implemented for Spyre")
 
+    # The named_dims seeds below zip names positionally to each seeded op's
+    # PHYSICAL output layout, which a pointwise/zeros_like op inherits from its
+    # input. SDPA is routinely called with q/k/v as transpose(1, 2) views of a
+    # [B, S, H, D] tensor, so query's physical layout is [B, S, H, D] while its
+    # logical shape is [B, H, S, D]. Seeding ["_b","_h","max_seqlen_q",...] on
+    # such a buffer binds "_h" to S and "max_seqlen_q" to H -- the tile then
+    # splits the head axis instead of the query axis and the result is wrong.
+    # Materialize a logical-contiguous copy up front so physical order matches
+    # the logical [B, H, S, D] order the seeds assume.
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+
     expansion = num_heads // num_kvheads
     if expansion != 1:
         key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
@@ -481,9 +494,7 @@ def spyre__sdpa_overrideable(
             with spyre_hint(
                 tiles={"max_seqlen_q": max(1, max_seqlen_q // q_block_size)}
             ):
-                with spyre_hint(
-                    work_div={"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 8}
-                ):
+                if True:
                     for blk in range(num_kv_blocks):
                         start = blk * kv_block_size
                         end = min(start + kv_block_size, max_seqlen_kv)
@@ -505,9 +516,15 @@ def spyre__sdpa_overrideable(
                             scaled_keys = k_blk * scaling_factor
                         with spyre_hint(named_dims=["_b", "_h", "blk_len", "head_dim"]):
                             v_blk = v_blk * 1.0
+                        # .contiguous() materializes the transposed keys so the
+                        # scores matmul sees a clean single-contraction-dim input.
+                        # Without it the backend scheduler aborts with
+                        # out_reuse_dim.size() == 1 (L3DlOpsScheduler): the
+                        # transposed view's loop-dim-order leaves the matmul with
+                        # an ambiguous contraction dim under Lq tiling.
                         keys_T = scaled_keys.transpose(
                             -1, -2
-                        )  # batch_size, num_heads, head_dim, blk_len
+                        ).contiguous()  # batch_size, num_heads, head_dim, blk_len
                         # A matmul output inherits no named dims from its inputs,
                         # so naming it explicitly is what keeps the op inside the
                         # max_seqlen_q tile region (otherwise it becomes an
@@ -529,36 +546,59 @@ def spyre__sdpa_overrideable(
                         block_max = torch.amax(
                             scores, dim=-1
                         )  # batch_size, num_heads, max_seqlen_q sparse
-                        max_running = torch.maximum(
+                        new_max = torch.maximum(
                             M, block_max
                         )  # batch_size, num_heads, max_seqlen_q sparse
 
                         exp_scores = torch.exp(
-                            scores - max_running.unsqueeze(-1)
+                            scores - new_max.unsqueeze(-1)
                         )  # batch_size, num_heads, max_seqlen_q, blk_len
                         correction = torch.exp(
-                            M - max_running
+                            M - new_max
                         )  # batch_size, num_heads, max_seqlen_q sparse
 
-                        denominator = torch.ops.spyre.copy_f(
-                            denominator * correction + exp_scores.sum(dim=-1),
-                            denominator,
+                        # Online-softmax recurrence as FUNCTIONAL SSA -- no
+                        # in-place copy_f writeback. copy_f mutates the whole
+                        # accumulator buffer and is NOT tile-aware: under the
+                        # max_seqlen_q tile it left the second query-tile's
+                        # accumulators un-updated (0/0 -> nan, exp(-inf) -> inf).
+                        # Threading new values forward (as in the coarse-tile
+                        # flash e2e test, PR #3674) keeps each Lq tile's carry
+                        # correct. The names flow from q_scaled/the matmuls.
+                        new_denom = denominator * correction + exp_scores.sum(
+                            dim=-1
                         )  # batch_size, num_heads, max_seqlen_q sparse
+                        # Materialize exp_scores before the second matmul for the
+                        # same reason as keys_T above -- a clean contiguous input
+                        # keeps the matmul's contraction dim unambiguous.
+                        exp_scores_c = exp_scores.contiguous()
                         with spyre_hint(
                             named_dims=["_b", "_h", "max_seqlen_q", "head_dim"]
                         ):
-                            weighted = torch.matmul(exp_scores, v_blk)
-                        output = torch.ops.spyre.copy_f(
-                            output * correction.unsqueeze(-1) + weighted,
-                            output,
+                            weighted = torch.matmul(exp_scores_c, v_blk)
+                        new_output = (
+                            output * correction.unsqueeze(-1) + weighted
                         )  # batch_size, num_heads, max_seqlen_q, head_dim
 
-                        M = torch.ops.spyre.copy_f(
-                            max_running,
-                            M,
-                        )  # batch_size, num_heads, max_seqlen_q sparse
-
-    output = torch.ops.spyre.copy_f(output / denominator.unsqueeze(-1), output)
+                        if blk == num_kv_blocks - 1:
+                            # The final divide must live INSIDE the innermost tile
+                            # scope (#3674 point #4): read past the loop group it
+                            # becomes a full untiled buffer whose input
+                            # (new_output, written in the tiled region) is
+                            # split-layout, so finalize_layouts hits
+                            # restickify-infeasible. Fold it into the last KV
+                            # block so it inherits the max_seqlen_q tile.
+                            with spyre_hint(
+                                named_dims=[
+                                    "_b",
+                                    "_h",
+                                    "max_seqlen_q",
+                                    "head_dim",
+                                ]
+                            ):
+                                output = new_output / new_denom.unsqueeze(-1)
+                        else:
+                            M, denominator, output = new_max, new_denom, new_output
     # The reference meta kernel for this op
     # (torch._meta_registrations.meta__scaled_dot_product_fused_attention_
     # overrideable -> alloc_with_matching_layout) declares the output layout to
