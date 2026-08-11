@@ -36,7 +36,6 @@ from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
 from .sliding_window_plan import (
     SlidingWindowPlan,
-    check_cache_geometry,
     check_window_read,
     plan_sliding_window,
     query_blocking,
@@ -553,14 +552,8 @@ def spyre_kv_window(
     read_start: int,
     buffer_width: int,
     num_heads: int,
-    cache_seqlen: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One Q block's KV window: k_win [B, Hq, E, W] transposed, v_win [B, Hq, W, E].
-
-    ``cache_seqlen`` only sharpens ``check_window_read``'s rejection (a
-    still-filling cache's unwritten tail); the slice below is read_start and
-    buffer_width either way.
-    """
+    """One Q block's KV window: k_win [B, Hq, E, W] transposed, v_win [B, Hq, W, E]."""
     reason = check_window_read(
         read_start=read_start,
         buffer_width=buffer_width,
@@ -569,7 +562,6 @@ def spyre_kv_window(
         num_kv_heads=key.size(1),
         key_shape=tuple(key.shape),
         value_shape=tuple(value.shape),
-        cache_seqlen=cache_seqlen,
     )
     if reason is not None:
         raise Unsupported(f"kv_window: {reason}")
@@ -617,7 +609,7 @@ def _windowed_attention(
 
         read_start = plan.read_start(block_index)
         k_win, v_win = torch.ops.spyre.kv_window(
-            key, value, read_start, buffer_width, num_heads, plan.seqlen_kv
+            key, value, read_start, buffer_width, num_heads
         )
         fully_attended = plan.block_is_fully_attended(block_index)
         band = (
@@ -637,7 +629,6 @@ def _windowed_attention(
                 plan.is_causal,
                 query.dtype,
                 query.device,
-                plan.seqlen_kv,
             )
         )
         q_rows = query[:, :, q_start:q_end, :]
@@ -731,11 +722,11 @@ def spyre_sliding_window_attention(
 
     # The cache's position, not its allocation. None means "exactly full",
     # which is what reading key.size(2) as a position silently assumed.
+    # Degenerate values (<= 0, either of them) need no check here:
+    # rejection_reason below rejects them, and it is the single source of
+    # truth for which geometries can be planned.
     if cache_seqlen is None:
         cache_seqlen = cache_capacity
-    reason = check_cache_geometry(cache_seqlen, cache_capacity)
-    if reason is not None:
-        raise Unsupported(f"sliding_window_attention: {reason}")
 
     if scale is not None and scale < 0:
         # math.sqrt would otherwise raise a bare ValueError.

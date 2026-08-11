@@ -45,7 +45,6 @@ import torch
 from torch_spyre._inductor.sliding_window_plan import (
     STICK,
     SlidingWindowPlan,
-    check_cache_geometry,
     check_window_read,
     plan_sliding_window,
     query_blocking,
@@ -169,8 +168,8 @@ class TestPlacement:
 
 class TestRolledBuffer:
     """cache_capacity < seqlen_kv: a compact buffer that has filled and is
-    sliding forward. Only reachable once check_cache_geometry allows the
-    logical position past the physical allocation.
+    sliding forward. Only reachable once the plan allows the logical
+    position to run past the physical allocation.
     """
 
     def test_blocks_read_different_offsets_not_the_collapsed_bound(self):
@@ -236,8 +235,7 @@ class TestRolledBuffer:
     def test_a_single_block_plan_is_unaffected_by_the_reach_check(self):
         # Decode and single-chunk prefill only ever have one block, so the
         # earliest-block check is checking the only block -- it must not
-        # reject a shape check_cache_geometry and buffer_width already
-        # accepted.
+        # reject a shape the buffer_width check already accepted.
         assert rejection_reason(1, 5120, 64, True, 1, cache_capacity=64) is None
         plan = plan_sliding_window(1, 5120, 64, q_block=1, cache_capacity=64)
         assert plan is not None
@@ -250,22 +248,22 @@ class TestStillFilling:
 
     cache_seqlen is no longer required to be stick-aligned (rejection_reason
     only requires the allocation, cache_capacity, to be), so in general a
-    block's buffer CAN overshoot into the unwritten tail -- window_band_mask's
-    tail check (column < cache_seqlen) handles that case, and
-    block_is_fully_attended already refuses to skip the band whenever it
-    happens (row_window's hi clamps to seqlen_kv, so a buffer extending past
-    it can never satisfy "fully attended").
+    block's buffer CAN overshoot the written prefix. That is safe without
+    any tail mask: causal masking alone excludes every such column, since a
+    query row's own coordinate is < cache_seqlen by construction and
+    column <= row follows from delta >= 0. block_is_fully_attended also
+    refuses to skip the band whenever the overshoot happens (row_window's
+    hi clamps to seqlen_kv, so a buffer extending past it can never satisfy
+    "fully attended").
 
     This class covers the narrower, STICK-aligned cache_seqlen values only,
-    where the tail mask is provably a no-op: every block's read is
+    where no block's read reaches the tail at all: every read is
     stick-aligned arithmetic built from a buffer_width sized to the *widest*
-    block. Per-block required width is monotonic non-decreasing in block
-    index (proven by test_per_block_width_is_monotonic below), so the last
-    block is always that widest block, and its own width reaches
-    cache_seqlen with zero slack once it -- already stick-aligned -- is
-    ceil_stick'd. No block's read reaches the tail for THESE inputs, so the
-    tail mask stays inert and the existing causal band alone suffices --
-    exactly what the swept tests below still confirm.
+    block, read_start is monotonic in block index (pinned by
+    test_per_block_read_start_is_monotonic below), so the last block is the
+    one that reaches furthest and its width lands on cache_seqlen with zero
+    slack once it -- already stick-aligned -- is ceil_stick'd. The general,
+    overshooting case is covered by TestArbitraryCacheSeqlen.
     """
 
     def test_a_still_filling_cache_plans_like_any_other(self):
@@ -281,28 +279,30 @@ class TestStillFilling:
         plan = plan_sliding_window(1, 128, 64, q_block=1, cache_capacity=4096)
         assert plan.buffer_origin == 0
 
-    def test_per_block_width_is_monotonic(self):
+    def test_per_block_read_start_is_monotonic(self):
         # The property the no-overshoot proof rests on: a later block never
-        # needs a narrower buffer than an earlier one, so sizing buffer_width
-        # to the max is the same as sizing it to the LAST block.
+        # reads from further back than an earlier one, so the LAST block is
+        # the one that reaches furthest and buffer_width sized to the max is
+        # the same as sizing it to that block. Asserted against the plan's
+        # own read_start rather than an inlined copy of the formula -- an
+        # earlier version reimplemented the logical-space floor here, which
+        # silently stopped matching the code when read_start moved to
+        # flooring in physical space.
         for seqlen_q in (128, 256, 384, 512):
             for window in (63, 64, 100, 128, 150, 192, 201, 300):
-                widths = []
-                for qi in range(-(-seqlen_q // STICK)):
-                    q_start = qi * STICK
-                    q_end = min(seqlen_q, q_start + STICK)
-                    first_coord, last_coord = q_start, q_end - 1
-                    window_origin = max(
-                        0, ((first_coord - window + 1) // STICK) * STICK
-                    )
-                    widths.append(last_coord - max(0, window_origin) + 1)
-                assert widths == sorted(widths), (seqlen_q, window, widths)
+                plan = plan_sliding_window(
+                    seqlen_q, seqlen_q, window, q_block=STICK, cache_capacity=seqlen_q
+                )
+                if plan is None:
+                    continue
+                starts = [plan.read_start(qi) for qi in range(plan.num_q_blocks)]
+                assert starts == sorted(starts), (seqlen_q, window, starts)
 
     @pytest.mark.parametrize("seqlen_q", [64, 128, 192, 256, 320, 384, 448, 512])
     @pytest.mark.parametrize("window", [64, 100, 128, 150, 192, 63, 201, 300, 33])
     def test_no_block_ever_reads_past_cache_seqlen(self, seqlen_q, window):
-        # The swept proof the class docstring and check_cache_geometry's
-        # docstring both point to: for every stick-aligned cache_seqlen a
+        # The swept proof the class docstring points to: for every
+        # stick-aligned cache_seqlen a
         # still-filling shape can reach, no block's physical read extends
         # into the allocated-but-unwritten tail.
         capacity = 4096
@@ -338,8 +338,9 @@ class TestArbitraryCacheSeqlen:
     physical allocation, does (see rejection_reason's docstring). This is
     the capability TestStillFilling's induction proof deliberately avoided
     needing: for a non-aligned position, a block's buffer CAN overshoot the
-    written prefix, and window_band_mask's tail check (column < cache_seqlen)
-    is what makes that safe instead of refusing the shape outright.
+    written prefix. What makes that safe rather than a reason to refuse the
+    shape is causal masking, which already excludes every overshot column
+    (column <= row < cache_seqlen) -- no separate tail mask involved.
     """
 
     def test_a_non_aligned_cache_seqlen_is_accepted_with_a_capacity(self):
@@ -381,15 +382,15 @@ class TestArbitraryCacheSeqlen:
         # reaches column 128 -- one past what is written. block_is_fully_
         # attended must say so (row_window's hi clamps to seqlen_kv, so a
         # buffer extending past it can never satisfy "fully attended"),
-        # which is what makes the band -- and its tail mask -- get added.
+        # which is what makes the causal band get added at all.
         plan = plan_sliding_window(1, 127, 63, q_block=1, cache_capacity=128)
         assert plan is not None
         assert not plan.block_is_fully_attended(0)
 
     def test_no_leakage_or_coverage_gap_at_arbitrary_non_stick_cache_seqlen(self):
         # The regression net for the whole design, swept over arbitrary
-        # (non-stick) cache_seqlen, against the two properties that
-        # window_band_mask's tail check exists to preserve: (1) coverage --
+        # (non-stick) cache_seqlen, against the two properties the design
+        # rests on: (1) coverage --
         # every column a row is allowed to attend (row_window, already
         # clamped to cache_seqlen) lies inside this block's buffer, checked
         # against the plan's own (independently computed) row_window; and
@@ -525,14 +526,20 @@ class TestRejection:
     def test_all_three_orderings_of_seqlen_and_capacity_are_accepted(self):
         # Reading only cares which side of cache_capacity the cache is on:
         # exactly full (equal), rolled and outgrown its allocation
-        # (seqlen > capacity), and still filling it (seqlen < capacity, left-
-        # aligned -- see TestStillFilling for why no masking change was
-        # needed to support this last one).
-        assert check_cache_geometry(256, 256) is None
-        assert check_cache_geometry(5000, 64) is None
-        assert check_cache_geometry(100, 4096) is None
-        assert "must be positive" in check_cache_geometry(0, 256)
-        assert "must be positive" in check_cache_geometry(256, 0)
+        # (seqlen > capacity), and still filling it (seqlen < capacity,
+        # left-aligned). rejection_reason is the single gate for all three;
+        # there is no separate geometry check.
+        assert rejection_reason(1, 256, 64, True, 1, cache_capacity=256) is None
+        assert rejection_reason(1, 5000, 64, True, 1, cache_capacity=64) is None
+        assert rejection_reason(1, 100, 64, True, 1, cache_capacity=4096) is None
+
+    def test_degenerate_lengths_are_rejected_without_a_separate_geometry_check(self):
+        # These used to go through check_cache_geometry, which caught nothing
+        # rejection_reason does not already catch -- only the wording differed.
+        assert "degenerate" in rejection_reason(1, 0, 64, True, 1, cache_capacity=256)
+        assert "degenerate" in rejection_reason(1, -5, 64, True, 1, cache_capacity=256)
+        assert rejection_reason(1, 256, 64, True, 1, cache_capacity=0) is not None
+        assert rejection_reason(1, 256, 64, True, 1, cache_capacity=-64) is not None
 
     def test_a_hand_built_read_is_validated(self):
         # The op takes its placement as plain ints, so a caller that does not
@@ -559,27 +566,30 @@ class TestRejection:
             **{**ok, "value_shape": mismatched}
         )
 
-    def test_a_hand_built_read_into_the_unwritten_tail_is_rejected(self):
-        # cache_seqlen=64 < cache_capacity=256: only rows [0, 64) are written.
-        # Before cache_seqlen was threaded into kv_window, a caller bypassing
-        # the plan could read [0, 128) here -- inside cache_capacity, so the
-        # existing bound passed it -- and silently read 64 uninitialized rows.
+    def test_a_read_overshooting_the_written_prefix_is_allowed(self):
+        # check_window_read bounds the read against the ALLOCATION, never
+        # against the cache's logical position. A still-filling cache's
+        # buffer routinely extends past what is written -- seqlen_kv need
+        # not be stick-aligned -- and causal masking excludes those columns,
+        # so it is the normal case rather than an error. A bound on the
+        # logical position here rejected 61% of valid plans when it briefly
+        # existed; this pins that it does not come back.
         shape = (BATCH, HEADS, 256, HEAD_DIM)
-        ok = dict(
+        overshooting = dict(
             read_start=0,
-            buffer_width=128,
+            buffer_width=128,  # cache_seqlen would be 100: reads 28 unwritten rows
             cache_capacity=256,
             num_heads=8,
             num_kv_heads=8,
             key_shape=shape,
             value_shape=shape,
         )
-        reason = check_window_read(**ok, cache_seqlen=64)
-        assert reason is not None and "unwritten tail" in reason
-        assert check_window_read(**ok, cache_seqlen=128) is None  # reaches exactly
-        assert check_window_read(**ok, cache_seqlen=256) is None  # exactly full
-        assert check_window_read(**ok, cache_seqlen=5000) is None  # rolled, past cap
-        assert check_window_read(**ok) is None  # omitted: unchanged
+        assert check_window_read(**overshooting) is None
+        # And the plan really does produce such a read, so this is not
+        # a hypothetical: cache_seqlen=100 into a 256-row allocation.
+        plan = plan_sliding_window(1, 100, 64, q_block=1, cache_capacity=256)
+        assert plan is not None
+        assert plan.read_start(0) + plan.buffer_width > plan.seqlen_kv
 
 
 # --------------------------------------------------------------- 2. algorithm

@@ -71,6 +71,77 @@ def _inputs(batch, heads, kvheads, seqlen_q, seqlen_kv, head_dim=64):
     return query, key, value
 
 
+def _compact_kv(batch, kvheads, capacity, cache_seqlen, head_dim=64):
+    """[B, Hkv, capacity, E] key/value for a compact (rolled or still-filling)
+    cache -- capacity rows physically allocated, only ``min(cache_seqlen,
+    capacity)`` of them real.
+
+    Real data fills ``[0, cache_seqlen)``; the rest is zero. For a rolled
+    cache (``cache_seqlen > capacity``) that is every row -- the whole
+    point, a buffer that has filled and is sliding forward. For a
+    still-filling one it leaves ``[cache_seqlen, capacity)`` zero, matching
+    the precondition on ``spyre::sliding_window_attention`` (an additive
+    ``-inf`` mask cannot rescue a ``NaN`` score) and on ``spyre::kv_window``
+    (rows stay contiguous and time-ordered, oldest dropped from the front).
+    """
+    written = min(cache_seqlen, capacity)
+    key = torch.zeros((batch, kvheads, capacity, head_dim), dtype=torch.float16)
+    value = torch.zeros((batch, kvheads, capacity, head_dim), dtype=torch.float16)
+    if written > 0:
+        key[:, :, :written, :] = cached_randn(
+            (batch, kvheads, written, head_dim), differentiation=2, dtype=torch.float16
+        )
+        value[:, :, :written, :] = cached_randn(
+            (batch, kvheads, written, head_dim), differentiation=3, dtype=torch.float16
+        )
+    return key, value
+
+
+def _rolled_reference(query, key, value, window_size, cache_seqlen):
+    """CPU reference for a compact cache: key/value are ``[B, Hkv, capacity,
+    E]``, not the full-length cache ``_band_mask`` assumes.
+
+    Physical row ``j`` holds logical position ``buffer_origin + j``
+    (``buffer_origin = max(0, cache_seqlen - capacity)``), per
+    ``spyre::kv_window``'s row-order precondition -- the band is built
+    directly in that coordinate space.
+
+    The ``k_pos < cache_seqlen`` term states the definition directly ("only
+    written rows are real keys") and is deliberately kept even though it is
+    provably redundant with the causal term for these inputs -- every query
+    row's coordinate is ``< cache_seqlen`` by construction, so ``delta >= 0``
+    already forces it. ``spyre::window_band_mask`` drops it for exactly that
+    reason; keeping it here means this reference does not inherit that
+    argument, so if the production causal band ever regressed, the two would
+    disagree rather than agreeing on the same mistake.
+    """
+    capacity = key.size(2)
+    seqlen_q = query.size(2)
+    buffer_origin = max(0, cache_seqlen - capacity)
+    q_pos = torch.arange(cache_seqlen - seqlen_q, cache_seqlen).unsqueeze(-1)
+    k_pos = torch.arange(capacity, dtype=torch.int64) + buffer_origin
+    delta = q_pos - k_pos.unsqueeze(0)
+    allowed = (delta >= 0) & (delta < window_size) & (k_pos.unsqueeze(0) < cache_seqlen)
+    mask = torch.zeros(seqlen_q, capacity, dtype=torch.float16)
+    mask.masked_fill_(~allowed, float("-inf"))
+    mask = mask.unsqueeze(0).unsqueeze(0)
+    return F.scaled_dot_product_attention(
+        query, key, value, mask, enable_gqa=query.size(1) != key.size(1)
+    )
+
+
+def _rolled_attention(q, k, v, window_size, cache_seqlen):
+    """Dispatch for a compact cache: the op on spyre with an explicit
+    ``cache_seqlen`` (it cannot default to ``k.size(2)`` here -- that IS the
+    distinction under test), the compact reference on CPU.
+    """
+    if q.device.type == "spyre":
+        return torch.ops.spyre.sliding_window_attention(
+            q, k, v, window_size, True, None, cache_seqlen
+        )
+    return _rolled_reference(q, k, v, window_size, cache_seqlen)
+
+
 class TestSlidingWindowAttention(unittest.TestCase):
     """Shapes the op supports, against the masked reference."""
 
@@ -165,6 +236,98 @@ class TestSlidingWindowAttention(unittest.TestCase):
         # An off-by-one in the pad arithmetic can survive either alone.
         query, key, value = _inputs(1, 8, 2, 100, 512)
         compare_with_cpu(_attention, query, key, value, 100, run_eager=False)
+
+
+class TestCompactCache(unittest.TestCase):
+    """cache_seqlen != key.size(2): a compact cache, rolled or still
+    filling. Every case here previously raised outright -- rolled at a
+    non-stick-aligned position, rejection_reason required cache_seqlen % 64
+    == 0 -- or was never exercised end to end (the earliest-block-reach
+    interaction for a multi-block rolled prefill). Shapes are pre-checked
+    against ``rejection_reason``/``plan_sliding_window`` before being
+    written here, so none of these are expected to raise Unsupported.
+
+    Not what these verify: a block's buffer physically overshooting
+    cache_seqlen (the still-filling case) is masked by the CAUSAL term
+    alone, not by window_band_mask's separate cache_seqlen term -- see that
+    op's docstring for why the two can never disagree while is_causal=True
+    is the only implemented mode. What these actually check is end-to-end
+    numeric correctness of placement + masking + attention against a
+    compact (not full-length) cache at these coordinates.
+    """
+
+    def setUp(self):
+        torch._dynamo.reset()
+
+    def test_rolled_decode_at_a_non_aligned_position(self):
+        # The design's actual goal: a compact W+64-row rolled buffer read at
+        # an arbitrary (non-stick) logical position -- 5001, not a multiple
+        # of 64. Before the physical-space floor fix this shape was refused
+        # outright; read_start is also identical for every such position
+        # (see TestArbitraryCacheSeqlen in test_kv_window.py for the swept
+        # proof), so this is one representative point on that line, verified
+        # end to end rather than just at the placement level.
+        batch, heads, kvheads = 1, 8, 8
+        capacity, cache_seqlen, window = 4160, 5001, 4096
+        key, value = _compact_kv(batch, kvheads, capacity, cache_seqlen)
+        query = cached_randn(
+            (batch, heads, 1, 64), differentiation=1, dtype=torch.float16
+        )
+        compare_with_cpu(
+            _rolled_attention, query, key, value, window, cache_seqlen, run_eager=False
+        )
+
+    def test_warmup_cache_at_a_non_aligned_seqlen(self):
+        # cache_seqlen=100 < capacity=256, not stick-aligned: the buffer
+        # physically reaches column 128, past what is written (rows
+        # [100, 128) are the zero-filled tail from _compact_kv). Causal
+        # masking alone already excludes those columns (see TestCompactCache's
+        # docstring) -- this checks that the placement and attention around
+        # that overshoot are still numerically correct end to end.
+        batch, heads, kvheads = 1, 8, 8
+        capacity, cache_seqlen, window = 256, 100, 64
+        key, value = _compact_kv(batch, kvheads, capacity, cache_seqlen)
+        query = cached_randn(
+            (batch, heads, 1, 64), differentiation=1, dtype=torch.float16
+        )
+        compare_with_cpu(
+            _rolled_attention, query, key, value, window, cache_seqlen, run_eager=False
+        )
+
+    def test_capacity_equals_window_decode(self):
+        # HF's StaticSlidingWindowLayer allocates exactly window_size rows
+        # for decode -- the minimal allocation contract this op requires
+        # (see the "capacity >= window_size" note on
+        # spyre::sliding_window_attention). read_start collapses to 0 for
+        # every position once capacity == buffer_width, including this
+        # arbitrary, non-aligned one.
+        batch, heads, kvheads = 1, 8, 8
+        capacity = window = 64
+        cache_seqlen = 5001
+        key, value = _compact_kv(batch, kvheads, capacity, cache_seqlen)
+        query = cached_randn(
+            (batch, heads, 1, 64), differentiation=1, dtype=torch.float16
+        )
+        compare_with_cpu(
+            _rolled_attention, query, key, value, window, cache_seqlen, run_eager=False
+        )
+
+    def test_multiblock_rolled_prefill_with_distinct_read_starts(self):
+        # 8 blocks of a 512-row prefill against a rolled, non-aligned
+        # cache_seqlen -- every block reads a DIFFERENT physical offset
+        # (448, 512, ..., 896 at this shape), the interaction hardest to get
+        # right: per-block window staggering on top of the physical-space
+        # floor and the earliest-block-reach check, together.
+        batch, heads, kvheads = 1, 8, 8
+        capacity, cache_seqlen, window = 1024, 5001, 64
+        seqlen_q = 512
+        key, value = _compact_kv(batch, kvheads, capacity, cache_seqlen)
+        query = cached_randn(
+            (batch, heads, seqlen_q, 64), differentiation=1, dtype=torch.float16
+        )
+        compare_with_cpu(
+            _rolled_attention, query, key, value, window, cache_seqlen, run_eager=False
+        )
 
 
 if __name__ == "__main__":

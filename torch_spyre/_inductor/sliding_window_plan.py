@@ -44,15 +44,43 @@ class SlidingWindowPlan:
 
     ``seqlen_kv`` and ``cache_capacity`` used to be the same field doing two
     jobs; they now say which job is which regardless of whether they agree.
-    ``seqlen_kv`` is the cache's logical position -- what a coordinate means,
-    so ``row_window`` clamps against it. ``cache_capacity`` is the rows
-    physically allocated -- what a *read* may not run past, so ``read_start``
-    clamps against it. ``check_cache_geometry`` allows either to be larger:
-    ``seqlen_kv < cache_capacity`` is a cache still filling its allocation
-    (left-aligned, ``buffer_origin`` 0); ``seqlen_kv > cache_capacity`` is a
-    compact buffer that has filled and is now sliding forward (rolled,
-    ``buffer_origin > 0``); equal is the full-length, exactly-full cache
-    every caller used before either parameter existed.
+    ``seqlen_kv`` is the cache's logical position -- HF's
+    ``cumulative_length``, vLLM's ``seq_lens``, what a coordinate *means* --
+    so ``row_window`` clamps against it. ``cache_capacity`` is
+    ``key.size(2)``, the rows physically allocated -- what a *read* may not
+    run past -- so ``read_start`` clamps against it.
+
+    Either may be larger. Reading only cares which side of
+    ``cache_capacity`` the cache is on, not the write-side transition of
+    crossing it: HF's three states (still-filling / becoming-full / full)
+    collapse to two here, since "becoming full" is a mid-update detail a
+    reader never observes -- it only ever sees the state an update left
+    behind.
+
+    ``seqlen_kv <= cache_capacity`` -- still filling its allocation.
+    Left-aligned, ``buffer_origin`` 0: buffer row ``j`` holds logical
+    position ``j`` for ``j < seqlen_kv``, and ``[seqlen_kv,
+    cache_capacity)`` is allocated but unwritten. ``seqlen_kv`` is not
+    required to be stick-aligned (only ``cache_capacity`` is, in
+    ``rejection_reason``), so a block's physical read routinely lands past
+    ``seqlen_kv``. Safe, and the reason no tail mask is needed: every query
+    row's own coordinate is ``< seqlen_kv`` by construction
+    (``q_kv_offset = seqlen_kv - seqlen_q``), so causal masking's
+    ``column <= row`` already forces ``column < seqlen_kv`` -- no column
+    past the written prefix can ever be causally attended. The precondition
+    that does remain: the unwritten tail must hold *finite* values
+    (zero-filled; see ``spyre::sliding_window_attention``'s docstring),
+    since an additive ``-inf`` cannot rescue a ``NaN`` even when the causal
+    term correctly assigns that ``-inf``.
+
+    ``seqlen_kv > cache_capacity`` -- a compact buffer that has filled and
+    is now sliding forward (rolled, ``buffer_origin > 0``), on the
+    assumption (unchecked -- see ``kv_window``'s docstring) that its rows
+    stay contiguous and time-ordered, oldest dropped from the front, so it
+    holds exactly the most recent ``cache_capacity`` positions.
+
+    Equal is the full-length, exactly-full cache every caller used before
+    either parameter existed.
     """
 
     seqlen_q: int
@@ -83,12 +111,11 @@ class SlidingWindowPlan:
 
         0 whenever ``seqlen_kv <= cache_capacity`` -- the cache fits inside
         its own allocation and physical and logical coordinates coincide.
-        Once ``seqlen_kv`` exceeds
-        ``cache_capacity`` -- a rolled buffer that has filled and is sliding
-        forward -- this is where its oldest resident row sits, on the
-        assumption the buffer holds exactly the most recent
-        ``cache_capacity`` logical positions (see ``check_cache_geometry``
-        and the "row order" precondition on ``kv_window``).
+        Once ``seqlen_kv`` exceeds ``cache_capacity`` -- a rolled buffer
+        that has filled and is sliding forward -- this is where its oldest
+        resident row sits, on the assumption the buffer holds exactly the
+        most recent ``cache_capacity`` logical positions (see this class's
+        docstring and the "row order" precondition on ``kv_window``).
         """
         return max(0, self.seqlen_kv - self.cache_capacity)
 
@@ -167,7 +194,6 @@ def check_window_read(
     num_kv_heads: int,
     key_shape: tuple[int, ...],
     value_shape: tuple[int, ...],
-    cache_seqlen: int | None = None,
 ) -> str | None:
     """Why this read is invalid, or None.
 
@@ -181,18 +207,13 @@ def check_window_read(
     already a capacity bound in practice; this only makes the parameter say
     so.
 
-    ``cache_seqlen``, when given, is the logical position -- what
-    ``check_cache_geometry`` validated at the op boundary -- and lets this
-    function tell "runs past the allocation" (the ``cache_capacity`` bound
-    above) apart from "runs into the allocation's unfilled tail" (below): a
-    still-filling cache (``cache_seqlen < cache_capacity``) leaves
-    ``[cache_seqlen, cache_capacity)`` unwritten, and a caller building its
-    own ``read_start``/``buffer_width`` rather than going through the plan
-    could otherwise read into it undetected -- the plan itself never does,
-    by construction (see ``check_cache_geometry``'s docstring). Optional and
-    defaulting to None so a caller with no logical position to give --
-    exactly the "equal" ordering, before ``cache_seqlen`` existed -- sees no
-    new rejection.
+    Bounds the read against the *allocation*, deliberately not against the
+    cache's logical position. A still-filling cache's buffer routinely
+    extends past its written prefix -- ``seqlen_kv`` need not be
+    stick-aligned, so ``read_start + buffer_width`` overshooting it is the
+    normal case, not an error -- and those columns are excluded by causal
+    masking anyway (see ``SlidingWindowPlan``'s class docstring). A bound
+    on the logical position here would reject most valid plans.
     """
     if read_start < 0:
         return f"read_start={read_start} is negative"
@@ -203,15 +224,6 @@ def check_window_read(
             f"window [{read_start}, {read_start + buffer_width}) runs past the "
             f"cache (cache_capacity={cache_capacity})"
         )
-    if cache_seqlen is not None and read_start + buffer_width > cache_seqlen:
-        # Unreachable once cache_seqlen >= cache_capacity: the bound above
-        # already caught read_start + buffer_width > cache_capacity <=
-        # cache_seqlen. Only fires for the still-filling case.
-        return (
-            f"window [{read_start}, {read_start + buffer_width}) runs into "
-            f"the cache's unwritten tail (cache_seqlen={cache_seqlen} of "
-            f"cache_capacity={cache_capacity} rows written)"
-        )
     if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
         return (
             f"num_heads={num_heads} is not a whole multiple of "
@@ -219,43 +231,6 @@ def check_window_read(
         )
     if key_shape != value_shape:
         return f"key.shape={key_shape} does not match value.shape={value_shape}"
-    return None
-
-
-def check_cache_geometry(cache_seqlen: int, cache_capacity: int) -> str | None:
-    """Why this (logical length, physical capacity) pair cannot be read, or None.
-
-    ``cache_seqlen`` is the true KV sequence position -- how many tokens the
-    cache has seen, HF's ``cumulative_length`` and vLLM's ``seq_lens``.
-    ``cache_capacity`` is ``key.size(2)``, the rows actually allocated.
-
-    Reading only cares which side of ``cache_capacity`` the cache is on, not
-    the write-side transition of crossing it -- HF's three states
-    (still-filling / becoming-full / full) collapse to two here, since
-    "becoming full" is a mid-update detail a reader never observes; it only
-    ever sees the state an update left behind.
-
-    ``cache_seqlen <= cache_capacity``: left-aligned, buffer row ``j`` holds
-    logical position ``j`` for ``j < cache_seqlen``; ``[cache_seqlen,
-    cache_capacity)`` is allocated but unwritten. ``cache_seqlen`` is not
-    required to be stick-aligned (only ``cache_capacity`` is, in
-    ``rejection_reason``), so a block's physical read can land past
-    ``cache_seqlen`` -- ``window_band_mask``'s tail check
-    (``column < cache_seqlen``) masks exactly that overshoot, on the
-    precondition that the unwritten tail holds finite values (zero-filled;
-    see ``spyre::sliding_window_attention``'s docstring), since an additive
-    ``-inf`` cannot rescue a ``NaN``.
-
-    ``cache_seqlen > cache_capacity``: a compact buffer that has filled and
-    is now sliding forward, on the assumption (not checked here -- see
-    ``kv_window``'s docstring) that its rows stay contiguous and
-    time-ordered, oldest dropped from the front, so the buffer holds exactly
-    the most recent ``cache_capacity`` positions.
-    """
-    if cache_seqlen <= 0:
-        return f"cache_seqlen={cache_seqlen} must be positive"
-    if cache_capacity <= 0:
-        return f"cache_capacity={cache_capacity} must be positive"
     return None
 
 
@@ -335,9 +310,10 @@ def rejection_reason(
     allocation -- ``effective_capacity`` -- needs alignment, since that is
     what fixes ``read_start``'s stick boundary (see ``read_start``'s
     docstring on flooring in physical, not logical, coordinates). A
-    still-filling or rolled cache at an arbitrary ``seqlen_kv`` is masked
-    correctly by ``window_band_mask``'s tail check, not by refusing anything
-    that doesn't land on a stick.
+    still-filling or rolled cache at an arbitrary ``seqlen_kv`` is handled
+    by the causal band, which already excludes every column past the written
+    prefix (see this module's ``SlidingWindowPlan`` docstring), not by
+    refusing anything that doesn't land on a stick.
     """
     if not is_causal:
         return "bidirectional windows are not implemented, only causal ones"

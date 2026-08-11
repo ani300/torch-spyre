@@ -834,33 +834,37 @@ def sliding_window_attention(  # type: ignore[empty-body]
     what the placement assumed before the parameter existed, so an existing
     caller is unaffected.
 
-    Three orderings against ``Lk`` are accepted (``check_cache_geometry``):
-    equal (the default, a full-length cache that is exactly full);
-    ``cache_seqlen < Lk`` (still filling its allocation, left-aligned, the
-    unwritten tail at ``[cache_seqlen, Lk)``); ``cache_seqlen > Lk`` (a
-    compact buffer that has filled and is sliding forward -- see
-    ``spyre::kv_window``'s docstring for the row-order precondition that
-    geometry requires of the caller).
+    Three orderings against ``Lk`` are accepted (see ``SlidingWindowPlan``'s
+    class docstring): equal (the default, a full-length cache that is
+    exactly full); ``cache_seqlen < Lk`` (still filling its allocation,
+    left-aligned, the unwritten tail at ``[cache_seqlen, Lk)``);
+    ``cache_seqlen > Lk`` (a compact buffer that has filled and is sliding
+    forward -- see ``spyre::kv_window``'s docstring for the row-order
+    precondition that geometry requires of the caller).
 
     ``cache_seqlen`` need NOT be a multiple of 64 -- it is a token count, not
     a memory offset, so a rolled buffer accepts any logical position, not
     just already-stick-aligned ones (only ``Lk`` itself must stay
     stick-aligned; see ``rejection_reason``). ``read_start`` floors in
     physical, not logical, coordinates to make this exact for a rolled
-    buffer (see ``SlidingWindowPlan.read_start``), and
-    ``spyre::window_band_mask`` masks any column whose logical position runs
-    past ``cache_seqlen`` -- the warmup tail a non-aligned position can now
-    expose.
+    buffer (see ``SlidingWindowPlan.read_start``). A non-aligned position can
+    make a block's buffer physically extend past ``cache_seqlen`` -- the
+    warmup tail -- but causal masking alone already excludes every such
+    column (every row's own coordinate is ``< cache_seqlen`` by
+    construction, so ``column <= row`` forces ``column < cache_seqlen``; see
+    ``SlidingWindowPlan``'s class docstring), so this needs no separate
+    handling for the causal-only path implemented today.
 
     The allocation ``Lk`` must hold at least one buffer's worth of rows: the
     op needs ``window_size`` for decode, or ``window_size + q_block`` for a
     multi-row query block (rows within a block have staggered windows), for
     the ``Lk`` it is actually given -- ``rejection_reason`` names the exact
     row count when a passed allocation is too narrow. Rows at or past
-    ``cache_seqlen`` in a still-filling cache may be read (and masked) by a
-    block whose buffer overshoots the written prefix, so they must still be
-    finite -- zero-fill the allocation; an additive ``-inf`` mask cannot
-    rescue a ``NaN`` score.
+    ``cache_seqlen`` in a still-filling cache ARE read by a block whose
+    buffer overshoots the written prefix -- causal masking discards their
+    scores, but the multiply still happens, so they must hold finite
+    values. Zero-fill the allocation; an additive ``-inf`` cannot rescue a
+    ``NaN``.
 
     MUST be called under torch.compile(backend="inductor") on the spyre
     device — see spyre_sliding_window_attention in decompositions.py for the
@@ -895,7 +899,6 @@ def window_band_mask(
     is_causal: bool,
     dtype: torch.dtype,
     device: torch.device,
-    cache_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Additive band over one Q block's KV window.
@@ -921,17 +924,16 @@ def window_band_mask(
     (``SlidingWindowPlan.read_start_logical``), not buffer-relative -- see
     the caller in decompositions.py.
 
-    ``cache_seqlen``, when given, additionally masks column ``read_start + j``
-    whenever its logical position is ``>= cache_seqlen`` -- the unwritten tail
-    of a still-filling cache (``seqlen_kv`` need not be stick-aligned, so the
-    buffer can physically extend past it; see ``rejection_reason``'s
-    docstring). A no-op when every column is already written: inert for a
-    rolled or exactly-full cache, and for any block whose buffer happens to
-    stay inside ``cache_seqlen``. Optional and defaulting to None so an
-    existing caller -- passing only what the plan always computed -- is
-    unaffected. Precondition: rows at or past ``cache_seqlen`` must still hold
-    finite values (zero-filled) -- an additive ``-inf`` mask cannot rescue a
-    ``NaN`` score.
+    No ``cache_seqlen`` term. A still-filling cache's buffer can extend past
+    its written prefix, but the causal condition already excludes every such
+    column: the row coordinates this op is given satisfy ``row < seqlen_kv``
+    by construction, so ``delta >= 0`` (``column <= row``) forces
+    ``column < seqlen_kv``. A separate ``column < seqlen_kv`` term could
+    never disagree with the causal one and was removed as dead. It would
+    become load-bearing only for a bidirectional window, where
+    ``abs(delta) < window_size`` admits ``column > row`` -- that mode raises
+    Unsupported today, and whoever implements it must revisit this mask
+    regardless.
 
     Built entirely on CPU so the in-place ops stay opaque to torch.compile,
     matching spyre.causal_mask's rationale.
@@ -943,8 +945,6 @@ def window_band_mask(
         allowed = (delta >= 0) & (delta < window_size)
     else:
         allowed = delta.abs() < window_size
-    if cache_seqlen is not None:
-        allowed = allowed & (column.unsqueeze(0) < cache_seqlen)
     mask_cpu = torch.zeros(allowed.shape, dtype=dtype, device="cpu")
     mask_cpu.masked_fill_(~allowed, float("-inf"))
     return mask_cpu.unsqueeze(0).unsqueeze(0).to(device=device)
@@ -960,7 +960,6 @@ def _(
     is_causal: bool,
     dtype: torch.dtype,
     device: torch.device,
-    cache_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     return torch.empty(1, 1, q_block, buffer_width, dtype=dtype, device=device)
 
@@ -972,7 +971,6 @@ def kv_window(  # type: ignore[empty-body]
     read_start: int,
     buffer_width: int,
     num_heads: int,
-    cache_seqlen: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Read one Q block's slice of the KV cache.
@@ -992,14 +990,13 @@ def kv_window(  # type: ignore[empty-body]
     ``read_start`` comes from SlidingWindowPlan. Passing it in, rather than a
     block index, keeps this op ignorant of how the query is blocked.
 
-    ``cache_seqlen``, when given, is the cache's logical position -- see
-    ``spyre::sliding_window_attention``'s docstring. Used only to validate
-    that this read does not reach into a still-filling cache's unwritten
-    tail (``check_window_read``); the slice itself is unaffected, since the
-    plan never asks for a read that needs the distinction. What lets a
-    caller that bypasses the plan walk into that tail undetected. Optional
-    and defaulting to None so an existing caller -- passing only what the
-    plan always computed -- is unaffected.
+    No ``cache_seqlen``: this op only needs to know where the read starts
+    and how wide it is. A still-filling cache's read routinely extends past
+    the written prefix -- normal, not an error, since causal masking
+    excludes those columns (see ``SlidingWindowPlan``'s class docstring) --
+    so bounding the read against the logical position here would reject
+    most valid plans. ``check_window_read`` bounds it against the
+    allocation, which is what actually prevents a fault.
 
     **Precondition when key/value is a compact buffer narrower than the
     cache's true length** (``SlidingWindowPlan.buffer_origin != 0``): rows
@@ -1032,7 +1029,6 @@ def _(
     read_start: int,
     buffer_width: int,
     num_heads: int,
-    cache_seqlen: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from .sliding_window_plan import check_window_read
 
@@ -1044,7 +1040,6 @@ def _(
         num_kv_heads=key.size(1),
         key_shape=tuple(key.shape),
         value_shape=tuple(value.shape),
-        cache_seqlen=cache_seqlen,
     )
     if reason is not None:
         raise Unsupported(f"kv_window: {reason}")
