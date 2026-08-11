@@ -3210,6 +3210,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
+            # mha_decode/gqa_decode still fail post-KV-loop: unrelated to KV
+            # tiling (decode inputs are not transposed; layout path differs).
             "expect_fail": ["mha_decode", "gqa_decode"],
         },
         ("test_split", "test_split_cpu"): {
