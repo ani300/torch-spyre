@@ -248,17 +248,24 @@ class TestStillFilling:
     allocation yet, left-aligned (buffer_origin == 0, already correct without
     any change -- see TestRolledBuffer's sibling test for the outgrown case).
 
-    The obvious design here adds a mask for the unwritten tail
-    [cache_seqlen, cache_capacity) and a matching block_is_fully_attended
-    condition. Neither is needed: rejection_reason already requires
-    cache_seqlen stick-aligned, and every block's read is stick-aligned
-    arithmetic built from a buffer_width sized to the *widest* block. Per-
-    block required width is monotonic non-decreasing in block index (proven
-    by test_per_block_width_is_monotonic below), so the last block is always
-    that widest block, and its own width reaches cache_seqlen with zero
-    slack once it -- already stick-aligned -- is ceil_stick'd. No block's
-    read ever reaches the tail; the existing causal band is the only mask
-    needed.
+    cache_seqlen is no longer required to be stick-aligned (rejection_reason
+    only requires the allocation, cache_capacity, to be), so in general a
+    block's buffer CAN overshoot into the unwritten tail -- window_band_mask's
+    tail check (column < cache_seqlen) handles that case, and
+    block_is_fully_attended already refuses to skip the band whenever it
+    happens (row_window's hi clamps to seqlen_kv, so a buffer extending past
+    it can never satisfy "fully attended").
+
+    This class covers the narrower, STICK-aligned cache_seqlen values only,
+    where the tail mask is provably a no-op: every block's read is
+    stick-aligned arithmetic built from a buffer_width sized to the *widest*
+    block. Per-block required width is monotonic non-decreasing in block
+    index (proven by test_per_block_width_is_monotonic below), so the last
+    block is always that widest block, and its own width reaches
+    cache_seqlen with zero slack once it -- already stick-aligned -- is
+    ceil_stick'd. No block's read reaches the tail for THESE inputs, so the
+    tail mask stays inert and the existing causal band alone suffices --
+    exactly what the swept tests below still confirm.
     """
 
     def test_a_still_filling_cache_plans_like_any_other(self):
@@ -326,6 +333,98 @@ class TestStillFilling:
                 assert stop <= cache_seqlen
 
 
+class TestArbitraryCacheSeqlen:
+    """cache_seqlen need not be stick-aligned -- only cache_capacity, the
+    physical allocation, does (see rejection_reason's docstring). This is
+    the capability TestStillFilling's induction proof deliberately avoided
+    needing: for a non-aligned position, a block's buffer CAN overshoot the
+    written prefix, and window_band_mask's tail check (column < cache_seqlen)
+    is what makes that safe instead of refusing the shape outright.
+    """
+
+    def test_a_non_aligned_cache_seqlen_is_accepted_with_a_capacity(self):
+        # Previously rejected outright ("seqlen_kv must be a multiple of
+        # 64"); now only the allocation (a real stick multiple, 4160) needs
+        # alignment -- 5001 is an arbitrary token count, not a memory offset.
+        assert rejection_reason(1, 5001, 4096, True, 1, cache_capacity=4160) is None
+        assert (
+            plan_sliding_window(1, 5001, 4096, q_block=1, cache_capacity=4160)
+            is not None
+        )
+
+    def test_rolled_decode_read_start_is_position_independent(self):
+        # The actual payoff of flooring in physical rather than logical
+        # coordinates: one graph should serve every decode step on a rolled
+        # buffer, not a recompile per logical position. Before the fix,
+        # read_start varied with position because the floor landed on a
+        # different physical offset depending on where buffer_origin
+        # (unaligned once seqlen_kv is) happened to fall relative to a stick.
+        starts = {
+            plan_sliding_window(
+                1, pos, 4096, q_block=1, cache_capacity=4160
+            ).read_start(0)
+            for pos in range(4160, 4160 + 600)
+        }
+        assert starts == {64}, starts
+
+    def test_a_small_rolled_buffer_is_also_position_independent(self):
+        starts = {
+            plan_sliding_window(1, pos, 64, q_block=1, cache_capacity=64).read_start(0)
+            for pos in range(64, 64 + 600)
+        }
+        assert starts == {0}, starts
+
+    def test_a_buffer_that_overshoots_the_still_filling_tail_is_not_fully_attended(
+        self,
+    ):
+        # seqlen_kv=127 is not stick-aligned: the W=63 buffer physically
+        # reaches column 128 -- one past what is written. block_is_fully_
+        # attended must say so (row_window's hi clamps to seqlen_kv, so a
+        # buffer extending past it can never satisfy "fully attended"),
+        # which is what makes the band -- and its tail mask -- get added.
+        plan = plan_sliding_window(1, 127, 63, q_block=1, cache_capacity=128)
+        assert plan is not None
+        assert not plan.block_is_fully_attended(0)
+
+    def test_no_leakage_or_coverage_gap_at_arbitrary_non_stick_cache_seqlen(self):
+        # The regression net for the whole design, swept over arbitrary
+        # (non-stick) cache_seqlen, against the two properties that
+        # window_band_mask's tail check exists to preserve: (1) coverage --
+        # every column a row is allowed to attend (row_window, already
+        # clamped to cache_seqlen) lies inside this block's buffer, checked
+        # against the plan's own (independently computed) row_window; and
+        # (2) no leakage -- whenever block_is_fully_attended skips the band
+        # entirely, every buffer column it reads must already be written,
+        # since nothing will mask it otherwise.
+        for cap in (64, 128, 256, 1024):
+            for seq in range(1, 600, 7):  # arbitrary step, hits non-stick values
+                for window in (63, 64, 100, 128, 300):
+                    for lq, qb in ((1, 1), (64, 64)):
+                        if seq < lq:
+                            continue
+                        plan = plan_sliding_window(
+                            lq, seq, window, q_block=qb, cache_capacity=cap
+                        )
+                        if plan is None:
+                            continue
+                        for qi in range(plan.num_q_blocks):
+                            start = plan.read_start_logical(qi)
+                            stop = start + plan.buffer_width
+                            if plan.block_is_fully_attended(qi):
+                                assert stop <= seq, (cap, seq, window, lq, qi)
+                            q_start, q_end = plan.block_q_range(qi)
+                            for q_index in range(q_start, q_end):
+                                lo, hi = plan.row_window(q_index)
+                                assert start <= lo and hi <= stop, (
+                                    cap,
+                                    seq,
+                                    window,
+                                    lq,
+                                    qi,
+                                    q_index,
+                                )
+
+
 class TestQueryPadding:
     """A query that does not divide into blocks is padded, not refused."""
 
@@ -371,7 +470,10 @@ class TestRejection:
     REJECTED = [
         ((256, 256, 64, False, 64), "causal"),
         ((256, 256, 0, True, 64), "window_size=0 must be positive"),
-        ((256, 257, 64, True, 64), "pad the KV cache"),
+        # No cache_capacity given: seqlen_kv doubles as the allocation
+        # (effective_capacity), which must still be stick-aligned -- unlike
+        # a passed cache_seqlen, which need not be (see rejection_reason).
+        ((256, 257, 64, True, 64), "pad the cache allocation"),
         ((100, 256, 64, True, 64), "whole number of 64-row blocks"),
         ((512, 256, 64, True, 64), "exceeds seqlen_kv"),
     ]

@@ -627,8 +627,8 @@ def _windowed_attention(
                 # Logical, not read_start: the row side of this op
                 # (q_row_origin) is a logical coordinate, and delta = row -
                 # column only means anything if both sides agree. Identical
-                # to read_start while buffer_origin is 0 -- every shape
-                # supported today -- and diverges once it isn't.
+                # to read_start while buffer_origin is 0 -- a still-filling
+                # or exactly-full cache -- and diverges for a rolled buffer.
                 plan.read_start_logical(block_index),
                 q_block,
                 buffer_width,
@@ -637,6 +637,7 @@ def _windowed_attention(
                 plan.is_causal,
                 query.dtype,
                 query.device,
+                plan.seqlen_kv,
             )
         )
         q_rows = query[:, :, q_start:q_end, :]

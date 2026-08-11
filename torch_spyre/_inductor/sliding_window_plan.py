@@ -120,25 +120,31 @@ class SlidingWindowPlan:
         rather than shrink, so every block's buffer is one shape and one
         allocation serves them all. The band removes what the shift drags in.
 
-        ``window_origin`` is computed in logical coordinates (it comes from
-        ``q_kv_offset``, an absolute cache position); subtracting
-        ``buffer_origin`` converts it to a buffer-relative index before the
-        clamp, which is itself expressed in capacity terms. Skipping that
-        conversion silently returns the same answer for every block once
-        ``seqlen_kv`` and ``cache_capacity`` diverge, because a logical
-        coordinate (thousands) clamped against a small physical bound just
-        returns the bound -- this was wrong for two releases running before
-        being caught by a non-degenerate test case.
+        Floors in PHYSICAL coordinates: convert the logical window start to
+        a buffer-relative index first (subtract ``buffer_origin``), *then*
+        round down to a stick. Flooring in logical coordinates first and
+        subtracting after -- the previous order -- only lands on a
+        stick-aligned physical offset when ``buffer_origin`` is itself a
+        stick multiple, which held for every geometry ``rejection_reason``
+        used to accept (both sides individually stick-aligned) but not for
+        an arbitrary rolled-buffer ``seqlen_kv``: e.g. ``buffer_origin=55``
+        would floor to physical offset ``9`` -- not a stick boundary, and
+        wrong for a HW read regardless. Flooring after conversion is
+        correct for both cases and identical to the old formula whenever
+        ``buffer_origin`` is a stick multiple (floor distributes over
+        subtracting an exact multiple of the modulus): every previously
+        accepted shape reads from exactly the same offset as before.
 
         When ``cache_capacity == buffer_width`` (the buffer holds exactly one
-        window), ``buffer_origin`` tracks ``window_origin`` exactly, so this
-        collapses to ``min(0, 0) == 0`` for every block: there is nowhere to
-        shift to, correctly, because the buffer only ever holds "now".
+        window), ``buffer_origin`` tracks the window's logical start exactly,
+        so the unfloored physical offset is already 0 (or floors to 0) for
+        every block: there is nowhere to shift to, correctly, because the
+        buffer only ever holds "now".
         """
         q_start, _ = self.block_q_range(qi)
         first_coord = self.q_kv_offset + q_start
-        window_origin = max(0, _floor_stick(first_coord - self.window_size + 1))
-        physical_origin = window_origin - self.buffer_origin
+        window_start_logical = max(0, first_coord - self.window_size + 1)
+        physical_origin = _floor_stick(window_start_logical - self.buffer_origin)
         return min(physical_origin, self.cache_capacity - self.buffer_width)
 
     def read_start_logical(self, qi: int) -> int:
@@ -231,15 +237,14 @@ def check_cache_geometry(cache_seqlen: int, cache_capacity: int) -> str | None:
 
     ``cache_seqlen <= cache_capacity``: left-aligned, buffer row ``j`` holds
     logical position ``j`` for ``j < cache_seqlen``; ``[cache_seqlen,
-    cache_capacity)`` is allocated but unwritten. No block's read ever
-    reaches that tail: ``rejection_reason`` requires ``cache_seqlen``
-    stick-aligned, and every block's read is built from stick-aligned
-    arithmetic that (by induction on ``buffer_width`` being sized to the
-    *widest* block, and per-block width being monotonic non-decreasing, so
-    the last block sets it exactly) lands the last, furthest-reaching block's
-    read exactly on ``cache_seqlen`` with no slack -- see
-    ``TestStillFilling.test_no_block_ever_reads_past_cache_seqlen`` for the
-    swept proof. No masking beyond the existing causal band is needed.
+    cache_capacity)`` is allocated but unwritten. ``cache_seqlen`` is not
+    required to be stick-aligned (only ``cache_capacity`` is, in
+    ``rejection_reason``), so a block's physical read can land past
+    ``cache_seqlen`` -- ``window_band_mask``'s tail check
+    (``column < cache_seqlen``) masks exactly that overshoot, on the
+    precondition that the unwritten tail holds finite values (zero-filled;
+    see ``spyre::sliding_window_attention``'s docstring), since an additive
+    ``-inf`` cannot rescue a ``NaN``.
 
     ``cache_seqlen > cache_capacity``: a compact buffer that has filled and
     is now sliding forward, on the assumption (not checked here -- see
@@ -255,7 +260,11 @@ def check_cache_geometry(cache_seqlen: int, cache_capacity: int) -> str | None:
 
 
 def _required_width(
-    seqlen_q: int, window_size: int, q_block: int, q_kv_offset: int
+    seqlen_q: int,
+    window_size: int,
+    q_block: int,
+    q_kv_offset: int,
+    buffer_origin: int = 0,
 ) -> int:
     """Widest span any block must cover, rounded up to a stick.
 
@@ -265,6 +274,12 @@ def _required_width(
 
     No ``seqlen_kv``: ``last_coord`` is already bounded by the cache. A
     bidirectional window would reach ``last_coord + W - 1`` and need clamping.
+
+    ``buffer_origin`` converts to the same buffer-relative space
+    ``read_start`` floors in (see its docstring) -- the width must be
+    measured from where the floor actually lands, physically, not from an
+    unconverted logical floor. Defaults to 0, matching every caller before a
+    rolled buffer existed, where logical and physical coincide.
     """
     widest = 0
     for qi in range(-(-seqlen_q // q_block)):
@@ -272,8 +287,10 @@ def _required_width(
         q_end = min(seqlen_q, q_start + q_block)
         first_coord = q_kv_offset + q_start
         last_coord = q_kv_offset + q_end - 1
-        window_origin = max(0, _floor_stick(first_coord - window_size + 1))
-        widest = max(widest, last_coord - window_origin + 1)
+        window_start_logical = max(0, first_coord - window_size + 1)
+        physical_start = _floor_stick(window_start_logical - buffer_origin)
+        physical_end = (last_coord - buffer_origin) + 1
+        widest = max(widest, physical_end - physical_start)
     return _ceil_stick(widest)
 
 
@@ -304,13 +321,23 @@ def rejection_reason(
 
     ``cache_capacity`` is optional and, when omitted, changes nothing -- every
     caller before this parameter existed still sees exactly the checks it saw
-    before. When given, it enables three more: ``read_start``'s buffer-relative
-    arithmetic needs ``cache_capacity`` stick-aligned the same way it always
-    needed ``seqlen_kv`` aligned; needs at least one buffer's worth of room to
-    place a read in; and needs enough room for the *first* block specifically,
-    since a capacity that clears the previous check can still be too narrow
-    for a multi-block plan whose earliest block reaches further back than a
+    before (``effective_capacity`` below is ``seqlen_kv`` in that case, so the
+    alignment check is the same one that branch always saw). When given, it
+    enables two more: needs at least one buffer's worth of room to place a
+    read in; and needs enough room for the *first* block specifically, since a
+    capacity that clears the previous check can still be too narrow for a
+    multi-block plan whose earliest block reaches further back than a
     smaller-but-nonzero amount of slack covers.
+
+    ``seqlen_kv`` itself is NOT required to be stick-aligned: it is the
+    cache's logical position, a token count that increments by 1 (HF's
+    ``cumulative_length``), not a memory offset. Only the physical
+    allocation -- ``effective_capacity`` -- needs alignment, since that is
+    what fixes ``read_start``'s stick boundary (see ``read_start``'s
+    docstring on flooring in physical, not logical, coordinates). A
+    still-filling or rolled cache at an arbitrary ``seqlen_kv`` is masked
+    correctly by ``window_band_mask``'s tail check, not by refusing anything
+    that doesn't land on a stick.
     """
     if not is_causal:
         return "bidirectional windows are not implemented, only causal ones"
@@ -325,27 +352,22 @@ def rejection_reason(
         return f"seqlen_q={seqlen_q} is not a whole number of {q_block}-row blocks"
     if window_size <= 0:
         return f"window_size={window_size} must be positive"
-    if seqlen_kv % STICK != 0:
-        # seqlen_kv also fixes buffer_origin's alignment (seqlen_kv -
-        # cache_capacity, both stick multiples once cache_capacity is
-        # checked below), which read_start's physical conversion depends on.
-        # For the default cache_capacity == seqlen_kv case this is also the
-        # original reason: the last block's read must land exactly on
-        # cache_capacity, itself a stick multiple, so seqlen_kv must be one.
-        return (
-            f"seqlen_kv={seqlen_kv} must be a multiple of {STICK}; pad the KV "
-            "cache to a stick boundary"
-        )
     if seqlen_kv - seqlen_q < 0:
         return f"seqlen_q={seqlen_q} exceeds seqlen_kv={seqlen_kv}"
+
+    effective_capacity = seqlen_kv if cache_capacity is None else cache_capacity
+    if effective_capacity % STICK != 0:
+        return (
+            f"cache_capacity={effective_capacity} must be a multiple of "
+            f"{STICK}; pad the cache allocation to a stick boundary"
+        )
+
     if cache_capacity is not None:
-        if cache_capacity % STICK != 0:
-            return (
-                f"cache_capacity={cache_capacity} must be a multiple of {STICK}; "
-                "pad the cache allocation to a stick boundary"
-            )
         q_kv_offset = seqlen_kv - seqlen_q
-        buffer_width = _required_width(seqlen_q, window_size, q_block, q_kv_offset)
+        buffer_origin = max(0, seqlen_kv - cache_capacity)
+        buffer_width = _required_width(
+            seqlen_q, window_size, q_block, q_kv_offset, buffer_origin
+        )
         if cache_capacity < buffer_width:
             return (
                 f"cache_capacity={cache_capacity} is narrower than the "
@@ -355,19 +377,20 @@ def rejection_reason(
         # any single block. A multi-block plan's EARLIEST block can still
         # reach further back than the buffer's oldest resident row, because
         # buffer_origin is fixed by the cache's total span while later
-        # blocks' windows start later. window_origin is monotonic in qi
-        # (first_coord grows with q_start, floor_stick preserves order), so
-        # the earliest block (qi=0) is the only one that can fail this and
-        # checking it is sufficient. Uncaught, this surfaces later as a
-        # negative read_start -- not silent, but from a less specific error
-        # site than here.
-        buffer_origin = max(0, seqlen_kv - cache_capacity)
-        earliest_window_origin = max(0, _floor_stick(q_kv_offset - window_size + 1))
-        if earliest_window_origin < buffer_origin:
+        # blocks' windows start later. The unfloored window start is
+        # monotonic in qi (first_coord grows with q_start), so the earliest
+        # block (qi=0) is the only one that can fail this and checking it is
+        # sufficient. Uncaught, this surfaces later as a negative read_start
+        # -- not silent, but from a less specific error site than here.
+        # Compared unfloored, matching read_start's physical-space floor: a
+        # floored comparison here could pass while the floor still lands
+        # negative (flooring only ever moves a value down).
+        earliest_window_start = max(0, q_kv_offset - window_size + 1)
+        if earliest_window_start < buffer_origin:
             return (
                 f"cache_capacity={cache_capacity} does not reach far enough back "
                 f"for this {seqlen_q}-row query: the earliest block needs logical "
-                f"column {earliest_window_origin}, but the buffer's oldest "
+                f"column {earliest_window_start}, but the buffer's oldest "
                 f"resident row is {buffer_origin}"
             )
 
@@ -398,7 +421,10 @@ def plan_sliding_window(
         cache_capacity = seqlen_kv
 
     q_kv_offset = seqlen_kv - seqlen_q
-    buffer_width = _required_width(seqlen_q, window_size, q_block, q_kv_offset)
+    buffer_origin = max(0, seqlen_kv - cache_capacity)
+    buffer_width = _required_width(
+        seqlen_q, window_size, q_block, q_kv_offset, buffer_origin
+    )
 
     return SlidingWindowPlan(
         seqlen_q=seqlen_q,

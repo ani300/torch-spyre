@@ -842,21 +842,25 @@ def sliding_window_attention(  # type: ignore[empty-body]
     ``spyre::kv_window``'s docstring for the row-order precondition that
     geometry requires of the caller).
 
-    ``cache_seqlen`` must still be a multiple of 64 today (see
-    ``rejection_reason``) -- for a rolled buffer this accepts only the
-    logical positions that are already stick-aligned, not arbitrary token
-    counts. Not yet closed: doing so needs ``read_start`` to floor in
-    physical rather than logical coordinates (see ``SlidingWindowPlan.
-    read_start``) plus a mask for the warmup tail.
+    ``cache_seqlen`` need NOT be a multiple of 64 -- it is a token count, not
+    a memory offset, so a rolled buffer accepts any logical position, not
+    just already-stick-aligned ones (only ``Lk`` itself must stay
+    stick-aligned; see ``rejection_reason``). ``read_start`` floors in
+    physical, not logical, coordinates to make this exact for a rolled
+    buffer (see ``SlidingWindowPlan.read_start``), and
+    ``spyre::window_band_mask`` masks any column whose logical position runs
+    past ``cache_seqlen`` -- the warmup tail a non-aligned position can now
+    expose.
 
     The allocation ``Lk`` must hold at least one buffer's worth of rows: the
     op needs ``window_size`` for decode, or ``window_size + q_block`` for a
     multi-row query block (rows within a block have staggered windows), for
     the ``Lk`` it is actually given -- ``rejection_reason`` names the exact
-    row count when a passed allocation is too narrow. Rows past
-    ``cache_seqlen`` in a still-filling cache are never read by any block
-    today (guaranteed by the existing stick-alignment requirement -- see
-    ``check_cache_geometry``'s docstring), so they may be uninitialized.
+    row count when a passed allocation is too narrow. Rows at or past
+    ``cache_seqlen`` in a still-filling cache may be read (and masked) by a
+    block whose buffer overshoots the written prefix, so they must still be
+    finite -- zero-fill the allocation; an additive ``-inf`` mask cannot
+    rescue a ``NaN`` score.
 
     MUST be called under torch.compile(backend="inductor") on the spyre
     device — see spyre_sliding_window_attention in decompositions.py for the
@@ -891,6 +895,7 @@ def window_band_mask(
     is_causal: bool,
     dtype: torch.dtype,
     device: torch.device,
+    cache_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Additive band over one Q block's KV window.
@@ -912,7 +917,21 @@ def window_band_mask(
 
     Takes ``read_start`` and ``q_row_origin`` -- an origin and an extent --
     rather than a block index and the sequence lengths, so the op knows nothing
-    about how the caller blocks the query.
+    about how the caller blocks the query. ``read_start`` here is logical
+    (``SlidingWindowPlan.read_start_logical``), not buffer-relative -- see
+    the caller in decompositions.py.
+
+    ``cache_seqlen``, when given, additionally masks column ``read_start + j``
+    whenever its logical position is ``>= cache_seqlen`` -- the unwritten tail
+    of a still-filling cache (``seqlen_kv`` need not be stick-aligned, so the
+    buffer can physically extend past it; see ``rejection_reason``'s
+    docstring). A no-op when every column is already written: inert for a
+    rolled or exactly-full cache, and for any block whose buffer happens to
+    stay inside ``cache_seqlen``. Optional and defaulting to None so an
+    existing caller -- passing only what the plan always computed -- is
+    unaffected. Precondition: rows at or past ``cache_seqlen`` must still hold
+    finite values (zero-filled) -- an additive ``-inf`` mask cannot rescue a
+    ``NaN`` score.
 
     Built entirely on CPU so the in-place ops stay opaque to torch.compile,
     matching spyre.causal_mask's rationale.
@@ -924,6 +943,8 @@ def window_band_mask(
         allowed = (delta >= 0) & (delta < window_size)
     else:
         allowed = delta.abs() < window_size
+    if cache_seqlen is not None:
+        allowed = allowed & (column.unsqueeze(0) < cache_seqlen)
     mask_cpu = torch.zeros(allowed.shape, dtype=dtype, device="cpu")
     mask_cpu.masked_fill_(~allowed, float("-inf"))
     return mask_cpu.unsqueeze(0).unsqueeze(0).to(device=device)
@@ -939,6 +960,7 @@ def _(
     is_causal: bool,
     dtype: torch.dtype,
     device: torch.device,
+    cache_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
     return torch.empty(1, 1, q_block, buffer_width, dtype=dtype, device=device)
 
