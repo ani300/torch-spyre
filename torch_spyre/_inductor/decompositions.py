@@ -424,7 +424,8 @@ def spyre__sdpa_overrideable(
     q_block_size = 64
     num_kv_blocks = (max_seqlen_kv + kv_block_size - 1) // kv_block_size
 
-    output = torch.zeros_like(query)
+    with spyre_hint(named_dims=["_b", "_h", "max_seqlen_q", "head_dim"]):
+        output = torch.zeros_like(query)
 
     # FIXME: create a sparse M tensor via reduction
     M_reduced = torch.full(
@@ -433,7 +434,8 @@ def spyre__sdpa_overrideable(
         device=query.device,
         dtype=query.dtype,
     )
-    M = M_reduced.amax(dim=-1)  # batch_size, num_heads, max_seqlen_q sparse
+    with spyre_hint(named_dims=["_b", "_h", "max_seqlen_q"]):
+        M = M_reduced.amax(dim=-1)  # batch_size, num_heads, max_seqlen_q sparse
 
     # FIXME: create a sparse denominator tensor via reduction
     denominator_reduced = torch.zeros(
@@ -441,9 +443,10 @@ def spyre__sdpa_overrideable(
         device=query.device,
         dtype=query.dtype,
     )
-    denominator = denominator_reduced.amax(
-        dim=-1
-    )  # batch_size, num_heads, max_seqlen_q sparse
+    with spyre_hint(named_dims=["_b", "_h", "max_seqlen_q"]):
+        denominator = denominator_reduced.amax(
+            dim=-1
+        )  # batch_size, num_heads, max_seqlen_q sparse
 
     # Precompute the causal additive mask once before entering the tiled loops.
     # Shape [1, 1, max_seqlen_q, max_seqlen_kv]: 0.0 = keep, -inf = masked.
@@ -456,6 +459,22 @@ def spyre__sdpa_overrideable(
         causal_mask = torch.ops.spyre.causal_mask(
             max_seqlen_q, max_seqlen_kv, query.dtype, query.device
         )
+
+    # Seed named dimensions on the accumulators (above) and the scaled query so
+    # the max_seqlen_q tiling hint below has a propagated named dim to bind to.
+    # Without a seed the spyre_hint(tiles={"max_seqlen_q": ...}) scope is a
+    # no-op: assign_dim_hints drops any tile whose named dim never propagated.
+    # The names zip positionally to the query layout
+    # [batch_size, num_heads, max_seqlen_q, head_dim]; from this producer the
+    # names flow automatically to every downstream pointwise/reduction op.
+    #
+    # The batch and head dims are deliberately named "_b"/"_h" -- placeholder
+    # names that do NOT match the tiles={"batch_size": ...} / {"num_heads": ...}
+    # contexts below, so only the max_seqlen_q tile activates for now. Renaming
+    # these to "batch_size"/"num_heads" is all it takes to light up those tiles
+    # in a follow-up.
+    with spyre_hint(named_dims=["_b", "_h", "max_seqlen_q", "head_dim"]):
+        q_scaled = query * scaling_factor
 
     with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
         with spyre_hint(tiles={"num_heads": max(1, num_heads // 4)}):
@@ -476,13 +495,30 @@ def spyre__sdpa_overrideable(
                             ..., start:end, :
                         ]  # batch_size, num_heads, blk_len, head_dim
 
-                        scaled_keys = k_blk * scaling_factor
+                        # The K/V slices are produced in-graph, so they carry no
+                        # named dims and stay untiled -- forming a restickify
+                        # boundary against the tiled matmuls that consume them.
+                        # Name each slice's first consuming op so the per-chunk
+                        # key extent ("blk_len") propagates and the producers tile
+                        # with their consumers.
+                        with spyre_hint(named_dims=["_b", "_h", "blk_len", "head_dim"]):
+                            scaled_keys = k_blk * scaling_factor
+                        with spyre_hint(named_dims=["_b", "_h", "blk_len", "head_dim"]):
+                            v_blk = v_blk * 1.0
                         keys_T = scaled_keys.transpose(
                             -1, -2
                         )  # batch_size, num_heads, head_dim, blk_len
-                        scores = torch.matmul(
-                            query * scaling_factor, keys_T
-                        )  # batch_size, num_heads, max_seqlen_q, blk_len
+                        # A matmul output inherits no named dims from its inputs,
+                        # so naming it explicitly is what keeps the op inside the
+                        # max_seqlen_q tile region (otherwise it becomes an
+                        # untiled restickify boundary). "blk_len" is the per-chunk
+                        # key extent -- the scores' last axis.
+                        with spyre_hint(
+                            named_dims=["_b", "_h", "max_seqlen_q", "blk_len"]
+                        ):
+                            scores = torch.matmul(
+                                q_scaled, keys_T
+                            )  # batch_size, num_heads, max_seqlen_q, blk_len
 
                         if is_causal:
                             scores = scores + causal_mask[..., :, start:end]
@@ -508,9 +544,12 @@ def spyre__sdpa_overrideable(
                             denominator * correction + exp_scores.sum(dim=-1),
                             denominator,
                         )  # batch_size, num_heads, max_seqlen_q sparse
+                        with spyre_hint(
+                            named_dims=["_b", "_h", "max_seqlen_q", "head_dim"]
+                        ):
+                            weighted = torch.matmul(exp_scores, v_blk)
                         output = torch.ops.spyre.copy_f(
-                            output * correction.unsqueeze(-1)
-                            + torch.matmul(exp_scores, v_blk),
+                            output * correction.unsqueeze(-1) + weighted,
                             output,
                         )  # batch_size, num_heads, max_seqlen_q, head_dim
 
