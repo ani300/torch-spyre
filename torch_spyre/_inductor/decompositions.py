@@ -416,17 +416,23 @@ def spyre__sdpa_overrideable(
         raise Unsupported("Attention dropout not implemented for Spyre")
 
     # The named_dims seeds below zip names positionally to each seeded op's
-    # PHYSICAL output layout, which a pointwise/zeros_like op inherits from its
-    # input. SDPA is routinely called with q/k/v as transpose(1, 2) views of a
-    # [B, S, H, D] tensor, so query's physical layout is [B, S, H, D] while its
-    # logical shape is [B, H, S, D]. Seeding ["_b","_h","max_seqlen_q",...] on
-    # such a buffer binds "_h" to S and "max_seqlen_q" to H -- the tile then
-    # splits the head axis instead of the query axis and the result is wrong.
-    # Materialize a logical-contiguous copy up front so physical order matches
-    # the logical [B, H, S, D] order the seeds assume.
+    # PHYSICAL output layout. host_coordinates derives the coord expressions
+    # from the op's physical STRIDES, so the tiler's loop-var -> logical-dim
+    # mapping follows physical stride order, not logical dim order. SDPA is
+    # routinely called with q/k/v as transpose(1, 2) views of a [B, S, H, D]
+    # tensor, so query's physical layout is [B, S, H, D] while its logical shape
+    # is [B, H, S, D]. Seeding ["_b","_h","max_seqlen_q",...] on such a buffer
+    # then maps the tile onto the head axis instead of the query axis and the
+    # result is wrong.
+    #
+    # Normalize the QUERY wholesale: query.contiguous() is bounded (same
+    # footprint as the `output` buffer we allocate below) and makes every
+    # query-derived seed (q_scaled, zeros_like(query), the final permute) land
+    # on logical [B, H, S, D] order. We do NOT contiguify key/value wholesale --
+    # that materializes a full [B, H, S_kv, D] copy that OOMs on long KV. K/V are
+    # instead normalized PER BLOCK inside the loop (keys_T's .contiguous() and
+    # the per-block v_blk.contiguous()), each a cheap [B, H, 64, D] copy.
     query = query.contiguous()
-    key = key.contiguous()
-    value = value.contiguous()
 
     expansion = num_heads // num_kvheads
     if expansion != 1:
@@ -514,8 +520,20 @@ def spyre__sdpa_overrideable(
                         # with their consumers.
                         with spyre_hint(named_dims=["_b", "_h", "blk_len", "head_dim"]):
                             scaled_keys = k_blk * scaling_factor
+                        # v_blk feeds the second matmul directly (line below), so
+                        # unlike scaled_keys (re-normalized by keys_T.contiguous())
+                        # it has no downstream .contiguous() to fix its layout. For
+                        # a transposed value view the slice's physical strides stay
+                        # transposed (a pointwise op preserves its input's stride
+                        # order via pick_loop_order), which scrambles the tiled
+                        # matmul. .contiguous() lowers to aten.clone(contiguous),
+                        # which the Spyre clone override freezes to contiguous
+                        # strides -- normalizing this [B, H, 64, D] slice per block
+                        # without a full-tensor value.contiguous() (an OOM on long
+                        # KV). The named_dims seed lands on the resulting clone, so
+                        # blk_len still propagates.
                         with spyre_hint(named_dims=["_b", "_h", "blk_len", "head_dim"]):
-                            v_blk = v_blk * 1.0
+                            v_blk = v_blk.contiguous()
                         # .contiguous() materializes the transposed keys so the
                         # scores matmul sees a clean single-contraction-dim input.
                         # Without it the backend scheduler aborts with
