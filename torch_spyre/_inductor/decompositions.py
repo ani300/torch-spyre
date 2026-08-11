@@ -553,8 +553,14 @@ def spyre_kv_window(
     read_start: int,
     buffer_width: int,
     num_heads: int,
+    cache_seqlen: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One Q block's KV window: k_win [B, Hq, E, W] transposed, v_win [B, Hq, W, E]."""
+    """One Q block's KV window: k_win [B, Hq, E, W] transposed, v_win [B, Hq, W, E].
+
+    ``cache_seqlen`` only sharpens ``check_window_read``'s rejection (a
+    still-filling cache's unwritten tail); the slice below is read_start and
+    buffer_width either way.
+    """
     reason = check_window_read(
         read_start=read_start,
         buffer_width=buffer_width,
@@ -563,6 +569,7 @@ def spyre_kv_window(
         num_kv_heads=key.size(1),
         key_shape=tuple(key.shape),
         value_shape=tuple(value.shape),
+        cache_seqlen=cache_seqlen,
     )
     if reason is not None:
         raise Unsupported(f"kv_window: {reason}")
@@ -610,7 +617,7 @@ def _windowed_attention(
 
         read_start = plan.read_start(block_index)
         k_win, v_win = torch.ops.spyre.kv_window(
-            key, value, read_start, buffer_width, num_heads
+            key, value, read_start, buffer_width, num_heads, plan.seqlen_kv
         )
         fully_attended = plan.block_is_fully_attended(block_index)
         band = (

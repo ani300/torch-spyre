@@ -457,6 +457,28 @@ class TestRejection:
             **{**ok, "value_shape": mismatched}
         )
 
+    def test_a_hand_built_read_into_the_unwritten_tail_is_rejected(self):
+        # cache_seqlen=64 < cache_capacity=256: only rows [0, 64) are written.
+        # Before cache_seqlen was threaded into kv_window, a caller bypassing
+        # the plan could read [0, 128) here -- inside cache_capacity, so the
+        # existing bound passed it -- and silently read 64 uninitialized rows.
+        shape = (BATCH, HEADS, 256, HEAD_DIM)
+        ok = dict(
+            read_start=0,
+            buffer_width=128,
+            cache_capacity=256,
+            num_heads=8,
+            num_kv_heads=8,
+            key_shape=shape,
+            value_shape=shape,
+        )
+        reason = check_window_read(**ok, cache_seqlen=64)
+        assert reason is not None and "unwritten tail" in reason
+        assert check_window_read(**ok, cache_seqlen=128) is None  # reaches exactly
+        assert check_window_read(**ok, cache_seqlen=256) is None  # exactly full
+        assert check_window_read(**ok, cache_seqlen=5000) is None  # rolled, past cap
+        assert check_window_read(**ok) is None  # omitted: unchanged
+
 
 # --------------------------------------------------------------- 2. algorithm
 

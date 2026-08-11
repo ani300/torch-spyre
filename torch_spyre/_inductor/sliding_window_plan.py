@@ -81,9 +81,9 @@ class SlidingWindowPlan:
     def buffer_origin(self) -> int:
         """Logical position of the buffer's physical row 0.
 
-        0 whenever ``seqlen_kv <= cache_capacity`` -- every shape supported
-        today, where the cache fits inside its own allocation and physical
-        and logical coordinates coincide. Once ``seqlen_kv`` exceeds
+        0 whenever ``seqlen_kv <= cache_capacity`` -- the cache fits inside
+        its own allocation and physical and logical coordinates coincide.
+        Once ``seqlen_kv`` exceeds
         ``cache_capacity`` -- a rolled buffer that has filled and is sliding
         forward -- this is where its oldest resident row sits, on the
         assumption the buffer holds exactly the most recent
@@ -147,7 +147,8 @@ class SlidingWindowPlan:
         ``window_band_mask`` needs this, not ``read_start``: its row side
         (``q_row_origin``) is logical, so the column side must be too for
         ``delta = row - column`` to mean anything. A no-op whenever
-        ``buffer_origin`` is 0 -- every shape supported today.
+        ``buffer_origin`` is 0 -- true for a still-filling or exactly-full
+        cache, false for a rolled buffer that has outgrown its allocation.
         """
         return self.read_start(qi) + self.buffer_origin
 
@@ -160,6 +161,7 @@ def check_window_read(
     num_kv_heads: int,
     key_shape: tuple[int, ...],
     value_shape: tuple[int, ...],
+    cache_seqlen: int | None = None,
 ) -> str | None:
     """Why this read is invalid, or None.
 
@@ -171,13 +173,20 @@ def check_window_read(
     ``cache_capacity`` is what both call sites have always passed here --
     ``key.size(2)``, the rows physically allocated -- so the bound below was
     already a capacity bound in practice; this only makes the parameter say
-    so. There is no ``cache_seqlen`` parameter: ``kv_window`` never receives
-    the logical position, only ``read_start``/``buffer_width`` computed from
-    it by the plan, so nothing here can yet distinguish "runs past the
-    allocation" from "runs into the allocation's unfilled tail" -- the
-    warmup case. That needs ``cache_seqlen`` threaded into ``kv_window``
-    itself, which ``check_cache_geometry``'s equality requirement makes
-    unreachable today regardless.
+    so.
+
+    ``cache_seqlen``, when given, is the logical position -- what
+    ``check_cache_geometry`` validated at the op boundary -- and lets this
+    function tell "runs past the allocation" (the ``cache_capacity`` bound
+    above) apart from "runs into the allocation's unfilled tail" (below): a
+    still-filling cache (``cache_seqlen < cache_capacity``) leaves
+    ``[cache_seqlen, cache_capacity)`` unwritten, and a caller building its
+    own ``read_start``/``buffer_width`` rather than going through the plan
+    could otherwise read into it undetected -- the plan itself never does,
+    by construction (see ``check_cache_geometry``'s docstring). Optional and
+    defaulting to None so a caller with no logical position to give --
+    exactly the "equal" ordering, before ``cache_seqlen`` existed -- sees no
+    new rejection.
     """
     if read_start < 0:
         return f"read_start={read_start} is negative"
@@ -187,6 +196,15 @@ def check_window_read(
         return (
             f"window [{read_start}, {read_start + buffer_width}) runs past the "
             f"cache (cache_capacity={cache_capacity})"
+        )
+    if cache_seqlen is not None and read_start + buffer_width > cache_seqlen:
+        # Unreachable once cache_seqlen >= cache_capacity: the bound above
+        # already caught read_start + buffer_width > cache_capacity <=
+        # cache_seqlen. Only fires for the still-filling case.
+        return (
+            f"window [{read_start}, {read_start + buffer_width}) runs into "
+            f"the cache's unwritten tail (cache_seqlen={cache_seqlen} of "
+            f"cache_capacity={cache_capacity} rows written)"
         )
     if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
         return (

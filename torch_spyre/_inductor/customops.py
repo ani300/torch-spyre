@@ -830,12 +830,33 @@ def sliding_window_attention(  # type: ignore[empty-body]
     ``cache_seqlen`` is how many tokens the cache has seen -- HF's
     ``cumulative_length``, vLLM's ``seq_lens`` -- as distinct from ``Lk``,
     which counts the rows it allocates. The two are the same number only for
-    a full-length cache that is exactly full; a compact rolled buffer holds
-    W rows at position 5000, and a warm one holds 100 tokens in a 4096-row
-    allocation. Defaults to ``Lk``, which is what the placement assumed
-    before the parameter existed, so an existing caller is unaffected. A
-    value that differs from ``Lk`` raises today (see check_cache_geometry) --
-    the placement still reads Lk as both, and misplacing a window is silent.
+    a full-length cache that is exactly full. Defaults to ``Lk``, which is
+    what the placement assumed before the parameter existed, so an existing
+    caller is unaffected.
+
+    Three orderings against ``Lk`` are accepted (``check_cache_geometry``):
+    equal (the default, a full-length cache that is exactly full);
+    ``cache_seqlen < Lk`` (still filling its allocation, left-aligned, the
+    unwritten tail at ``[cache_seqlen, Lk)``); ``cache_seqlen > Lk`` (a
+    compact buffer that has filled and is sliding forward -- see
+    ``spyre::kv_window``'s docstring for the row-order precondition that
+    geometry requires of the caller).
+
+    ``cache_seqlen`` must still be a multiple of 64 today (see
+    ``rejection_reason``) -- for a rolled buffer this accepts only the
+    logical positions that are already stick-aligned, not arbitrary token
+    counts. Not yet closed: doing so needs ``read_start`` to floor in
+    physical rather than logical coordinates (see ``SlidingWindowPlan.
+    read_start``) plus a mask for the warmup tail.
+
+    The allocation ``Lk`` must hold at least one buffer's worth of rows: the
+    op needs ``window_size`` for decode, or ``window_size + q_block`` for a
+    multi-row query block (rows within a block have staggered windows), for
+    the ``Lk`` it is actually given -- ``rejection_reason`` names the exact
+    row count when a passed allocation is too narrow. Rows past
+    ``cache_seqlen`` in a still-filling cache are never read by any block
+    today (guaranteed by the existing stick-alignment requirement -- see
+    ``check_cache_geometry``'s docstring), so they may be uninitialized.
 
     MUST be called under torch.compile(backend="inductor") on the spyre
     device — see spyre_sliding_window_attention in decompositions.py for the
@@ -929,6 +950,7 @@ def kv_window(  # type: ignore[empty-body]
     read_start: int,
     buffer_width: int,
     num_heads: int,
+    cache_seqlen: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Read one Q block's slice of the KV cache.
@@ -947,6 +969,15 @@ def kv_window(  # type: ignore[empty-body]
 
     ``read_start`` comes from SlidingWindowPlan. Passing it in, rather than a
     block index, keeps this op ignorant of how the query is blocked.
+
+    ``cache_seqlen``, when given, is the cache's logical position -- see
+    ``spyre::sliding_window_attention``'s docstring. Used only to validate
+    that this read does not reach into a still-filling cache's unwritten
+    tail (``check_window_read``); the slice itself is unaffected, since the
+    plan never asks for a read that needs the distinction. What lets a
+    caller that bypasses the plan walk into that tail undetected. Optional
+    and defaulting to None so an existing caller -- passing only what the
+    plan always computed -- is unaffected.
 
     **Precondition when key/value is a compact buffer narrower than the
     cache's true length** (``SlidingWindowPlan.buffer_origin != 0``): rows
@@ -979,6 +1010,7 @@ def _(
     read_start: int,
     buffer_width: int,
     num_heads: int,
+    cache_seqlen: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from .sliding_window_plan import check_window_read
 
@@ -990,6 +1022,7 @@ def _(
         num_kv_heads=key.size(1),
         key_shape=tuple(key.shape),
         value_shape=tuple(value.shape),
+        cache_seqlen=cache_seqlen,
     )
     if reason is not None:
         raise Unsupported(f"kv_window: {reason}")
