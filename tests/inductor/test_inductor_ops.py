@@ -3155,6 +3155,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                     True,
                 ),
+                "mha_prefill_kv_tail": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 130, 32, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 130, 32, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    None,
+                    False,
+                    False,
+                ),
+                "mha_prefill_kv_tail_causal": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 130, 32, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 130, 32, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    None,
+                    True,
+                    False,
+                ),
                 "mha_decode": (
                     cached_randn(
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
