@@ -842,6 +842,11 @@ def sliding_window_attention(  # type: ignore[empty-body]
     forward -- see ``spyre::kv_window``'s docstring for the row-order
     precondition that geometry requires of the caller).
 
+    **This op only reads.** Keeping a rolled cache in the time order the
+    third case requires is the caller's job, is out of scope here, and is
+    NOT demonstrated to work on Spyre -- ``aten::roll`` has no lowering on
+    this backend. See ``spyre::kv_window``'s docstring for the detail.
+
     ``cache_seqlen`` need NOT be a multiple of 64 -- it is a token count, not
     a memory offset, so a rolled buffer accepts any logical position, not
     just already-stick-aligned ones (only ``Lk`` itself must stay
@@ -1005,8 +1010,21 @@ def kv_window(  # type: ignore[empty-body]
     ring/modulo indexing. ``read_start``'s buffer-relative arithmetic
     (``SlidingWindowPlan.buffer_origin``) assumes this; nothing here checks
     it, since kv_window only ever sees offsets and never the tokens
-    themselves. Maintaining it -- rolling the buffer forward as new tokens
-    arrive -- is a write-side operation with no owner in torch-spyre today.
+    themselves.
+
+    **Maintaining that ordering is out of scope for this op and unproven on
+    this backend.** HF's ``StaticSlidingWindowLayer`` keeps it with
+    ``keys.roll(-1, dims=-2)`` followed by an in-place overwrite of the last
+    row. On Spyre only the second half is known to work: ``aten.copy_`` has
+    a lowering, but ``aten::roll`` has no lowering, no Spyre decomposition,
+    and no CPU fallback registered anywhere in torch-spyre. It would have to
+    survive PyTorch's generic decomposition into narrow/cat -- both of which
+    do lower -- and the ``cat`` route is specifically suspect here: cat-ing
+    window slices on device is already known to zero the leading slots (see
+    ``TestKVWindowOp``'s docstring in tests/inductor/test_kv_window.py).
+    Nothing in this PR exercises a device-side roll, so a caller wiring up a
+    rolled cache should verify the write path independently rather than
+    assume the read path's correctness carries over.
 
     GQA expansion to num_heads happens here, applied to the window slice rather
     than to the full-length cache (see the decomposition for why).
