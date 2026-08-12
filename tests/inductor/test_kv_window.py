@@ -563,7 +563,26 @@ class TestRejection:
         assert "degenerate" in rejection_reason(1, 0, 64, True, 1, cache_capacity=256)
         assert "degenerate" in rejection_reason(1, -5, 64, True, 1, cache_capacity=256)
         assert rejection_reason(1, 256, 64, True, 1, cache_capacity=0) is not None
-        assert rejection_reason(1, 256, 64, True, 1, cache_capacity=-64) is not None
+        # A negative capacity clears the stick check (-64 % 64 == 0), so the
+        # message has to name cache_capacity rather than fall through.
+        assert "cache_capacity=0" in rejection_reason(
+            1, 256, 64, True, 1, cache_capacity=0
+        )
+        assert "cache_capacity=-64" in rejection_reason(
+            1, 256, 64, True, 1, cache_capacity=-64
+        )
+
+    def test_an_explicit_origin_is_checked_without_a_capacity(self):
+        # Regression: the capacity checks were guarded on cache_capacity being
+        # passed, so an explicit buffer_origin skipped the reach check and
+        # planned a negative read_start.
+        assert "does not reach far enough back" in rejection_reason(
+            1, 256, 64, True, 1, buffer_origin=200
+        )
+        assert plan_sliding_window(1, 256, 64, q_block=1, buffer_origin=200) is None
+        # The largest origin the earliest block still reaches: its window
+        # starts at 256 - 1 - 64 + 1 = 192.
+        assert rejection_reason(1, 256, 64, True, 1, buffer_origin=192) is None
 
     def test_a_hand_built_read_is_validated(self):
         # The op takes its placement as plain ints, so a caller that does not

@@ -259,17 +259,21 @@ def rejection_reason(
     Single source of truth: ``plan_sliding_window`` decides with it and the op
     raises with it, so the message names what actually failed.
 
-    ``cache_capacity`` defaults to ``seqlen_kv``. When given it enables two
-    further checks: the capacity must fit at least one buffer, and it must
-    reach far enough back for the *earliest* block of a multi-block plan --
-    which a capacity clearing the first check can still fail.
+    ``cache_capacity`` defaults to ``seqlen_kv``, and every check runs against
+    that effective value rather than only against a capacity the caller
+    passed: the allocation must be positive and stick-aligned, must fit at
+    least one buffer, and must reach far enough back for the *earliest* block
+    of a multi-block plan -- which an allocation clearing the fit check can
+    still fail.
 
     ``buffer_origin`` defaults to ``default_buffer_origin``. It is bounded
     below by that default (a smaller one would place the newest token past
-    the end of the buffer) and above by ``seqlen_kv`` (a larger one leaves no
-    written row at all). It need NOT be stick-aligned: ``read_start`` floors
-    after converting to physical coordinates, so the resulting offset lands
-    on a stick whatever the origin is.
+    the end of the buffer), above by ``seqlen_kv`` (a larger one leaves no
+    written row at all), and above again by the earliest block's window start
+    (a larger one would floor ``read_start`` below physical row 0). It need
+    NOT be stick-aligned: ``read_start`` floors after converting to physical
+    coordinates, so the resulting offset lands on a stick whatever the origin
+    is.
 
     Only the physical allocation needs stick alignment. ``seqlen_kv`` is a
     token count, not a memory offset (see ``read_start`` on flooring in
@@ -293,6 +297,11 @@ def rejection_reason(
         return f"seqlen_q={seqlen_q} exceeds seqlen_kv={seqlen_kv}"
 
     effective_capacity = seqlen_kv if cache_capacity is None else cache_capacity
+    if effective_capacity <= 0:
+        # Before the stick check, which a negative capacity clears: -64 % 64 is
+        # 0 in Python. Without this the fall-through blames buffer_origin, a
+        # parameter the caller need not have passed.
+        return f"degenerate cache_capacity={effective_capacity}, must be positive"
     if effective_capacity % STICK != 0:
         return (
             f"cache_capacity={effective_capacity} must be a multiple of "
@@ -317,30 +326,37 @@ def rejection_reason(
             f"so the buffer holds no written row"
         )
 
-    if cache_capacity is not None:
-        q_kv_offset = seqlen_kv - seqlen_q
-        buffer_width = _required_width(
-            seqlen_q, window_size, q_block, q_kv_offset, buffer_origin
+    # Against effective_capacity, so an omitted cache_capacity is held to the
+    # same rules with seqlen_kv standing in as the allocation. Neither can fire
+    # when capacity and origin are BOTH defaulted: buffer_width is bounded by
+    # seqlen_kv there (physical_end <= seqlen_kv, physical_start >= 0, and
+    # ceil_stick is a no-op on the stick-aligned seqlen_kv checked above) and
+    # buffer_origin is 0, so pre-existing callers are unaffected. Guarding
+    # these on cache_capacity instead let an explicit buffer_origin skip the
+    # reach check and produce a plan whose read_start is negative.
+    q_kv_offset = seqlen_kv - seqlen_q
+    buffer_width = _required_width(
+        seqlen_q, window_size, q_block, q_kv_offset, buffer_origin
+    )
+    if effective_capacity < buffer_width:
+        return (
+            f"cache_capacity={effective_capacity} is narrower than the "
+            f"{buffer_width}-row buffer this window needs"
         )
-        if cache_capacity < buffer_width:
-            return (
-                f"cache_capacity={cache_capacity} is narrower than the "
-                f"{buffer_width}-row buffer this window needs"
-            )
-        # buffer_origin is fixed by the cache's total span while later blocks'
-        # windows start later, so the EARLIEST block is the one that can reach
-        # further back than the buffer holds -- and the unfloored window start
-        # is monotonic in qi, so checking qi=0 is sufficient. Compared
-        # unfloored to match read_start's physical-space floor: a floored
-        # comparison could pass while the floor still lands negative.
-        earliest_window_start = max(0, q_kv_offset - window_size + 1)
-        if earliest_window_start < buffer_origin:
-            return (
-                f"cache_capacity={cache_capacity} does not reach far enough back "
-                f"for this {seqlen_q}-row query: the earliest block needs logical "
-                f"column {earliest_window_start}, but the buffer's oldest "
-                f"resident row is {buffer_origin}"
-            )
+    # buffer_origin is fixed by the cache's total span while later blocks'
+    # windows start later, so the EARLIEST block is the one that can reach
+    # further back than the buffer holds -- and the unfloored window start
+    # is monotonic in qi, so checking qi=0 is sufficient. Compared
+    # unfloored to match read_start's physical-space floor: a floored
+    # comparison could pass while the floor still lands negative.
+    earliest_window_start = max(0, q_kv_offset - window_size + 1)
+    if earliest_window_start < buffer_origin:
+        return (
+            f"cache_capacity={effective_capacity} does not reach far enough back "
+            f"for this {seqlen_q}-row query: the earliest block needs logical "
+            f"column {earliest_window_start}, but the buffer's oldest "
+            f"resident row is {buffer_origin}"
+        )
 
     return None
 
