@@ -819,42 +819,25 @@ def sliding_window_attention(  # type: ignore[empty-body]
     """
     Sliding-window attention entry point.
 
-    query: [B, Hq, Lq, D]; key/value: [B, Hkv, Lk, D] (GQA expansion handled
-    internally when Hq != Hkv). window_size is a compile-time constant (not a
-    data-dependent tensor), matching flash-attention's window_size_left
-    convention. Query row r (KV-cache coordinate max(0, Lk - Lq) + i) may
-    attend to key position c iff 0 <= r - c < window_size (causal) or
-    abs(r - c) < window_size (bidirectional, not yet implemented --
-    is_causal=False raises Unsupported).
+    query: [B, Hq, Lq, D]; key/value: [B, Hkv, Lk, D], GQA expanded
+    internally. Query row i, at cache coordinate ``cache_seqlen - Lq + i``,
+    attends column c iff ``0 <= coordinate - c < window_size``.
+    ``is_causal=False`` raises Unsupported.
 
-    ``cache_seqlen`` is how many tokens the cache has seen -- HF's
-    ``cumulative_length``, vLLM's ``seq_lens`` -- as distinct from ``Lk``,
-    the rows it allocates. Defaults to ``Lk``. All three orderings are
-    accepted; ``SlidingWindowPlan``'s class docstring describes what each
-    means for placement. It need NOT be a multiple of 64 (only ``Lk`` must
-    be): it is a token count, not a memory offset.
+    ``cache_seqlen`` is how many tokens the cache has seen, as distinct from
+    ``Lk``, the rows it allocates. Defaults to ``Lk``; need not be a multiple
+    of 64. All three orderings against ``Lk`` are accepted -- see
+    ``SlidingWindowPlan`` for what each means for placement.
 
-    **Allocation contract:** ``Lk >= round_up_to_64(window_size + Lq - 1)``
-    for the ``Lq`` of *this* call -- HF's ``get_mask_sizes`` formula rounded
-    to a stick. Decode (``Lq=1``) therefore needs exactly ``window_size``,
-    matching ``StaticSlidingWindowLayer``; a prefill chunk needs the extra
-    ``Lq - 1`` because its earliest row still reaches ``window_size`` columns
-    back. Prefill long sequences in chunks sized to the allocation.
-    ``rejection_reason`` names the required row count when ``Lk`` is too
-    narrow.
-
-    **Zero-fill the allocation.** A block's buffer may overshoot the written
-    prefix; causal masking discards those scores, but the multiply still
-    happens, so the rows must hold finite values -- an additive ``-inf``
-    cannot rescue a ``NaN``.
-
-    **This op only reads.** Keeping a rolled cache in time order is the
-    caller's job and is not demonstrated to work on Spyre; see
-    ``spyre::kv_window``.
+    Allocation contract: ``Lk >= round_up_to_64(window_size + Lq - 1)`` for
+    the ``Lq`` of this call, so prefill long sequences in chunks;
+    ``rejection_reason`` names the required row count when ``Lk`` is short.
+    Zero-fill the allocation -- a buffer may overshoot the written prefix,
+    and though causal masking discards those scores the multiply still
+    happens, and an additive ``-inf`` cannot rescue a ``NaN``.
 
     MUST be called under torch.compile(backend="inductor") on the spyre
-    device — see spyre_sliding_window_attention in decompositions.py for the
-    real (windowed, block-skipping) Inductor lowering. This eager body is
+    device; the real lowering is in decompositions.py. This eager body is
     intentionally empty, matching spyre::exx2 / spyre::layernormscale.
     """
     pass
@@ -901,21 +884,16 @@ def window_band_mask(
       - bidirectional: abs(delta) < window_size
 
     The band removes what the buffer over-covers: the stagger between rows
-    inside the block, and the columns pulled in when a ragged first/last
-    window is shifted to stay inside the cache.
+    inside the block, and the columns a shifted ragged window drags in.
 
-    Takes ``read_start`` and ``q_row_origin`` -- an origin and an extent --
-    rather than a block index and the sequence lengths, so the op knows nothing
-    about how the caller blocks the query. ``read_start`` here is logical
-    (``SlidingWindowPlan.read_start_logical``), not buffer-relative -- see
-    the caller in decompositions.py.
+    ``read_start`` here is **logical** (``read_start_logical``), not
+    buffer-relative, since ``q_row_origin`` is logical and ``delta`` subtracts
+    the two.
 
-    No ``cache_seqlen`` term, deliberately: the rows this op is given satisfy
-    ``row < cache_seqlen`` by construction, so the causal ``delta >= 0``
-    already forces ``column < cache_seqlen`` and a separate term could never
-    disagree. It would become load-bearing only for a bidirectional window,
-    where ``abs(delta) < window_size`` admits ``column > row`` -- that mode
-    raises Unsupported today and must revisit this mask.
+    No ``cache_seqlen`` term, deliberately: rows satisfy ``row < cache_seqlen``
+    by construction, so causal ``delta >= 0`` already forces
+    ``column < cache_seqlen``. Only a bidirectional window, which raises
+    today, would need one.
 
     Built entirely on CPU so the in-place ops stay opaque to torch.compile,
     matching spyre.causal_mask's rationale.
@@ -959,46 +937,28 @@ def kv_window(  # type: ignore[empty-body]
 
     key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win) covering cache rows
     [read_start, read_start + buffer_width). k_win is [B, Hq, E, buffer_width],
-    already **transposed** -- that is the layout the scores matmul wants, and
-    doing it on the slice costs nothing.
+    already **transposed** -- the layout the scores matmul wants, free on a
+    slice. GQA expansion to num_heads happens here, on the slice rather than
+    on the full cache.
 
-    **One block per call.** The caller loops over Q blocks and reuses the same
-    window buffer, so the extra memory is buffer_width rows for any query
-    length rather than one buffer per block. That reuse is granted by the
-    memory planner rather than expressed by the graph -- the blocks are
-    independent of each other -- and it is granted today: the planned pool
-    grows by one window per unit of buffer_width, not by one per block.
+    One block per call; the memory planner reuses one window buffer across
+    them, so the cost is buffer_width rows for any query length.
+    ``read_start`` comes from SlidingWindowPlan, and ``check_window_read``
+    bounds it against the *allocation*, never the logical position -- a
+    still-filling read routinely runs past the written prefix, where causal
+    masking excludes the columns.
 
-    ``read_start`` comes from SlidingWindowPlan. Passing it in, rather than a
-    block index, keeps this op ignorant of how the query is blocked. It is
-    bounded against the *allocation* by ``check_window_read``, never against
-    the cache's logical position -- a still-filling cache's read routinely
-    extends past the written prefix, and causal masking excludes those
-    columns (see ``SlidingWindowPlan``).
-
-    **Precondition for a compact buffer** (``buffer_origin != 0``): rows must
-    stay contiguous and time-ordered, oldest at row 0, newest last. No
-    ring/modulo indexing. Nothing here checks it -- this op only ever sees
-    offsets, never tokens.
-
-    **Maintaining that order is out of scope and unproven on this backend.**
-    HF uses ``keys.roll(-1, dims=-2)`` plus an in-place overwrite; on Spyre
-    only ``aten.copy_`` is known to lower. ``aten::roll`` has no lowering, no
-    Spyre decomposition and no CPU fallback, so it would have to survive
-    PyTorch's generic decomposition into narrow/cat -- and the ``cat`` route
-    is suspect here (see ``TestKVWindowOp``). A caller wiring up a rolled
-    cache must verify the write path independently.
-
-    GQA expansion to num_heads happens here, applied to the window slice rather
-    than to the full-length cache (see the decomposition for why).
-
-    The mask that goes with this window is a separate op, spyre::window_band_mask
-    -- reading the cache and building a band have no arguments in common.
+    **Preconditions for a compact buffer** (``buffer_origin != 0``), neither
+    checked here since this op sees only offsets, never tokens: rows stay
+    contiguous and time-ordered, oldest at row 0, no ring/modulo indexing.
+    Maintaining that order is the caller's job and is unproven on this
+    backend -- ``aten::roll`` has no lowering, no Spyre decomposition and no
+    CPU fallback, and the narrow/cat route it would decompose to is suspect
+    (see ``TestKVWindowOp``).
 
     MUST be called under torch.compile(backend="inductor") on the spyre
-    device — this eager body is intentionally empty, matching
-    spyre::sliding_window_attention. The real logic is the
-    register_spyre_decomposition lowering in decompositions.py.
+    device; the real logic is the lowering in decompositions.py. This eager
+    body is intentionally empty.
     """
     pass
 
