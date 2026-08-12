@@ -439,7 +439,14 @@ def spyre__sdpa_overrideable(
         key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
 
-    kv_block_size = 64
+    # Fixed block size of 64 gave num_blocks = ceil(Skv/64), which climbs
+    # with sequence length -- 8k KV = 128 blocks, and block counts > 6 do
+    # not yet compile (PR #3672). Size the block at ~1/4 of the KV length
+    # instead, so the block *count* stays ~4 regardless of Skv (8k -> 2048,
+    # 4 blocks). Round up to a 64-element fp16 stick so every block stays
+    # stick-aligned; floor at 64 so short KV keeps the original small-block
+    # behavior (128 -> 64, unchanged).
+    kv_block_size = max(64, ((max_seqlen_kv + 3) // 4 + 63) // 64 * 64)
     q_block_size = 64
     num_kv_blocks = (max_seqlen_kv + kv_block_size - 1) // kv_block_size
 
