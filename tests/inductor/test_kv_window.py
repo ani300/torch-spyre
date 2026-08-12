@@ -46,6 +46,7 @@ from torch_spyre._inductor.sliding_window_plan import (
     STICK,
     SlidingWindowPlan,
     check_window_read,
+    default_buffer_origin,
     plan_sliding_window,
     query_blocking,
     rejection_reason,
@@ -214,6 +215,19 @@ class TestRolledBuffer:
             plan_sliding_window(512, 5120, 64, q_block=64, cache_capacity=192) is None
         )
 
+    def test_buffer_origin_defaults_to_the_exactly_full_derivation(self):
+        # Backward compatibility: omitting the argument must reproduce the
+        # value the plan used to derive internally, for every geometry.
+        for lq, qb in ((1, 1), (64, STICK), (512, STICK)):
+            for kv in (256, 512, 4096, 5120):
+                for cap in (None, 64, 256, 1024, 4096):
+                    plan = plan_sliding_window(
+                        lq, kv, 64, q_block=qb, cache_capacity=cap
+                    )
+                    if plan is None:
+                        continue
+                    assert plan.buffer_origin == default_buffer_origin(kv, cap or kv)
+
     def test_a_single_block_plan_is_unaffected_by_the_reach_check(self):
         # Decode and single-chunk prefill only ever have one block, so the
         # earliest-block check is checking the only block -- it must not
@@ -221,6 +235,85 @@ class TestRolledBuffer:
         assert rejection_reason(1, 5120, 64, True, 1, cache_capacity=64) is None
         plan = plan_sliding_window(1, 5120, 64, q_block=1, cache_capacity=64)
         assert plan is not None
+
+
+class TestExplicitBufferOrigin:
+    """buffer_origin is given, not inferred.
+
+    seqlen_kv and cache_capacity together do NOT determine where physical row
+    0 sits. The default assumes an exactly-full buffer holding precisely the
+    most recent cache_capacity positions -- true for HF's
+    StaticSlidingWindowLayer, false for any evictor working at coarser
+    granularity, which keeps whole blocks and so holds fewer live positions.
+    """
+
+    # capacity 256, window 64, decode at 1000, evictor freeing whole 64-blocks:
+    # it must keep everything from 896 on, so row 0 holds 896, not 1000-256=744.
+    CAPACITY, WINDOW, POSITION, EVICT_BLOCK = 256, 64, 1000, 64
+    TRUE_ORIGIN = ((POSITION - WINDOW + 1) // EVICT_BLOCK) * EVICT_BLOCK
+
+    def _plan(self, buffer_origin):
+        return plan_sliding_window(
+            1,
+            self.POSITION,
+            self.WINDOW,
+            q_block=1,
+            cache_capacity=self.CAPACITY,
+            buffer_origin=buffer_origin,
+        )
+
+    def test_the_default_is_wrong_for_a_block_granular_evictor(self):
+        # Not a bug in the default -- a demonstration that the two lengths
+        # underdetermine the layout, which is why the argument exists. Under
+        # the real layout the default's read points at rows holding logical
+        # positions that were never written.
+        default = self._plan(None)
+        assert default.buffer_origin == 744 and self.TRUE_ORIGIN == 896
+        read = default.read_start(0)
+        actually_holds = self.TRUE_ORIGIN + read
+        assert actually_holds >= self.POSITION, (
+            "the default read should land past every written row here"
+        )
+
+    def test_the_true_origin_places_the_read_on_written_data(self):
+        plan = self._plan(self.TRUE_ORIGIN)
+        assert plan is not None
+        low, high = plan.row_window(0)
+        start = plan.read_start_logical(0)
+        # The window is covered by the buffer...
+        assert start <= low and high <= start + plan.buffer_width
+        # ...and every column in it is a position the evictor actually kept.
+        assert all(self.TRUE_ORIGIN <= c < self.POSITION for c in range(low, high))
+
+    def test_an_overshooting_tail_is_still_banded_not_skipped(self):
+        # The buffer reaches past cache_seqlen here, so the band must be
+        # emitted -- skipping it would attend the unwritten tail.
+        assert not self._plan(self.TRUE_ORIGIN).block_is_fully_attended(0)
+
+    def test_reads_stay_stick_aligned_at_any_origin(self):
+        # buffer_origin need not be stick-aligned: read_start floors AFTER
+        # converting to physical coordinates, so the offset lands on a stick
+        # whatever the origin is.
+        for origin in range(744, 1000):
+            plan = self._plan(origin)
+            if plan is None:
+                continue
+            assert plan.read_start(0) % STICK == 0, origin
+
+    def test_out_of_range_origins_are_refused_with_the_reason(self):
+        def reason(origin):
+            return rejection_reason(
+                1, 1000, 64, True, 1, cache_capacity=256, buffer_origin=origin
+            )
+
+        # Below the default: the newest token would fall off the end.
+        assert "too small" in reason(700)
+        assert "too small" in reason(-1)
+        # At or past cache_seqlen: no written row remains.
+        assert "no written row" in reason(1000)
+        assert "no written row" in reason(1001)
+        # The default and the block-granular truth both stand.
+        assert reason(744) is None and reason(896) is None
 
 
 class TestStillFilling:

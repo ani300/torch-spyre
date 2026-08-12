@@ -701,6 +701,7 @@ def spyre_sliding_window_attention(
     is_causal: bool = True,
     scale: float | None = None,
     cache_seqlen: int | None = None,
+    buffer_origin: int | None = None,
 ) -> torch.Tensor:
     """Sliding-window attention: each Q block attends only its own KV slice.
 
@@ -753,6 +754,7 @@ def spyre_sliding_window_attention(
         is_causal=is_causal,
         q_block=q_block,
         cache_capacity=cache_capacity,
+        buffer_origin=buffer_origin,
     )
     if plan is None:
         # Never None when the plan is, but the type says otherwise.
@@ -764,6 +766,7 @@ def spyre_sliding_window_attention(
                 is_causal,
                 q_block,
                 cache_capacity,
+                buffer_origin,
             )
             or "the window placement cannot express this shape"
         )

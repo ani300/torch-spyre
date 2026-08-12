@@ -815,6 +815,7 @@ def sliding_window_attention(  # type: ignore[empty-body]
     is_causal: bool = True,
     scale: Optional[float] = None,
     cache_seqlen: Optional[int] = None,
+    buffer_origin: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Sliding-window attention entry point.
@@ -826,8 +827,12 @@ def sliding_window_attention(  # type: ignore[empty-body]
 
     ``cache_seqlen`` is how many tokens the cache has seen, as distinct from
     ``Lk``, the rows it allocates. Defaults to ``Lk``; need not be a multiple
-    of 64. All three orderings against ``Lk`` are accepted -- see
-    ``SlidingWindowPlan`` for what each means for placement.
+    of 64. ``buffer_origin`` is the logical position held by physical row 0,
+    defaulting to ``max(0, cache_seqlen - Lk)`` -- correct only for a buffer
+    that is exactly full, holding precisely the most recent ``Lk`` positions.
+    A caller evicting at coarser granularity holds fewer live positions and
+    MUST pass its true origin, or every read lands past the data, in bounds
+    and unmasked. See ``SlidingWindowPlan`` for both.
 
     Allocation contract: ``Lk >= round_up_to_64(window_size + Lq - 1)`` for
     the ``Lq`` of this call, so prefill long sequences in chunks;
@@ -852,6 +857,7 @@ def _(
     is_causal: bool = True,
     scale: Optional[float] = None,
     cache_seqlen: Optional[int] = None,
+    buffer_origin: Optional[int] = None,
 ) -> torch.Tensor:
     return query.new_empty(query.size())
 
@@ -950,8 +956,9 @@ def kv_window(  # type: ignore[empty-body]
 
     **Preconditions for a compact buffer** (``buffer_origin != 0``), neither
     checked here since this op sees only offsets, never tokens: rows stay
-    contiguous and time-ordered, oldest at row 0, no ring/modulo indexing.
-    Maintaining that order is the caller's job and is unproven on this
+    contiguous and time-ordered, oldest at row 0, no ring/modulo indexing;
+    and physical row 0 holds exactly the ``buffer_origin`` the plan was
+    given. Maintaining that order is the caller's job and is unproven on this
     backend -- ``aten::roll`` has no lowering, no Spyre decomposition and no
     CPU fallback, and the narrow/cat route it would decompose to is suspect
     (see ``TestKVWindowOp``).

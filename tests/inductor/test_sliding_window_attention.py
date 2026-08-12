@@ -97,7 +97,26 @@ def _compact_kv(batch, kvheads, capacity, cache_seqlen, head_dim=64):
     return key, value
 
 
-def _rolled_reference(query, key, value, window_size, cache_seqlen):
+def _compact_kv_at(batch, kvheads, capacity, buffer_origin, cache_seqlen, head_dim=64):
+    """Like ``_compact_kv`` but for a buffer whose physical row 0 holds
+    ``buffer_origin`` rather than the exactly-full ``cache_seqlen -
+    capacity``. Rows ``[0, cache_seqlen - buffer_origin)`` are real; the rest
+    is the zero-filled tail an evictor working at block granularity leaves.
+    """
+    written = cache_seqlen - buffer_origin
+    assert 0 < written <= capacity, "buffer_origin outside the plannable range"
+    key = torch.zeros((batch, kvheads, capacity, head_dim), dtype=torch.float16)
+    value = torch.zeros((batch, kvheads, capacity, head_dim), dtype=torch.float16)
+    key[:, :, :written, :] = cached_randn(
+        (batch, kvheads, written, head_dim), differentiation=2, dtype=torch.float16
+    )
+    value[:, :, :written, :] = cached_randn(
+        (batch, kvheads, written, head_dim), differentiation=3, dtype=torch.float16
+    )
+    return key, value
+
+
+def _rolled_reference(query, key, value, window_size, cache_seqlen, buffer_origin=None):
     """CPU reference for a compact cache: key/value are ``[B, Hkv, capacity,
     E]``, not the full-length cache ``_band_mask`` assumes.
 
@@ -114,7 +133,8 @@ def _rolled_reference(query, key, value, window_size, cache_seqlen):
     """
     capacity = key.size(2)
     seqlen_q = query.size(2)
-    buffer_origin = max(0, cache_seqlen - capacity)
+    if buffer_origin is None:
+        buffer_origin = max(0, cache_seqlen - capacity)
     q_pos = torch.arange(cache_seqlen - seqlen_q, cache_seqlen).unsqueeze(-1)
     k_pos = torch.arange(capacity, dtype=torch.int64) + buffer_origin
     delta = q_pos - k_pos.unsqueeze(0)
@@ -127,16 +147,16 @@ def _rolled_reference(query, key, value, window_size, cache_seqlen):
     )
 
 
-def _rolled_attention(q, k, v, window_size, cache_seqlen):
+def _rolled_attention(q, k, v, window_size, cache_seqlen, buffer_origin=None):
     """Dispatch for a compact cache: the op on spyre with an explicit
     ``cache_seqlen`` (it cannot default to ``k.size(2)`` here -- that IS the
     distinction under test), the compact reference on CPU.
     """
     if q.device.type == "spyre":
         return torch.ops.spyre.sliding_window_attention(
-            q, k, v, window_size, True, None, cache_seqlen
+            q, k, v, window_size, True, None, cache_seqlen, buffer_origin
         )
-    return _rolled_reference(q, k, v, window_size, cache_seqlen)
+    return _rolled_reference(q, k, v, window_size, cache_seqlen, buffer_origin)
 
 
 class TestSlidingWindowAttention(unittest.TestCase):
@@ -290,6 +310,32 @@ class TestCompactCache(unittest.TestCase):
         )
         compare_with_cpu(
             _rolled_attention, query, key, value, window, cache_seqlen, run_eager=False
+        )
+
+    def test_block_granular_eviction_with_an_explicit_buffer_origin(self):
+        # A buffer that is NOT exactly full: an evictor freeing whole 64-row
+        # blocks keeps everything from logical 896 on, so physical row 0 holds
+        # 896 rather than the default's 1000-256=744. Rows stay contiguous and
+        # time-ordered, so kv_window's ordering precondition holds -- only the
+        # origin differs, and passing it is what keeps the read on real data.
+        batch, heads, kvheads = 1, 8, 8
+        capacity, cache_seqlen, window = 256, 1000, 64
+        buffer_origin = 896
+        key, value = _compact_kv_at(
+            batch, kvheads, capacity, buffer_origin, cache_seqlen
+        )
+        query = cached_randn(
+            (batch, heads, 1, 64), differentiation=1, dtype=torch.float16
+        )
+        compare_with_cpu(
+            _rolled_attention,
+            query,
+            key,
+            value,
+            window,
+            cache_seqlen,
+            buffer_origin,
+            run_eager=False,
         )
 
     def test_multiblock_rolled_prefill_with_distinct_read_starts(self):

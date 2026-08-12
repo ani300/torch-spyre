@@ -26,6 +26,17 @@ from dataclasses import dataclass
 STICK = 64
 
 
+def default_buffer_origin(seqlen_kv: int, cache_capacity: int) -> int:
+    """Logical position of physical row 0 for an exactly-full rolled buffer.
+
+    Correct only when the buffer holds precisely the most recent
+    ``cache_capacity`` positions and rolls one row per token. A caller whose
+    evictor works at coarser granularity holds fewer live positions than that
+    and must supply its own -- see ``SlidingWindowPlan``.
+    """
+    return max(0, seqlen_kv - cache_capacity)
+
+
 def _floor_stick(value: int) -> int:
     """Round down to a stick boundary, for negative values too."""
     return (value // STICK) * STICK
@@ -57,9 +68,22 @@ class SlidingWindowPlan:
       those columns. They must still hold *finite* values -- an additive
       ``-inf`` cannot rescue a ``NaN``.
     - ``seqlen_kv > cache_capacity`` -- a compact buffer that has filled and
-      is sliding forward, ``buffer_origin > 0``. Assumes rows stay contiguous
-      and time-ordered, oldest at the front; unchecked here, see ``kv_window``.
+      is sliding forward, ``buffer_origin > 0``. Rows must stay contiguous,
+      time-ordered and oldest-first; unchecked here, see ``kv_window``.
     - Equal -- the full-length, exactly-full cache.
+
+    ``buffer_origin`` -- the logical position of physical row 0 -- is
+    *given*, not inferred, because ``seqlen_kv`` and ``cache_capacity``
+    together do not determine it. It defaults to ``max(0, seqlen_kv -
+    cache_capacity)``, which holds only when the buffer is **exactly full
+    and holds precisely the most recent ``cache_capacity`` positions**,
+    rolling one row per token -- HF's ``StaticSlidingWindowLayer``. An
+    evictor working at block granularity (vLLM's block manager) frees whole
+    blocks and so keeps *fewer* than ``cache_capacity`` live positions: its
+    rows are still contiguous, time-ordered and oldest-first, yet row 0 sits
+    later than the default computes. Every read would then land past the
+    data, in bounds and unmasked, with nothing to detect it. Such a caller
+    must pass its true ``buffer_origin``.
     """
 
     seqlen_q: int
@@ -71,6 +95,7 @@ class SlidingWindowPlan:
     q_kv_offset: int
     is_causal: bool
     cache_capacity: int
+    buffer_origin: int
 
     def block_q_range(self, qi: int) -> tuple[int, int]:
         """Half-open query-row range of Q block ``qi``."""
@@ -83,16 +108,6 @@ class SlidingWindowPlan:
         lo = max(0, coord - self.window_size + 1)
         hi = min(self.seqlen_kv, coord + 1)
         return lo, hi
-
-    @property
-    def buffer_origin(self) -> int:
-        """Logical position of the buffer's physical row 0.
-
-        0 while the cache fits inside its own allocation, so physical and
-        logical coordinates coincide. Once it has outgrown the allocation this
-        is where its oldest resident row sits.
-        """
-        return max(0, self.seqlen_kv - self.cache_capacity)
 
     def block_is_fully_attended(self, qi: int) -> bool:
         """True when block ``qi``'s band masks nothing, so the add can be skipped.
@@ -237,6 +252,7 @@ def rejection_reason(
     is_causal: bool,
     q_block: int,
     cache_capacity: int | None = None,
+    buffer_origin: int | None = None,
 ) -> str | None:
     """Why this shape cannot be planned, or None if it can.
 
@@ -247,6 +263,13 @@ def rejection_reason(
     further checks: the capacity must fit at least one buffer, and it must
     reach far enough back for the *earliest* block of a multi-block plan --
     which a capacity clearing the first check can still fail.
+
+    ``buffer_origin`` defaults to ``default_buffer_origin``. It is bounded
+    below by that default (a smaller one would place the newest token past
+    the end of the buffer) and above by ``seqlen_kv`` (a larger one leaves no
+    written row at all). It need NOT be stick-aligned: ``read_start`` floors
+    after converting to physical coordinates, so the resulting offset lands
+    on a stick whatever the origin is.
 
     Only the physical allocation needs stick alignment. ``seqlen_kv`` is a
     token count, not a memory offset (see ``read_start`` on flooring in
@@ -276,9 +299,26 @@ def rejection_reason(
             f"{STICK}; pad the cache allocation to a stick boundary"
         )
 
+    # Validated against effective_capacity, so an explicit origin is checked
+    # whether or not the caller also passed a capacity.
+    smallest_origin = default_buffer_origin(seqlen_kv, effective_capacity)
+    if buffer_origin is None:
+        buffer_origin = smallest_origin
+    if buffer_origin < smallest_origin:
+        return (
+            f"buffer_origin={buffer_origin} is too small: physical row 0 cannot "
+            f"hold a position earlier than {smallest_origin}, or the newest "
+            f"token ({seqlen_kv - 1}) would fall past the end of the "
+            f"{effective_capacity}-row buffer"
+        )
+    if buffer_origin >= seqlen_kv:
+        return (
+            f"buffer_origin={buffer_origin} is not before seqlen_kv={seqlen_kv}, "
+            f"so the buffer holds no written row"
+        )
+
     if cache_capacity is not None:
         q_kv_offset = seqlen_kv - seqlen_q
-        buffer_origin = max(0, seqlen_kv - cache_capacity)
         buffer_width = _required_width(
             seqlen_q, window_size, q_block, q_kv_offset, buffer_origin
         )
@@ -312,21 +352,34 @@ def plan_sliding_window(
     is_causal: bool = True,
     q_block: int = STICK,
     cache_capacity: int | None = None,
+    buffer_origin: int | None = None,
 ) -> SlidingWindowPlan | None:
     """The placement, or None for a shape ``rejection_reason`` declines.
 
     ``cache_capacity`` is the rows the cache physically allocates, as distinct
     from ``seqlen_kv``, its logical position. Defaults to ``seqlen_kv``.
+
+    ``buffer_origin`` is the logical position of physical row 0. Defaults to
+    ``default_buffer_origin``, which assumes an exactly-full rolled buffer; a
+    caller evicting at coarser granularity must pass its own. See
+    ``SlidingWindowPlan``.
     """
     if rejection_reason(
-        seqlen_q, seqlen_kv, window_size, is_causal, q_block, cache_capacity
+        seqlen_q,
+        seqlen_kv,
+        window_size,
+        is_causal,
+        q_block,
+        cache_capacity,
+        buffer_origin,
     ):
         return None
     if cache_capacity is None:
         cache_capacity = seqlen_kv
+    if buffer_origin is None:
+        buffer_origin = default_buffer_origin(seqlen_kv, cache_capacity)
 
     q_kv_offset = seqlen_kv - seqlen_q
-    buffer_origin = max(0, seqlen_kv - cache_capacity)
     buffer_width = _required_width(
         seqlen_q, window_size, q_block, q_kv_offset, buffer_origin
     )
@@ -341,4 +394,5 @@ def plan_sliding_window(
         q_kv_offset=q_kv_offset,
         is_causal=is_causal,
         cache_capacity=cache_capacity,
+        buffer_origin=buffer_origin,
     )
