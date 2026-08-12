@@ -431,7 +431,8 @@ def spyre__sdpa_overrideable(
     # on logical [B, H, S, D] order. We do NOT contiguify key/value wholesale --
     # that materializes a full [B, H, S_kv, D] copy that OOMs on long KV. K/V are
     # instead normalized PER BLOCK inside the loop (keys_T's .contiguous() and
-    # the per-block v_blk.contiguous()), each a cheap [B, H, 64, D] copy.
+    # the per-block v_blk.contiguous()), each a bounded [B, H, kv_block_size, D]
+    # copy (kv_block_size ~= Skv/4, see below), never the full [B, H, S_kv, D].
     query = query.contiguous()
 
     expansion = num_heads // num_kvheads
@@ -535,9 +536,9 @@ def spyre__sdpa_overrideable(
                         # order via pick_loop_order), which scrambles the tiled
                         # matmul. .contiguous() lowers to aten.clone(contiguous),
                         # which the Spyre clone override freezes to contiguous
-                        # strides -- normalizing this [B, H, 64, D] slice per block
-                        # without a full-tensor value.contiguous() (an OOM on long
-                        # KV). The named_dims seed lands on the resulting clone, so
+                        # strides -- normalizing this [B, H, blk_len, D] slice per
+                        # block without a full-tensor value.contiguous() (an OOM on
+                        # long KV). The named_dims seed lands on the resulting clone, so
                         # blk_len still propagates.
                         with spyre_hint(named_dims=["_b", "_h", "blk_len", "head_dim"]):
                             v_blk = v_blk.contiguous()
