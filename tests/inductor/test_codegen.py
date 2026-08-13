@@ -759,3 +759,161 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         self.assertTrue(
             any(sk.is_derived_symbolic for sk in symbol_kinds[first_address:])
         )
+
+
+class TestInjectPoolAllocDealloc(InductorTestCase):
+    """Unit tests for wrapper._inject_pool_alloc_dealloc.
+
+    The HBM ``_pool`` byte region is passed as the first arg to every
+    ``sdsc_*.run(...)`` that references a pool-allocated tensor. When a compiled
+    graph emits more than one function that uses ``_pool`` -- e.g. the top-level
+    ``Runner.call`` plus a reused ``invoke_subgraph`` decoder-block function --
+    EACH function must allocate ``_pool`` in its own local scope and free it
+    before its own ``return``. The pre-fix whole-file first-``.run(``/last-
+    ``return (`` scan injected only once (into whichever function was emitted
+    first textually), leaving the other referencing an undefined ``_pool``
+    (UnboundLocalError at runtime).
+    """
+
+    _ALLOC = "_pool = spyre_empty_with_layout(POOL)"
+
+    def _apply(self, wrapper_str):
+        from torch_spyre._inductor.wrapper import _inject_pool_alloc_dealloc
+
+        return _inject_pool_alloc_dealloc(wrapper_str, self._ALLOC)
+
+    def test_subgraph_before_main_both_get_pool(self):
+        # Mirrors the real Granite whole-forward wrapper: the reused
+        # invoke_subgraph function is emitted textually BEFORE Runner.call, and
+        # both bodies pass _pool to their kernels.
+        wrapper = "\n".join(
+            [
+                "def auto_functionalized_subgraph_0(args):",
+                "    a, = args",
+                "    buf0 = spyre_empty_with_layout(S)",
+                "    sub_kernel.run(_pool, a, buf0)",
+                "    return (buf0, )",
+                "",
+                "class Runner:",
+                "    def call(self, args):",
+                "        a, = args",
+                "        buf1 = spyre_empty_with_layout(S)",
+                "        main_kernel.run(_pool, a, buf1)",
+                "        return (buf1, )",
+            ]
+        )
+        out = self._apply(wrapper).split("\n")
+
+        # Both function scopes must define _pool exactly once.
+        self.assertEqual(sum(1 for ln in out if ln.strip() == self._ALLOC), 2)
+        # And free it exactly once each.
+        self.assertEqual(sum(1 for ln in out if ln.strip() == "del _pool"), 2)
+
+        # The allocation must precede the kernel call WITHIN each scope.
+        sub_alloc = next(i for i, ln in enumerate(out) if "sub_kernel.run" in ln) - 1
+        self.assertEqual(out[sub_alloc].strip(), self._ALLOC)
+        main_alloc = next(i for i, ln in enumerate(out) if "main_kernel.run" in ln) - 1
+        self.assertEqual(out[main_alloc].strip(), self._ALLOC)
+
+    def test_already_processed_subgraph_not_double_allocated(self):
+        # Mirrors the REAL two-pass composition. The subgraph wrapper's own
+        # generate() injects _pool into the subgraph body first; that finished
+        # text is then spliced into the parent, whose generate() runs the
+        # injector again on the whole thing. The subgraph must NOT get a second
+        # (duplicate) _pool alloc, while Runner.call must still get its own.
+        wrapper = "\n".join(
+            [
+                "def auto_functionalized_subgraph_0(args):",
+                "    a, = args",
+                "    " + self._ALLOC,
+                "    sub_kernel.run(_pool, a, buf0)",
+                "    del _pool",
+                "    return (buf0, )",
+                "",
+                "class Runner:",
+                "    def call(self, args):",
+                "        main_kernel.run(_pool, a, buf1)",
+                "        return (buf1, )",
+            ]
+        )
+        out = self._apply(wrapper).split("\n")
+        # Two allocs total: subgraph's pre-existing one (not duplicated) + the
+        # newly injected Runner.call one.
+        self.assertEqual(sum(1 for ln in out if ln.strip() == self._ALLOC), 2)
+        self.assertEqual(sum(1 for ln in out if ln.strip() == "del _pool"), 2)
+        # The subgraph body still holds exactly one alloc (no duplicate).
+        runner_start = next(i for i, ln in enumerate(out) if "class Runner" in ln)
+        sub_allocs = sum(1 for ln in out[:runner_start] if ln.strip() == self._ALLOC)
+        self.assertEqual(sub_allocs, 1)
+
+    def test_generated_wrapper_body_is_executable(self):
+        # Strongest guard: the injected wrapper must actually run without an
+        # UnboundLocalError. Build a two-function wrapper, inject, exec it, and
+        # confirm both scopes resolve _pool.
+        wrapper = "\n".join(
+            [
+                "def subfn(args):",
+                "    (a,) = args",
+                "    out = kern.run(_pool, a)",
+                "    return (out, )",
+                "",
+                "def mainfn(args):",
+                "    (a,) = args",
+                "    out = kern.run(_pool, a)",
+                "    return (out, )",
+            ]
+        )
+        src = self._apply(wrapper)
+
+        class _Kern:
+            @staticmethod
+            def run(pool, a):
+                return (pool, a)
+
+        ns = {
+            "kern": _Kern,
+            "spyre_empty_with_layout": lambda *_a, **_k: "POOL_OBJ",
+        }
+        # Make the alloc a real assignment the exec can evaluate.
+        src = src.replace(self._ALLOC, "_pool = spyre_empty_with_layout()")
+        exec(src, ns)  # noqa: S102 -- controlled test source
+        self.assertEqual(ns["subfn"]([1]), (("POOL_OBJ", 1),))
+        self.assertEqual(ns["mainfn"]([2]), (("POOL_OBJ", 2),))
+
+    def test_indentation_matches_scope(self):
+        # _pool alloc/free must be indented to the function body, not column 0.
+        wrapper = "\n".join(
+            [
+                "class Runner:",
+                "    def call(self, args):",
+                "        (a,) = args",
+                "        k.run(_pool, a)",
+                "        return (a, )",
+            ]
+        )
+        out = self._apply(wrapper).split("\n")
+        alloc = next(ln for ln in out if ln.strip() == self._ALLOC)
+        dele = next(ln for ln in out if ln.strip() == "del _pool")
+        self.assertEqual(len(alloc) - len(alloc.lstrip()), 8)
+        self.assertEqual(len(dele) - len(dele.lstrip()), 8)
+
+    def test_function_without_pool_untouched(self):
+        # A helper function that never touches _pool must not get an allocation.
+        wrapper = "\n".join(
+            [
+                "def helper(args):",
+                "    (a,) = args",
+                "    return (a, )",
+                "",
+                "def mainfn(args):",
+                "    (a,) = args",
+                "    k.run(_pool, a)",
+                "    return (a, )",
+            ]
+        )
+        out = self._apply(wrapper).split("\n")
+        self.assertEqual(sum(1 for ln in out if ln.strip() == self._ALLOC), 1)
+        self.assertEqual(sum(1 for ln in out if ln.strip() == "del _pool"), 1)
+        # The lone allocation is inside mainfn, not helper.
+        helper_end = next(i for i, ln in enumerate(out) if "def mainfn" in ln)
+        self.assertNotIn(self._ALLOC, [ln.strip() for ln in out[:helper_end]])
