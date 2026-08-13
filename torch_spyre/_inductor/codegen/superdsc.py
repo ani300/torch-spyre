@@ -44,6 +44,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
@@ -1578,6 +1579,111 @@ def _inject_implicit_conv_kernel_dims(
         work_slices[kj_sym] = 1
 
 
+def bmm_reuse_dims(
+    inp0_dims: list, inp1_dims: list, out_dims: list
+) -> tuple[set[str], set[str]]:
+    """Reproduce the backend's batchmatmul role derivation from three dim orders.
+
+    ``getMinParamBmm`` (``deeptools/dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp``)
+    reads the ``layoutDimOrder_`` of ``labeledDs_`` positions front / 1 / back --
+    which are ``args[0]`` / ``args[1]`` / ``args[-1]`` here -- and derives the op's
+    dim roles purely by set membership::
+
+        inp0_reuse = (inp1 & out) - inp0    # the output channel
+        out_reuse  = (inp0 & inp1) - out    # the contraction (reduction axis)
+
+    Returns ``(output_channel_dims, contraction_dims)``.  Order is irrelevant: the
+    C++ uses ``std::find`` into a ``std::set``, so only membership matters.
+    """
+    s0 = {str(d) for d in inp0_dims}
+    s1 = {str(d) for d in inp1_dims}
+    so = {str(d) for d in out_dims}
+    return (s1 & so) - s0, (s0 & s1) - so
+
+
+def _op_provenance(op_spec: OpSpec) -> str:
+    """Short "who emitted this op" string for diagnostics."""
+    handle = op_spec.debug_handle
+    if handle is None:
+        return op_spec.op
+    parts = [op_spec.op]
+    if handle.aten_op:
+        parts.append(handle.aten_op)
+    if handle.source is not None:
+        parts.append(handle.source.to_str())
+    if handle.ir_chain:
+        parts.append("/".join(handle.ir_chain))
+    return " ".join(parts)
+
+
+def _check_bmm_reuse_dims(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    inp0_dims: list,
+    inp1_dims: list,
+    out_dims: list,
+) -> None:
+    """Reject a batchmatmul whose emitted geometry the backend cannot honour.
+
+    The invariant is not a scheduler quirk.  ``bmm.ddl`` declares exactly one
+    ``%in`` and one ``%out`` channel with ``is_order_fixed=true`` stick layouts,
+    ``dsi.cpp`` sizes the cross-core psum cohort from ``numSplitAtDim.at(IN)``,
+    and the senulator asserts the INPUT stick dim is ``IN`` and the OUTPUT stick
+    dim is ``OUT``.  Both the CARDINALITY and the NAMES are load-bearing:
+
+    * more than one contraction dim -> ``DT_CHECK(out_reuse_dim.size() == 1)``
+      fires inside a min-param heuristic and ``dxp_standalone`` SIGABRTs, with no
+      torch-spyre frame anywhere in the report;
+    * a singleton contraction that is not named ``in`` (or an output channel not
+      named ``out``) passes that check and then binds ``%in`` to an axis the
+      kernel does not reduce over -- a silent wrong-numerics miscompile, which is
+      strictly worse than the abort.
+
+    Both are hard errors here, at the layer that owns the geometry.
+    """
+    out_channel, contraction = bmm_reuse_dims(inp0_dims, inp1_dims, out_dims)
+    if contraction == {"in"} and out_channel == {"out"}:
+        return
+
+    def _fmt(dims: list) -> str:
+        return "[" + ", ".join(str(d) for d in dims) + "]"
+
+    sizes = ", ".join(f"{k}={v}" for k, v in sdsc_iteration_space.items())
+    geometry = (
+        f"layoutDimOrder_ inp0={_fmt(inp0_dims)} inp1={_fmt(inp1_dims)} "
+        f"out={_fmt(out_dims)}; N_=({sizes})"
+    )
+    where = _op_provenance(op_spec)
+
+    if len(contraction) != 1:
+        raise Unsupported(
+            f"{where}: emitted device geometry contracts {len(contraction)} "
+            f"axes {sorted(contraction)}, but a batchmatmul must contract "
+            f"exactly one. {geometry}. The backend derives the reduction axis "
+            f"by set difference over those three lists and DT_CHECKs that it is "
+            f"a single dim (getMinParamBmm, L3DlOpsScheduler.cpp), so emitting "
+            f"this bundle would abort dxp_standalone with no Python frame. "
+            f"Typical cause: one logical axis reached codegen split across two "
+            f"device dims -- e.g. the (heads, head_dim) pair of a "
+            f"transpose+reshape on an SDPA output that was never materialised."
+        )
+    if len(out_channel) != 1:
+        raise Unsupported(
+            f"{where}: emitted device geometry has {len(out_channel)} "
+            f"output-channel axes {sorted(out_channel)}, but a batchmatmul must "
+            f"have exactly one. {geometry}. The backend DT_CHECKs "
+            f"inp0_reuse_dim.size() == 1 (getMinParamBmm, L3DlOpsScheduler.cpp)."
+        )
+    raise Unsupported(
+        f"{where}: batchmatmul dim roles are mislabelled -- the contraction axis "
+        f"is labelled {sorted(contraction)} and the output channel "
+        f"{sorted(out_channel)}, but the backend hard-codes the reduction axis as "
+        f"'in' and the output channel as 'out' (bmm.ddl's %in / %out channels, "
+        f"dsi.cpp's numSplitAtDim.at(IN), the senulator's stick-dim asserts). "
+        f"{geometry}. This would compile and then reduce over the wrong axis."
+    )
+
+
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_conv2d = _is_conv(op_spec.op)
@@ -1803,6 +1909,19 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # A dimension was added to the iteration space, update splits and work slices
         dim_splits[missing_dim] = 1
         work_slices[missing_dim] = 1
+
+    if is_matmul and len(args) >= 3:
+        # Validate the geometry before it leaves Python.  ``layouts`` is final by
+        # now (only ``_get_layout_label`` writes "dim_order"), and these are the
+        # exact three lists the backend will read: primaryDsInfo_ keyed by the
+        # layout label of labeledDs_ front / 1 / back.
+        _check_bmm_reuse_dims(
+            op_spec,
+            sdsc_iteration_space,
+            layouts[args[0].layout]["dim_order"],
+            layouts[args[1].layout]["dim_order"],
+            layouts[args[-1].layout]["dim_order"],
+        )
 
     # In case of same type conversion (identity op) user gets compile time error & avoid
     # changing the padding logic here to fix errors with torch.split() for 3d shapes.

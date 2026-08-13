@@ -36,7 +36,9 @@ from torch_spyre._inductor.codegen.compute_ops import (
 )
 from torch_spyre._inductor.codegen.superdsc import (
     _align_pool_dim_labels,
+    _check_bmm_reuse_dims,
     _resolve_sdsc_size,
+    bmm_reuse_dims,
     compile_op_spec,
 )
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
@@ -759,3 +761,66 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         self.assertTrue(
             any(sk.is_derived_symbolic for sk in symbol_kinds[first_address:])
         )
+
+
+class TestBmmGeometryGuard(InductorTestCase):
+    """Unit tests for superdsc._check_bmm_reuse_dims.
+
+    The guard reproduces deeptools' getMinParamBmm role derivation over the three
+    emitted layoutDimOrder_ lists and rejects any geometry the backend cannot
+    honour, so a bad bundle fails as a Python Unsupported at the layer that owns
+    the geometry instead of SIGABRTing dxp_standalone from inside a min-param
+    heuristic.
+    """
+
+    @staticmethod
+    def _op():
+        return OpSpec(
+            op="batchmatmul",
+            is_reduction=True,
+            iteration_space={},
+            args=[],
+            op_info={},
+        )
+
+    def test_healthy_signatures_accepted(self):
+        # Every batchmatmul layout signature observed in working bundles.
+        for inp0, inp1, out in (
+            (["in"], ["in", "out"], ["out"]),
+            (["in", "mb"], ["in", "out"], ["out", "mb"]),
+            (["in", "mb"], ["out", "in", "mb"], ["out", "mb"]),
+            (["mb", "in"], ["mb", "out", "in"], ["out", "mb"]),
+            (["in", "mb", "x"], ["out", "in", "x"], ["out", "mb", "x"]),
+            (["mb", "in", "x"], ["in", "out"], ["mb", "out", "x"]),
+        ):
+            _check_bmm_reuse_dims(self._op(), {}, inp0, inp1, out)  # must not raise
+
+    def test_two_contraction_axes_rejected(self):
+        # The seq_len == 1 fused SDPA + o_proj geometry: both of inp0's axes are
+        # contracted, so out_reuse has two members and getMinParamBmm aborts.
+        it_space = {
+            sympy.Symbol("mb"): 1024,
+            sympy.Symbol("out"): 128,
+            sympy.Symbol("in"): 16,
+        }
+        with self.assertRaisesRegex(Unsupported, "contracts 2 axes"):
+            _check_bmm_reuse_dims(
+                self._op(),
+                it_space,
+                ["out", "in"],
+                ["out", "in", "mb"],
+                ["mb"],
+            )
+
+    def test_mislabelled_singleton_rejected(self):
+        # Cardinality is fine but the contraction is not named "in", so the
+        # backend would bind %in to an axis the kernel does not reduce over.
+        with self.assertRaisesRegex(Unsupported, "mislabelled"):
+            _check_bmm_reuse_dims(self._op(), {}, ["out"], ["out", "mb"], ["mb"])
+
+    def test_reuse_dims_are_order_insensitive(self):
+        # The C++ compares by set membership, so label order must not matter.
+        a = bmm_reuse_dims(["in", "mb"], ["out", "in", "mb"], ["out", "mb"])
+        b = bmm_reuse_dims(["mb", "in"], ["mb", "in", "out"], ["mb", "out"])
+        self.assertEqual(a, b)
+        self.assertEqual(a, ({"out"}, {"in"}))
