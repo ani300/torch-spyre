@@ -421,9 +421,9 @@ def spyre__sdpa_overrideable(
     # mapping follows physical stride order, not logical dim order. SDPA is
     # routinely called with q/k/v as transpose(1, 2) views of a [B, S, H, D]
     # tensor, so query's physical layout is [B, S, H, D] while its logical shape
-    # is [B, H, S, D]. Seeding ["_b","_h","max_seqlen_q",...] on such a buffer
-    # then maps the tile onto the head axis instead of the query axis and the
-    # result is wrong.
+    # is [B, H, S, D]. Seeding ["_b","num_heads","max_seqlen_q",...] on such
+    # a buffer then maps the tile onto the head axis instead of the query
+    # axis and the result is wrong.
     #
     # Normalize the QUERY wholesale: query.contiguous() is bounded (same
     # footprint as the `output` buffer we allocate below) and makes every
@@ -451,7 +451,7 @@ def spyre__sdpa_overrideable(
     q_block_size = 64
     num_kv_blocks = (max_seqlen_kv + kv_block_size - 1) // kv_block_size
 
-    with spyre_hint(named_dims=["_b", "_h", "max_seqlen_q", "head_dim"]):
+    with spyre_hint(named_dims=["_b", "num_heads", "max_seqlen_q", "head_dim"]):
         output = torch.zeros_like(query)
 
     # FIXME: create a sparse M tensor via reduction
@@ -461,7 +461,7 @@ def spyre__sdpa_overrideable(
         device=query.device,
         dtype=query.dtype,
     )
-    with spyre_hint(named_dims=["_b", "_h", "max_seqlen_q"]):
+    with spyre_hint(named_dims=["_b", "num_heads", "max_seqlen_q"]):
         M = M_reduced.amax(dim=-1)  # batch_size, num_heads, max_seqlen_q sparse
 
     # FIXME: create a sparse denominator tensor via reduction
@@ -470,7 +470,7 @@ def spyre__sdpa_overrideable(
         device=query.device,
         dtype=query.dtype,
     )
-    with spyre_hint(named_dims=["_b", "_h", "max_seqlen_q"]):
+    with spyre_hint(named_dims=["_b", "num_heads", "max_seqlen_q"]):
         denominator = denominator_reduced.amax(
             dim=-1
         )  # batch_size, num_heads, max_seqlen_q sparse
@@ -495,12 +495,13 @@ def spyre__sdpa_overrideable(
     # [batch_size, num_heads, max_seqlen_q, head_dim]; from this producer the
     # names flow automatically to every downstream pointwise/reduction op.
     #
-    # The batch and head dims are deliberately named "_b"/"_h" -- placeholder
-    # names that do NOT match the tiles={"batch_size": ...} / {"num_heads": ...}
-    # contexts below, so only the max_seqlen_q tile activates for now. Renaming
-    # these to "batch_size"/"num_heads" is all it takes to light up those tiles
+    # The head dim is named "num_heads" so it matches the
+    # tiles={"num_heads": ...} scope below and the head tile activates. The
+    # batch dim is still the placeholder "_b" -- it does NOT match
+    # tiles={"batch_size": ...}, so the batch tile stays inactive for now.
+    # Renaming "_b" -> "batch_size" is all it takes to light up the batch tile
     # in a follow-up.
-    with spyre_hint(named_dims=["_b", "_h", "max_seqlen_q", "head_dim"]):
+    with spyre_hint(named_dims=["_b", "num_heads", "max_seqlen_q", "head_dim"]):
         q_scaled = query * scaling_factor
 
     with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
@@ -526,7 +527,9 @@ def spyre__sdpa_overrideable(
                         # Name each slice's first consuming op so the per-chunk
                         # key extent ("blk_len") propagates and the producers tile
                         # with their consumers.
-                        with spyre_hint(named_dims=["_b", "_h", "blk_len", "head_dim"]):
+                        with spyre_hint(
+                            named_dims=["_b", "num_heads", "blk_len", "head_dim"]
+                        ):
                             scaled_keys = k_blk * scaling_factor
                         # v_blk feeds the second matmul directly (line below), so
                         # unlike scaled_keys (re-normalized by keys_T.contiguous())
@@ -540,7 +543,9 @@ def spyre__sdpa_overrideable(
                         # block without a full-tensor value.contiguous() (an OOM on
                         # long KV). The named_dims seed lands on the resulting clone, so
                         # blk_len still propagates.
-                        with spyre_hint(named_dims=["_b", "_h", "blk_len", "head_dim"]):
+                        with spyre_hint(
+                            named_dims=["_b", "num_heads", "blk_len", "head_dim"]
+                        ):
                             v_blk = v_blk.contiguous()
                         # .contiguous() materializes the transposed keys so the
                         # scores matmul sees a clean single-contraction-dim input.
@@ -557,7 +562,7 @@ def spyre__sdpa_overrideable(
                         # untiled restickify boundary). "blk_len" is the per-chunk
                         # key extent -- the scores' last axis.
                         with spyre_hint(
-                            named_dims=["_b", "_h", "max_seqlen_q", "blk_len"]
+                            named_dims=["_b", "num_heads", "max_seqlen_q", "blk_len"]
                         ):
                             scores = torch.matmul(
                                 q_scaled, keys_T
@@ -599,7 +604,7 @@ def spyre__sdpa_overrideable(
                         # keeps the matmul's contraction dim unambiguous.
                         exp_scores_c = exp_scores.contiguous()
                         with spyre_hint(
-                            named_dims=["_b", "_h", "max_seqlen_q", "head_dim"]
+                            named_dims=["_b", "num_heads", "max_seqlen_q", "head_dim"]
                         ):
                             weighted = torch.matmul(exp_scores_c, v_blk)
                         new_output = (
@@ -617,7 +622,7 @@ def spyre__sdpa_overrideable(
                             with spyre_hint(
                                 named_dims=[
                                     "_b",
-                                    "_h",
+                                    "num_heads",
                                     "max_seqlen_q",
                                     "head_dim",
                                 ]
