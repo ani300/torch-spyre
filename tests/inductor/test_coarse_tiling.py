@@ -104,6 +104,7 @@ from torch_spyre._inductor.spyre_kernel import (
 from torch_spyre._inductor.temp_passes import (
     _mark_static_unit_batch_bmm,
     mark_direct_unit_bmm_pass,
+    mm_to_bmm_pass,
 )
 
 _FP16 = DataFormats.SEN169_FP16
@@ -3175,6 +3176,65 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             ["mb", "out", "x"],
         )
 
+    def test_unit_bmm_preserve_leaves_present_rank4_unit_axis_unchanged(self):
+        # Shared-region MLP projections reach layout construction with an
+        # explicit physical size-1, coordinate-0 axis already in place (rank 4).
+        # The optimization is meant to *recover* a unit axis that was squeezed
+        # away; when the axis is already present it must leave the OpSpec alone.
+        # Rewriting the existing axis into the active _spyre_bmm_unit iteration
+        # dimension changes the iteration space and produces a numeric residual.
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        c2 = Symbol("c2")
+        input_arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=[512, 64, 1, 64],
+            device_coordinates=[c0, floor(c2 / 64), Integer(0), Mod(c2, 64)],
+            allocation={"hbm": 0},
+        )
+        kernel_arg = TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=_FP16,
+            device_size=[200, 4096, 64],
+            device_coordinates=[floor(c1 / 64), c2, Mod(c1, 64)],
+            allocation={"hbm": 0x400000000},
+        )
+        output_arg = TensorArg(
+            is_input=False,
+            arg_index=2,
+            device_dtype=_FP16,
+            device_size=[512, 200, 1, 64],
+            device_coordinates=[c0, floor(c1 / 64), Integer(0), Mod(c1, 64)],
+            allocation={"hbm": 0x800000000},
+        )
+        input_size_before = list(input_arg.device_size)
+        input_coords_before = list(input_arg.device_coordinates)
+        output_size_before = list(output_arg.device_size)
+        output_coords_before = list(output_arg.device_coordinates)
+        iteration_space = {
+            c0: (Integer(512), 4),
+            c1: (Integer(12800), 8),
+            c2: (Integer(4096), 1),
+        }
+        op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
+
+        new_iteration_space = _preserve_shared_weight_unit_bmm_dim(
+            "batchmatmul",
+            iteration_space,
+            [input_arg, kernel_arg, output_arg],
+            op_info,
+        )
+
+        self.assertIs(new_iteration_space, iteration_space)
+        self.assertNotIn("_spyre_bmm_unit", {str(dim) for dim in iteration_space})
+        self.assertEqual(input_arg.device_size, input_size_before)
+        self.assertEqual(input_arg.device_coordinates, input_coords_before)
+        self.assertEqual(output_arg.device_size, output_size_before)
+        self.assertEqual(output_arg.device_coordinates, output_coords_before)
+
     def test_unit_bmm_preserve_skips_higher_rank_attention_layout(self):
         c0 = Symbol("c0")
         c1 = Symbol("c1")
@@ -3247,6 +3307,64 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
         self.assertNotIn(
             SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
             self._static_bmm_custom_meta((1, m, 2), (1, 2, n), (1, m, n)),
+        )
+
+    def test_mm_to_bmm_does_not_mark_rank_expanding_output_view(self):
+        batch, rows, inner, heads, head_dim = 1, 64, 2048, 8, 128
+        columns = heads * head_dim
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.empty(
+            (batch, rows, inner), dtype=torch.float16, device="meta"
+        )
+        weight = graph.placeholder("weight")
+        weight.meta["val"] = torch.empty(
+            (inner, columns), dtype=torch.float16, device="meta"
+        )
+        flattened = graph.call_function(
+            torch.ops.aten.reshape.default, args=(x, (rows, inner))
+        )
+        flattened.meta["val"] = torch.empty(
+            (rows, inner), dtype=torch.float16, device="meta"
+        )
+        mm = graph.call_function(
+            torch.ops.aten.mm.default, args=(flattened, weight)
+        )
+        mm.meta["val"] = torch.empty(
+            (rows, columns), dtype=torch.float16, device="meta"
+        )
+        linear_output = graph.call_function(
+            torch.ops.aten.reshape.default,
+            args=(mm, (batch, rows, columns)),
+        )
+        linear_output.meta["val"] = torch.empty(
+            (batch, rows, columns), dtype=torch.float16, device="meta"
+        )
+        heads_view = graph.call_function(
+            torch.ops.aten.reshape.default,
+            args=(linear_output, (batch, rows, heads, head_dim)),
+        )
+        heads_view.meta["val"] = torch.empty(
+            (batch, rows, heads, head_dim),
+            dtype=torch.float16,
+            device="meta",
+        )
+        graph.output(heads_view)
+
+        graph_module = fx.GraphModule({}, graph)
+        mm_to_bmm_pass.apply(graph_module)
+        graph = graph_module.graph
+        graph.lint()
+        bmms = [
+            node
+            for node in graph.nodes
+            if node.op == "call_function"
+            and node.target == torch.ops.aten.bmm.default
+        ]
+        self.assertEqual(len(bmms), 1)
+        self.assertNotIn(
+            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
+            bmms[0].meta.get("custom") or {},
         )
 
     def test_mark_direct_unit_bmm_pass_does_not_mark_reshape_inputs(self):

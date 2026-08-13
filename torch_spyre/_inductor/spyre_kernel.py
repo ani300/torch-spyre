@@ -125,14 +125,24 @@ def _preserve_shared_weight_unit_bmm_dim(
         return it_space
     unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
 
-    if all(len(unit_idxs) == 0 for unit_idxs in unit_idxs_by_arg):
-        for arg in target_args:
-            if len(arg.device_size) < 2:
-                return it_space
-            insert_at = len(arg.device_size) - 1
-            arg.device_size.insert(insert_at, 1)
-            arg.device_coordinates.insert(insert_at, sympy.S.Zero)
-        unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
+    # This optimization only recovers a unit axis that layout construction
+    # squeezed away: it re-synthesizes the axis and folds it into the BMM
+    # iteration space. When a target layout already carries an explicit
+    # physical size-1, coordinate-0 axis (e.g. shared-region MLP projections),
+    # rewriting that existing axis into the active _spyre_bmm_unit iteration
+    # dimension changes the iteration space and corrupts the result. Only
+    # proceed when the axis was squeezed away on *both* target layouts; if one
+    # is already present, leave the OpSpec unchanged.
+    if not all(len(unit_idxs) == 0 for unit_idxs in unit_idxs_by_arg):
+        return it_space
+
+    for arg in target_args:
+        if len(arg.device_size) < 2:
+            return it_space
+        insert_at = len(arg.device_size) - 1
+        arg.device_size.insert(insert_at, 1)
+        arg.device_coordinates.insert(insert_at, sympy.S.Zero)
+    unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
 
     if not all(len(unit_idxs) == 1 for unit_idxs in unit_idxs_by_arg):
         return it_space

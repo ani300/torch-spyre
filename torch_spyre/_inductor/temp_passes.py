@@ -109,6 +109,16 @@ def _is_direct_unit_bmm_operand(node: torch.fx.Node) -> bool:
     return False
 
 
+def _has_rank_expanding_reshape_user(node: torch.fx.Node) -> bool:
+    for user in node.users:
+        if user.op != "call_function" or user.target not in _RESHAPE_OPS:
+            continue
+        output_shape = user.args[1]
+        if isinstance(output_shape, (list, tuple)) and len(output_shape) > 3:
+            return True
+    return False
+
+
 def _mark_direct_static_unit_batch_bmm(
     bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
 ) -> None:
@@ -124,17 +134,8 @@ def _mark_direct_static_unit_batch_bmm(
         ):
             return
 
-    bmm_users = list(bmm_node.users.keys())
-    if len(bmm_users) == 1:
-        output_view = bmm_users[0]
-        if (
-            isinstance(output_view, torch.fx.Node)
-            and output_view.op == "call_function"
-            and output_view.target in _RESHAPE_OPS
-        ):
-            output_shape = output_view.args[1]
-            if isinstance(output_shape, (list, tuple)) and len(output_shape) > 3:
-                return
+    if _has_rank_expanding_reshape_user(bmm_node):
+        return
 
     _mark_static_unit_batch_bmm(bmm_node, lhs_node, rhs_node)
 
@@ -251,11 +252,12 @@ def _unflatten_mm_to_bmm(
         )
         bmm_node.meta["val"] = torch.empty(output_shape, dtype=rhs_dtype, device="meta")
         copy_fx_custom_meta(node, bmm_node)
-        _mark_static_unit_batch_bmm(bmm_node, lhs_input, expanded)
 
     # Replace all uses of mm and output view with the bmm
     node.replace_all_uses_with(bmm_node)
     output_view.replace_all_uses_with(bmm_node)
+    if not _has_rank_expanding_reshape_user(bmm_node):
+        _mark_static_unit_batch_bmm(bmm_node, lhs_input, expanded)
 
     # Clean up dead nodes
     graph.erase_node(output_view)
