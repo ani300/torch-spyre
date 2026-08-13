@@ -29,6 +29,7 @@ from torch._inductor.ir import (
     FallbackKernel,
     FixedLayout,
     InputBuffer,
+    InvokeSubgraph,
     MutationLayoutSHOULDREMOVE,
     MultiOutput,
     ReinterpretView,
@@ -39,7 +40,7 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.graph import GraphLowering
+from torch._inductor.graph import GraphLowering, SubgraphLowering
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 
@@ -1574,13 +1575,93 @@ def _eager_view_input_layout(
     )
 
 
+def _subgraph_input_stls(
+    graph: SubgraphLowering,
+) -> dict[str, SpyreTensorLayout]:
+    """Map each subgraph graph-input name to its parent operand's STL.
+
+    For a subgraph GraphLowering, ``V.get_real_inputs()`` is NOT re-scoped: it
+    still holds the *parent* graph's real inputs, so zipping it against the
+    subgraph's ``graph_input_names`` (as the normal input-conversion loop does)
+    pairs each subgraph input with an unrelated parent tensor and stamps a
+    foreign device layout onto it (issue: fused-QKV weight receiving
+    selected_freqs' STL -> restickify abort).
+
+    The correct source is the parent's ``InvokeSubgraph`` node. Its operand
+    list is stored on the ExternKernel base as ``.inputs`` (the dataclass
+    ``operands`` field stays ``None`` -- the constructor passes them through as
+    ``inputs=operands``). Those operands are the real parent buffers feeding the
+    region and are positionally aligned to the subgraph's ``graph_input_names``
+    (via ``constrain_to_fake_tensor`` at lowering). Each is realized before the
+    subgraph is lowered (the subgraph is lowered lazily during the parent's
+    ``scheduler.codegen()``), so its buffer already carries a resolved
+    ``FixedTiledLayout`` whose ``.device_layout`` is the STL we need. Return a
+    name->STL map; inputs whose operand has no device layout are absent from the
+    map and fall back to the normal (device_tensor_layout) path.
+    """
+    parent = graph.parent
+    invoke: InvokeSubgraph | None = None
+    for op in parent.operations:
+        if isinstance(op, InvokeSubgraph) and op.subgraph is not None:
+            if op.subgraph.graph is graph:
+                invoke = op
+                break
+    # Operands live on the ExternKernel base as `.inputs`; the `operands`
+    # dataclass field is left None by InvokeSubgraph's constructor.
+    operands = getattr(invoke, "inputs", None)
+    if invoke is None or operands is None:
+        return {}
+
+    input_names = graph.graph_input_names
+    result: dict[str, SpyreTensorLayout] = {}
+    for name, operand in zip(input_names, operands):
+        # Unwrap TensorBox/StorageBox to the underlying buffer, then read the
+        # parent-resolved STL off the buffer's FixedTiledLayout.device_layout.
+        buf = operand
+        while hasattr(buf, "data"):
+            buf = buf.data
+        stl = getattr(getattr(buf, "layout", None), "device_layout", None)
+        if stl is not None:
+            result[name] = stl
+    return result
+
+
 def propagate_spyre_tensor_layouts(
     graph: GraphLowering,
 ) -> None:
     operations = graph.operations
     # Convert InputBuffers from FixedLayout to SpyreTensorLayouts
     if len(graph.graph_input_names) > 0:
+        # For a subgraph, V.get_real_inputs() is the PARENT's real-input list
+        # (never re-scoped), so pairing it positionally with the subgraph's
+        # graph_input_names is a misalignment. Source the subgraph inputs' STLs
+        # from the parent InvokeSubgraph operands instead.
+        subgraph_input_stls: dict[str, SpyreTensorLayout] = (
+            _subgraph_input_stls(graph) if isinstance(graph, SubgraphLowering) else {}
+        )
         for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
+            seeded_stl = subgraph_input_stls.get(name)
+            if seeded_stl is not None:
+                tb = graph.graph_inputs[name]
+                if (
+                    not isinstance(tb, TensorBox)
+                    or not isinstance(tb.data, StorageBox)
+                    or not isinstance(tb.data.data, InputBuffer)
+                ):
+                    raise Unsupported(
+                        f"subgraph input {name} is not a "
+                        f"TensorBox(StorageBox(InputBuffer))"
+                    )
+                ptl = tb.data.data.layout
+                if not isinstance(ptl, FixedLayout):
+                    raise Unsupported(
+                        f"subgraph input {name} does not have a FixedLayout"
+                    )
+                # Operands are constrained to contiguous, subgraph-input strides
+                # at lowering (constrain_to_fake_tensor), so there is no view to
+                # rewrite -- stamp the parent-resolved STL directly.
+                tb.layouts = [seeded_stl]
+                continue
             if isinstance(real_input, torch.Tensor):
                 stl = real_input.device_tensor_layout()
                 if stl is None:
@@ -1656,7 +1737,6 @@ def propagate_spyre_tensor_layouts(
                         target_name,
                         type(target_buf).__name__,
                     )
-                    # SpyreEmptyFallback accumulator has no device layout yet.
                     # Treat the mutation op like a normal pointwise op: run
                     # _multi_arg_pointwise_layouts with the "new value" inputs
                     # (excluding the running accumulator read-back).  This
