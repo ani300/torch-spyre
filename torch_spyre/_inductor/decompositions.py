@@ -454,9 +454,7 @@ def spyre__sdpa_overrideable(
     # layout. Use the canonical copy ONLY in the matmul; ``query`` itself is left
     # untouched because the output permute-dance below keys on ``query.stride()``
     # to satisfy the meta kernel's output-stride assertion.
-    query_c = torch.zeros(
-        list(query.shape), device=query.device, dtype=query.dtype
-    )
+    query_c = torch.zeros(list(query.shape), device=query.device, dtype=query.dtype)
     query_m = torch.ops.spyre.opaque_copy_(query, query_c)
 
     kv_block_size = 64

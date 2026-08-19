@@ -7209,9 +7209,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # (the value matmul's probs operand has num_heads * Sq * Skv, and
                 # the weight operands are larger). Sq == 1 here.
                 query_elems = num_heads * sq * head_dim
-                query_sizes = [
-                    ds for ds in bmm_x_sizes if math.prod(ds) == query_elems
-                ]
+                query_sizes = [ds for ds in bmm_x_sizes if math.prod(ds) == query_elems]
                 self.assertTrue(
                     query_sizes,
                     msg=(
