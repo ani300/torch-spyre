@@ -7084,6 +7084,167 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_sdpa_bf16_gqa_decode_query_canonicalized(self):
+        """Layout regression test for the dense Gemma-4-12b **decode** garbage
+        bug (special-token gibberish like ``258882 '<image|>'`` on device while
+        prefill was already correct — root-caused in hf-adapters PR #379, fixed
+        in ``spyre__sdpa_overrideable``'s decomp).
+
+        The query reaches the SDPA score matmul transposed: physical
+        ``[B, S, H, D]`` but logical ``[B, H, S, D]``, the layout the adapter's
+        ``apply_rope_matmul`` ``view(B, S, H, D).transpose(1, 2)`` (+ RoPE
+        ``.sum(4)``) produces. In the *device* layout of that transposed view the
+        stick-major axis is ``head_dim``, so ``num_heads`` is NOT the outermost
+        device dim. As the FIRST operand of the score matmul the query's physical
+        stick layout picks which rows the matmul reads; in the full fused decode
+        graph the wrong sticks are read silently → finite but wrong output. K/V
+        are immune (second operand / value; the decomp's internal transpose
+        absorbs their layout), which is why a KV-side barrier is inert. The fix
+        copies the query into fresh contiguous ``[B, H, S, D]`` zeros (via
+        ``spyre.opaque_copy_``) before it drives the matmul, forcing ``num_heads``
+        back to the outermost device dim.
+
+        A standalone SDPA op CANNOT reproduce the *numerical* corruption: even
+        with the query carrying gemma's byte-exact transposed device layout, the
+        isolated matmul reads it correctly — the corruption is composition/scale
+        dependent (which is why PR #379 split the graph), and the end-to-end
+        numerics are guarded by hf-adapters' gemma-4-12b token-compare test. What
+        this test locks in instead is the fix's *mechanism*, which IS observable
+        in isolation: it asserts the score matmul's query operand reaches the
+        matmul with ``num_heads`` outermost in its device layout. Without the fix
+        ``device_size[0]`` is the (size-1) query length and ``num_heads`` sits at
+        an inner device dim → the assertion fails; with the fix
+        ``device_size[0] == num_heads``.
+
+        Covers both dense Gemma-4-12b decode attention types: sliding (16 query /
+        8 KV heads, head_dim 256) and full (16 query / 1 KV head, head_dim 512).
+        Sq=1 (a single decode step) matters: prefill was already correct in the
+        failing baseline; only the single-query decode step was corrupted."""
+        from torch_spyre._inductor.constants import (
+            BATCH_MATMUL_FP8_OP,
+            BATCH_MATMUL_OP,
+        )
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        # (name, num_heads, num_kv_heads, head_dim)
+        geometries = [("sliding", 16, 8, 256), ("full", 16, 1, 512)]
+        for name, num_heads, num_kv_heads, head_dim in geometries:
+            with self.subTest(attention=name):
+                sq, skv = 1, 64
+                generator = torch.Generator().manual_seed(1337)
+                q_source = (
+                    torch.randn(
+                        (1, sq, num_heads * head_dim),
+                        dtype=torch.bfloat16,
+                        generator=generator,
+                    )
+                    * 0.1
+                )
+                k = (
+                    torch.randn(
+                        (1, num_kv_heads, skv, head_dim),
+                        dtype=torch.bfloat16,
+                        generator=generator,
+                    )
+                    * 0.1
+                )
+                v = (
+                    torch.randn(
+                        (1, num_kv_heads, skv, head_dim),
+                        dtype=torch.bfloat16,
+                        generator=generator,
+                    )
+                    * 0.1
+                )
+                mask = torch.zeros((1, 1, sq, skv), dtype=torch.bfloat16)
+
+                def fn(q_source, k, v, mask):
+                    # In-graph view+transpose reproduces the adapter's RoPE-output
+                    # query layout: physical [B, S, H, D], logical [B, H, S, D].
+                    q = q_source.view(1, sq, num_heads, head_dim).transpose(1, 2)
+                    return F.scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        attn_mask=mask,
+                        dropout_p=0.0,
+                        scale=1 / head_dim**0.5,
+                        enable_gqa=True,
+                    )
+
+                expected = fn(q_source, k, v, mask)
+
+                # Capture the device_size of every batch-matmul's first (x) input
+                # operand as the compiler emits its op-specs. For the score
+                # matmul that first operand is the query.
+                bmm_x_sizes = []
+                orig_create_op_spec = SpyreKernel.create_op_spec
+
+                def capturing_create_op_spec(
+                    self, op, is_reduction, args, op_info, *a, **kw
+                ):
+                    if op in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP) and args:
+                        bmm_x_sizes.append(list(args[0].device_size))
+                    return orig_create_op_spec(
+                        self, op, is_reduction, args, op_info, *a, **kw
+                    )
+
+                with mock.patch.object(
+                    SpyreKernel, "create_op_spec", capturing_create_op_spec
+                ):
+                    actual = (
+                        torch.compile(fn, dynamic=False)(
+                            q_source.to("spyre"),
+                            k.to("spyre"),
+                            v.to("spyre"),
+                            mask.to("spyre"),
+                        )
+                        .cpu()
+                        .float()
+                        .flatten()
+                    )
+
+                # The score matmul's query operand is the batch-matmul x-operand
+                # whose device layout holds exactly num_heads * head_dim elements
+                # (the value matmul's probs operand has num_heads * Sq * Skv, and
+                # the weight operands are larger). Sq == 1 here.
+                query_elems = num_heads * sq * head_dim
+                query_sizes = [
+                    ds for ds in bmm_x_sizes if math.prod(ds) == query_elems
+                ]
+                self.assertTrue(
+                    query_sizes,
+                    msg=(
+                        f"[{name}] no batch-matmul input operand with "
+                        f"{query_elems} elements found; captured {bmm_x_sizes}"
+                    ),
+                )
+                for ds in query_sizes:
+                    self.assertEqual(
+                        ds[0],
+                        num_heads,
+                        msg=(
+                            f"[{name}] the score matmul's query operand reaches "
+                            f"the matmul with num_heads not outermost in its "
+                            f"device layout (device_size={ds}); the query-"
+                            f"canonicalization fix in spyre__sdpa_overrideable "
+                            f"should force device_size[0] == num_heads="
+                            f"{num_heads}. This is the dense Gemma-4-12b decode "
+                            f"transposed-query bug (hf-adapters PR #379)."
+                        ),
+                    )
+
+                # Sanity guard: the op still compiles and runs to finite output.
+                # (Isolated numerics match with or without the fix — see above —
+                # so this is not the fix-regression signal, only breakage bait.)
+                expected = expected.float().flatten()
+                cosine = F.cosine_similarity(actual, expected, dim=0).item()
+                self.assertTrue(
+                    torch.isfinite(actual).all() and cosine >= 0.99,
+                    msg=f"[{name}] cosine={cosine:.8f}",
+                )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):
         def test(end, device=None):
             return torch.arange(end, device=device, dtype=torch.float16)
