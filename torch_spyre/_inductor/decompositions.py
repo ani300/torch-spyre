@@ -427,51 +427,22 @@ def spyre__sdpa_overrideable(
         key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
 
-    # Canonicalize ``query``'s layout before it drives the score matmul below.
-    #
-    # ``query`` reaches this decomp transposed (physical [B, S, H, D], logical
-    # [B, H, S, D]) whenever it was built as ``...view(B, S, H, D).transpose(1, 2)``
-    # -- the standard attention path (e.g. hf-adapters' apply_rope_matmul, whose
-    # RoPE ``.sum(4)`` leaves the query transposed). As the FIRST matmul operand,
-    # ``query``'s physical stick layout picks which rows ``torch.matmul`` reads;
-    # matmul-layout Pass 1 accepts the transposed view as a zero-cost stick match
-    # whenever the physical stick coincidentally carries the needed loop var, so
-    # the matmul silently reads the wrong sticks and the attention output is wrong
-    # (Gemma 4 dense decode produced garbage special tokens, top-1 diverged with
-    # a per-token logit max-diff ~11; prefill was already correct). Key/value do
-    # NOT need this: they feed the matmul as the second operand / value, so the
-    # decomp's internal transpose absorbs their entry layout.
-    #
-    # spyre.opaque_copy_ (PR #3811) is a functional custom op whose Inductor
-    # lowering introduces a MutationLayoutSHOULDREMOVE write one stage after
-    # AOTAutograd's functional-graph check -- so it survives remove_noop_ops
-    # (an aten.clone/aten.copy here is in Inductor's noop_registry and gets
-    # eliminated before any Spyre restickify pass runs) AND is legal inside this
-    # decomp (reached via proxy-mode decomposition substitution, which never
-    # re-enters FunctionalTensorMode; a mutating copy_forced would trip
-    # assert_functional_graph). The copy into a FRESH CONTIGUOUS destination
-    # (torch.zeros, NOT zeros_like) forces a restickify to canonical [B, H, S, D]
-    # layout. Use the canonical copy ONLY in the matmul; ``query`` itself is left
-    # untouched because the output permute-dance below keys on ``query.stride()``
-    # to satisfy the meta kernel's output-stride assertion.
+    # query can arrive transposed (physical [B, S, H, D] behind a logical
+    # [B, H, S, D] view). As the first matmul operand its physical layout selects
+    # which rows are read, so the transposed view reads the wrong sticks. Copy
+    # into a fresh contiguous buffer to canonicalize; opaque_copy_ is used because
+    # a clone/copy would be dropped by Inductor's noop_registry before restickify.
+    # Use the copy only in the score matmul -- the output permute below keys on
+    # the original query.stride().
     query_c = torch.zeros(list(query.shape), device=query.device, dtype=query.dtype)
     query_m = torch.ops.spyre.opaque_copy_(query, query_c)
 
     kv_block_size = 64
     q_block_size = 64
 
-    # The output accumulator must NOT inherit ``query``'s physical layout.
-    # ``query`` reaches this decomp transposed (physical [B, S, H, D], logical
-    # [B, H, S, D]) whenever it was built as ``...view(B,S,H,D).transpose(1,2)``
-    # (the standard attention path, e.g. hf-adapters' apply_rope_matmul). With
-    # ``torch.zeros_like(query)`` the accumulator inherits that transposed stick
-    # layout, and the online-softmax ``opaque_copy_`` in-place writes fold a
-    # standard-layout ``matmul(exp_scores, value)`` result into a transposed
-    # accumulator -- a layout mismatch the in-place copy does not resolve, so
-    # the attention output is silently wrong (Gemma 4 E2B device garbage).
-    # Allocate a plain contiguous [B, H, S, D] accumulator instead; the final
-    # permute-dance below still re-materializes the output in query's layout to
-    # satisfy the meta kernel's stride assertion.
+    # Not zeros_like(query): a transposed query would give the accumulator a
+    # transposed layout, into which the online-softmax in-place writes fold the
+    # contiguous matmul(exp_scores, value) incorrectly. Allocate contiguous.
     output = torch.zeros(
         (batch_size, num_heads, max_seqlen_q, head_dim),
         device=query.device,
