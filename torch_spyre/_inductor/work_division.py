@@ -20,6 +20,7 @@ from sympy import Expr, Integer, Symbol, divisors
 from .ir import (
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    AllReduceAsyncFallback,
     BroadcastAsyncFallback,
     WaitWorkFallback,
 )
@@ -40,7 +41,7 @@ from torch._inductor.graph import GraphLowering
 from torch_spyre._C import ElementArrangement
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, DEVICE_NAME, TOPK_OPS, BATCH_MATMUL_FP8_OP
+from .constants import BATCH_MATMUL_OP, DEVICE_NAME, BATCH_MATMUL_FP8_OP
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -51,6 +52,7 @@ from .pass_utils import (
     get_mem_deps_from_rw,
     device_coordinates,
     iteration_space_from_op,
+    is_topk,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
     op_read_writes,
@@ -412,19 +414,19 @@ def get_per_core_span(
     return itemsize
 
 
-def warn_if_per_core_overflow(
+def raise_if_per_core_overflow(
     tensor_deps: list[TensorDep],
     it_space_orig: dict[Symbol, Expr],
     splits: dict[Symbol, int],
     op_name: str,
     symbol_meta: SymbolMeta,
 ) -> None:
-    """Log CRITICAL if any tensor's per-core memory span exceeds MAX_SPAN_BYTES."""
+    """Raise Unsupported if any tensor's per-core memory span exceeds MAX_SPAN_BYTES."""
     for td in tensor_deps:
         per_core_span = get_per_core_span(td, splits, it_space_orig, symbol_meta)
         if per_core_span > MAX_SPAN_BYTES:
             dl = td.layout.device_layout
-            logger.critical(
+            raise Unsupported(
                 f"{op_name}: per-core tensor span "
                 f"{per_core_span / (1024 * 1024):.3f} MB "
                 f"(shape={list(td.layout.size)}, dtype={td.layout.dtype}, "
@@ -695,18 +697,15 @@ def enumerate_work_division_candidates(
     of ``1`` means the dim is unsplit; the all-ones single-core split is
     included when it is itself permissible.
 
-    Only ``Pointwise`` / ``Reduction`` ops have a divisible iteration space;
-    ``TOPK`` reductions run single-core, so they yield only the unsplit split.
+    For ``TOPK`` reductions, k's factors are restricted to divisors ``d``
+    with ``k / d <= _TOPK_MAX_K_PER_CORE``, and the search-space dim is
+    pinned to 1 via the ``topk_pinned_search_space_vars`` constraint.
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
 
     it_space = iteration_space_from_op(op)
-
-    # TOPK reductions run single-core (see divide_reduction_op): the only
-    # permissible "division" is the unsplit one.
-    if isinstance(op.data, Reduction) and op.data.reduction_type in TOPK_OPS:
-        return [{v: 1 for v in it_space}]
+    op_is_topk = is_topk(op)
 
     input_tds, output_td = collect_tensor_deps(
         op, get_mem_deps_from_rw(op_read_writes(op))
@@ -722,6 +721,12 @@ def enumerate_work_division_candidates(
     # device coordinates (mirrors prioritize_dimensions / splits_by_index_coeff).
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+
+    topk_k_sym = None
+    if op_is_topk:
+        output_dims, _ = prioritize_dimensions(output_td, it_space_adjusted)
+        topk_k_sym = _find_topk_k_symbol(output_dims, input_tds)
+
     constraint_result = collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
@@ -740,6 +745,9 @@ def enumerate_work_division_candidates(
     # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
     # no ``>= current_min`` floor (we want the full set, including 1).
     def factors(v: Symbol) -> list[int]:
+        if op_is_topk and v == topk_k_sym:
+            k_val = concretize_expr(it_space[v])
+            return _topk_valid_k_splits(k_val, max_cores) or [1]
         if v in symbol_meta:
             basis = symbol_meta[v][1]  # granularity
         elif v in stick_vars:
@@ -1128,7 +1136,7 @@ def work_distribution_pass(
                     f"min_splits={committed_splits}, user_splits={user_splits}, "
                     f"op_it_space_splits={op_splits}"
                 )
-            warn_if_per_core_overflow(
+            raise_if_per_core_overflow(
                 all_tds, it_space, user_splits, op.get_name(), symbol_meta
             )
             return
@@ -1155,7 +1163,7 @@ def work_distribution_pass(
             f"op_it_space_splits={op.op_it_space_splits}"
         )
 
-    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
+    raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
 
 _PT_ROWS = 8  # PT block rows per corelet
@@ -1499,24 +1507,50 @@ def divide_pointwise_op(
     pass_fn(op, args, max_cores)
 
 
+# Maximum k rows that the topk hardware op can process per core.
+_TOPK_MAX_K_PER_CORE = 4
+
+
+def _find_topk_k_symbol(
+    output_dims: list[Symbol], input_tds: list[TensorDep]
+) -> Symbol | None:
+    """Return the output symbol absent from every input's device coords.
+
+    ``_topk_reduction_kwargs`` (lowering.py) substitutes the reduction loop
+    var for k in every input load, so k's symbol never appears in an input's
+    device coords -- unlike batch/other output dims, which pass through
+    unchanged. This distinguishes k independent of size.
+
+    Returns None if no such symbol exists, or more than one does (should not
+    happen for a well-formed topk op).
+    """
+    input_syms = {
+        s for td in input_tds for e in td.device_coords[:-1] for s in e.free_symbols
+    }
+    candidates = [d for d in output_dims if d not in input_syms]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _topk_valid_k_splits(k_val: int, max_cores: int) -> list[int]:
+    """Return every divisor of k_val that is a legal per-core k-split.
+
+    A divisor ``d`` is legal iff ``d <= max_cores`` and
+    ``k_val // d <= _TOPK_MAX_K_PER_CORE``. ``d=1`` is included iff
+    ``k_val <= _TOPK_MAX_K_PER_CORE``. Results are sorted ascending.
+    """
+    return [
+        d
+        for d in sorted(divisors(k_val))
+        if d <= max_cores and k_val // d <= _TOPK_MAX_K_PER_CORE
+    ]
+
+
 def divide_reduction_op(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
     max_cores: int,
     pass_fn: Callable,
 ) -> None:
-    red: Reduction = op.data
-
-    # Currently we support Topk for k<=4, which can be handled efficiently on single core
-    # TODO: Modification will be required to enable Topk for k>4
-    if red.reduction_type in TOPK_OPS:
-        if not config.ignore_work_division_hints and _has_work_div_hint(op):
-            logger.warning(
-                f"work_division_hint: {op.get_name()} ignores work_div hint "
-                f"because TOPK reductions run single-core."
-            )
-        return
-
     pass_fn(op, args, max_cores)
 
 
@@ -1550,8 +1584,15 @@ def _iter_computed_buffers(operations: list[Operation]):
                 # Work division not supported on allocation/constant kernels, nor
                 # on DeviceCopy.
                 pass
-            elif isinstance(op, (BroadcastAsyncFallback, WaitWorkFallback)):
-                # Work division not supported on broadcast kernels
+            elif isinstance(
+                op,
+                (
+                    BroadcastAsyncFallback,
+                    WaitWorkFallback,
+                    AllReduceAsyncFallback,
+                ),
+            ):
+                # Work division not supported on collective kernels
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")
@@ -1698,7 +1739,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         return False
 
     apply_splits(op, splits, output_td)
-    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
+    raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(

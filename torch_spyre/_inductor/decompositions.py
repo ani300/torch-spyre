@@ -332,9 +332,16 @@ def spyre_topk(
     input: torch.Tensor,
     k: int,
     dim: Optional[int] = -1,
+    largest: bool = True,
+    sorted: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if k > 4:
-        raise Unsupported("Topk is not supported for this config")
+    if k > 128:
+        raise Unsupported(f"topk with k={k} is not supported (max k=128)")
+    if not largest:
+        raise Unsupported("topk with largest=False")
+    # sorted=False is a no-op: our reduction always returns sorted output.
+    # Index stays in the input dtype (not int64) all the way out; topkindex's
+    # fake reports it so Dynamo traces it with no meta conflict.
     return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
         input, k, dim
     )
@@ -630,6 +637,7 @@ def spyre__sdpa_overrideable(
                                 output = new_output / new_denom.unsqueeze(-1)
                         else:
                             M, denominator, output = new_max, new_denom, new_output
+
     # The reference meta kernel for this op
     # (torch._meta_registrations.meta__scaled_dot_product_fused_attention_
     # overrideable -> alloc_with_matching_layout) declares the output layout to
