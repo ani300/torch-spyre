@@ -199,6 +199,66 @@ def _dma_to_spyre_indirect_access(
     return dst
 
 
+def dma_moe_expert_weight_to_spyre(
+    weight: torch.Tensor,
+    target_dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    """Transfer a rank-3 ``[E, C, F]`` MoE expert weight to Spyre.
+
+    The expert dim ``E`` is placed outermost on the device and the free/output
+    dim ``F`` is split into stick-sized blocks, giving device dims
+    ``[E, C, F // eps, eps]`` where ``eps`` is the elements-per-stick for the
+    device dtype. This one layout serves both MoE paths:
+
+      * the decode gather ``weight[idx]`` needs the indexed (expert) dim
+        outermost -- the "indirect access" requirement; and
+      * the matmul weight operand ``A[m,k] @ B[k,n]`` needs the weight sticked
+        on its free dim ``n`` (here ``F``), with the contraction dim ``C``
+        un-split in the middle.
+
+    ``gate``/``up`` are logical ``[E, H, M]`` (contract H, free M); ``down`` is
+    logical ``[E, M, H]`` (contract M, free H). The logical PyTorch
+    shape/stride is unchanged; only the device layout carries this arrangement.
+
+    Uses the 3-arg device-dims ``SpyreTensorLayout`` overload with the *device*
+    dtype (``get_device_dtype``).
+
+    Requires ``F % eps == 0``; otherwise the sticks can't tile the free dim, so
+    we warn and return ``None`` to signal the caller to fall back to a default
+    move (which still loads and runs, just without the shared-layout
+    optimization).
+
+    Caller must ensure ``weight.ndim == 3``.
+    """
+    assert weight.ndim == 3, "MoE expert-weight path is for rank-3 [E,C,F] only"
+
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    dev_dtype = target_dtype if target_dtype is not None else weight.dtype
+
+    experts, contract, free = weight.shape
+    # elems_per_stick is dtype-aware (64 at fp16/bf16, 32 at fp32), so query it
+    # rather than hardcoding a stick size.
+    eps = SpyreTensorLayout(list(weight.shape), dev_dtype).elems_per_stick()
+    if free % eps != 0:
+        warnings.warn(
+            f"MoE expert-weight free dim {free} is not a multiple of the Spyre "
+            f"stick size {eps} for dtype {dev_dtype}; falling back to the "
+            "default layout (no shared-layout optimization) for this weight.",
+            stacklevel=2,
+        )
+        return None
+
+    layout = SpyreTensorLayout(
+        [experts, contract, free // eps, eps],  # device_size: E outermost
+        [contract * free, free, eps, 1],  # stride_map
+        get_device_dtype(dev_dtype),
+    )
+    dst = spyre_empty_with_layout(weight.size(), weight.stride(), dev_dtype, layout)
+    copy_tensor(weight, dst, non_blocking=False)
+    return dst
+
+
 # --- Model loading ---------------------------------------------------
 
 
