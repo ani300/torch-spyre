@@ -22,6 +22,7 @@ import regex
 import torch
 import sympy
 from sympy import Expr, Symbol
+from sympy.polys.polyerrors import PolynomialError
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
@@ -1552,9 +1553,11 @@ def normalize_matmul_input_layout(
     and the inner stick changes which core owns each tile.
 
     Unit axes do not affect physical ownership.  Among non-unit axes, reorder
-    only the batch and outer-stick ownership subsequence so every batch axis
-    precedes the outer stick tile.  Unrelated axes keep their physical slots;
-    moving them would manufacture full-tensor copies for ordinary 2D matmuls.
+    only the broadcast-batch and outer-stick ownership subsequence so every
+    relevant batch axis precedes the outer stick tile.  Batch axes carried by
+    both operands already share a physical ownership frame and must not be
+    normalized: doing so manufactures full-tensor copies for ordinary BMMs.
+    Unrelated axes keep their physical slots.
 
     Return ``None`` when a non-unit physical coordinate mixes the stick variable
     with a batch variable.  Free-symbol membership cannot distinguish, for
@@ -1626,15 +1629,53 @@ def matmul_output_batch_vars(
     return set().union(*(coord.free_symbols for coord in output_coords[:-2]))
 
 
+def matmul_ownership_batch_vars(
+    output_layout: FixedLayout,
+    output_dep: MemoryDep,
+    input_deps: list[MemoryDep],
+) -> set[sympy.Symbol]:
+    """Return output batch variables broadcast by at least one matmul operand.
+
+    A batch variable used affinely and one-to-one by both operands gives the
+    kernel a common ownership coordinate, so preserving its existing position
+    relative to the stick's outer tiles is safe.  Canonicalizing those shared
+    axes adds large, redundant copies to ordinary BMMs.  A variable missing
+    from either operand, or reused through a non-affine expression such as
+    ``floor(head / group)``, has no common input ownership frame; these are the
+    GQA/broadcast axes that must precede the outer stick tile.
+
+    Be conservative when the lowered reduction does not expose exactly two
+    tensor reads: retain all output batch variables rather than assuming an
+    axis is shared.
+    """
+    output_batch_vars = matmul_output_batch_vars(output_layout, output_dep)
+    if len(input_deps) != 2:
+        return output_batch_vars
+
+    def is_direct_axis(dep: MemoryDep, var: sympy.Symbol) -> bool:
+        try:
+            return sympy.Poly(dep.index, var).degree() == 1
+        except PolynomialError:
+            return False
+
+    shared_input_vars = {
+        var
+        for var in output_batch_vars
+        if all(is_direct_axis(dep, var) for dep in input_deps)
+    }
+    return output_batch_vars - shared_input_vars
+
+
 def matmul_batch_vars(op: ComputedBuffer) -> set[sympy.Symbol]:
-    """Return the output batch variables for a lowered matmul operation."""
+    """Return ownership-relevant batch variables for a lowered matmul."""
     write_deps = [
         dep for dep in op_read_writes(op).writes if isinstance(dep, MemoryDep)
     ]
     if not write_deps:
         return set()
 
-    return matmul_output_batch_vars(op.layout, write_deps[0])
+    read_deps = [dep for dep in op_read_writes(op).reads if isinstance(dep, MemoryDep)]
+    return matmul_ownership_batch_vars(op.layout, write_deps[0], read_deps)
 
 
 def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
@@ -1708,6 +1749,25 @@ def compute_restickify_needed(
         else None
     )
     batch_vars = matmul_batch_vars(op) if is_matmul else set()
+    if matmul_stick_var is not None:
+        assert op is not None
+        write_deps = [
+            dep for dep in op_read_writes(op).writes if isinstance(dep, MemoryDep)
+        ]
+        all_batch_vars = (
+            matmul_output_batch_vars(op.layout, write_deps[0]) if write_deps else set()
+        )
+        normalized_required = normalize_matmul_input_layout(
+            out_stl, out_idc, matmul_stick_var, all_batch_vars
+        )
+        if normalized_required is None:
+            return True, None
+        # Propagation canonicalizes shared axes only when the operands disagree
+        # about their ownership order.  The required layout records that
+        # decision.  Enforce every output batch axis when it is canonical;
+        # otherwise retain only the broadcast/reused axes selected above.
+        if normalized_required == out_stl:
+            batch_vars = all_batch_vars
     # Input stick with an offset always needs restickify to remove the offset.
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
     if in_stick_offset_free and stick_compatible([idc, out_idc]):

@@ -85,6 +85,7 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    matmul_ownership_batch_vars,
     matmul_output_batch_vars,
     normalize_matmul_input_layout,
 )
@@ -890,22 +891,118 @@ def _matmul_layouts(
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var(x.dep, output_dep)
     generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
-    batch_vars = matmul_output_batch_vars(output, output_dep)
 
     x_req_stl = find_stick_compatible_input_layout(
         x,
         reduction_var,
         data.reduction_type,
         "x",
-        matmul_batch_vars=batch_vars,
     )
     y_req_stl = find_stick_compatible_input_layout(
         y,
         generated_var,
         data.reduction_type,
         "y",
-        matmul_batch_vars=batch_vars,
     )
+
+    all_batch_vars = matmul_output_batch_vars(output, output_dep)
+    batch_vars = matmul_ownership_batch_vars(output, output_dep, [x.dep, y.dep])
+
+    def batch_outer_order(
+        stl: SpyreTensorLayout,
+        dep: MemoryDep,
+        stick_var: sympy.Symbol,
+        batch_var: sympy.Symbol,
+    ) -> int | None:
+        """Return -1/1 when batch is before/after the outer stick tiles."""
+        coords = try_device_coordinates(stl, dep, None)
+        if coords is None:
+            return None
+        physical_axes = [
+            axis for axis, size in enumerate(stl.device_size[:-1]) if size > 1
+        ]
+        batch_axes = [
+            axis for axis in physical_axes if batch_var in coords[axis].free_symbols
+        ]
+        stick_axes = [
+            axis for axis in physical_axes if stick_var in coords[axis].free_symbols
+        ]
+        if not batch_axes or not stick_axes:
+            return None
+        if set(batch_axes) & set(stick_axes):
+            return 0
+        if max(batch_axes) < min(stick_axes):
+            return -1
+        if min(batch_axes) > max(stick_axes):
+            return 1
+        return 0
+
+    def outer_stick_tiles(
+        stl: SpyreTensorLayout,
+        dep: MemoryDep,
+        stick_var: sympy.Symbol,
+    ) -> int | None:
+        coords = try_device_coordinates(stl, dep, None)
+        if coords is None:
+            return None
+        axes = [
+            axis
+            for axis in range(len(stl.device_size) - 1)
+            if stick_var in coords[axis].free_symbols
+        ]
+        if not axes:
+            return 1
+        return math.prod(int(stl.device_size[axis]) for axis in axes)
+
+    output_m = concretize_expr(output.size[-2])
+    output_n = concretize_expr(output.size[-1])
+    output_nonbatch_work = output_m * math.ceil(
+        output_n / get_elem_in_stick(output.dtype)
+    )
+    x_outer_tiles = outer_stick_tiles(x_req_stl, x.dep, reduction_var)
+    y_outer_tiles = outer_stick_tiles(y_req_stl, y.dep, generated_var)
+    batch_may_split = output_nonbatch_work < config.sencores
+    unequal_outer_tiles = (
+        x_outer_tiles is not None
+        and y_outer_tiles is not None
+        and x_outer_tiles != y_outer_tiles
+    )
+
+    # Direct shared batch axes can keep a non-canonical order only when both
+    # operands agree on it and the output's M/N work can occupy every core.
+    # Decode GQA is the important counterexample: M/N alone cannot fill the
+    # machine, so heads participate in core ownership; if K_outer and N_outer
+    # have different cardinalities, placing heads after them maps the same head
+    # to different cores on the two inputs.  Canonicalize just those exposed or
+    # conflicting axes.
+    for batch_var in all_batch_vars - batch_vars:
+        orders = {
+            order
+            for order in (
+                batch_outer_order(x_req_stl, x.dep, reduction_var, batch_var),
+                batch_outer_order(y_req_stl, y.dep, generated_var, batch_var),
+            )
+            if order is not None
+        }
+        exposed_unequal_tiles = batch_may_split and unequal_outer_tiles and 1 in orders
+        if 0 in orders or len(orders) > 1 or exposed_unequal_tiles:
+            batch_vars.add(batch_var)
+
+    if batch_vars:
+        x_req_stl = find_stick_compatible_input_layout(
+            x,
+            reduction_var,
+            data.reduction_type,
+            "x",
+            matmul_batch_vars=batch_vars,
+        )
+        y_req_stl = find_stick_compatible_input_layout(
+            y,
+            generated_var,
+            data.reduction_type,
+            "y",
+            matmul_batch_vars=batch_vars,
+        )
 
     out_stick_dim = next(
         (i for i, c in enumerate(out_coords) if generated_var in c.free_symbols),
