@@ -1324,19 +1324,19 @@ def _is_restickify_op(op) -> bool:
 
 
 def _restickify_readers_by_source(fn, *args):
-    """Run fn on Spyre and return {producer_name: [restickify buffer names]},
-    a map of every source buffer to the restickify ops that read it, captured
-    from graph.operations right after insert_restickify splices them in."""
+    """Capture restickify readers and their FX metadata after insertion."""
     import torch_spyre._inductor.passes as _passes
 
     insert_restickify = _passes.insert_restickify
     by_source: dict[str, list[str]] = {}
+    fx_metas = []
 
     def capturing_insert_restickify(graph):
         insert_restickify(graph)
         for op in graph.operations:
             if not _is_restickify_op(op):
                 continue
+            fx_metas.append(next(iter(op.origins)).meta)
             for read in op.get_read_writes().reads:
                 name = getattr(read, "name", None)
                 if name is not None:
@@ -1344,21 +1344,22 @@ def _restickify_readers_by_source(fn, *args):
 
     with patch.object(_passes, "insert_restickify", capturing_insert_restickify):
         _compile_and_run(fn, args, DEVICE)
-    return by_source
+    return by_source, fx_metas
 
 
-def test_shared_producer_gets_two_restickify_nodes():
+def test_shared_producer_gets_two_restickify_nodes_with_fx_metadata():
     """insert_restickify keys its plan by consumer, not by source, so a producer
     that fans out to two consumers each wanting a different layout gets a
     *separate* restickify node per consumer -- both reading the one producer.
-    We assert the two-node shape directly rather than via the fusion log."""
+    The inserted nodes must retain tensor metadata needed by later IR passes."""
     (x, za, zb), fn = _shared_producer_two_restickify_case()
-    by_source = _restickify_readers_by_source(fn, x, za, zb)
+    by_source, fx_metas = _restickify_readers_by_source(fn, x, za, zb)
     shared = [src for src, readers in by_source.items() if len(readers) >= 2]
     assert shared, (
         "expected one producer read by >=2 restickify nodes, got "
         f"{ {s: r for s, r in by_source.items()} }"
     )
+    assert fx_metas and all("val" in meta for meta in fx_metas)
 
 
 # ------- Restickify padding: strict (distinct values + torch.equal) ---------

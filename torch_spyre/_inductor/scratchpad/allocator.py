@@ -119,6 +119,44 @@ _LX_TRACKER_CAPACITY_BYTES = (
 _LX_ALLOCATION_GRANULARITY_BYTES = 128
 
 
+def _is_outer_layout_restickify(graph: GraphLowering, op: Operation) -> bool:
+    """Return whether ``op`` reorders outer device axes without moving the stick.
+
+    These ownership-normalizing copies are emitted as ordinary identities:
+    :func:`is_restickify_coords` classifies only a change of the within-stick
+    host dimension as ``ReStickifyOpHBM``.  HBM can address the identity's
+    physically distinct outer-axis layout globally, but an LX allocation is a
+    packed per-core slice and cannot preserve that global ownership frame.
+    Keep such outputs in HBM until the identity emitter can represent this
+    HBM-to-LX ownership transition explicitly.
+    """
+    if op_short_name(op) != "restickify":
+        return False
+    output_layout = op.get_layout()
+    if not isinstance(output_layout, FixedTiledLayout):
+        return False
+    reads = [dep for dep in op_read_writes(op).reads if isinstance(dep, MemoryDep)]
+    if len(reads) != 1:
+        return False
+    read = reads[0]
+    input_layout = getattr(op, "_input_layout_overrides", {}).get(read.name)
+    if input_layout is None:
+        input_buf = graph.get_buffer(read.name)
+        if input_buf is None:
+            return False
+        input_layout = input_buf.get_layout()
+    if not isinstance(input_layout, FixedTiledLayout):
+        return False
+
+    input_stl = input_layout.device_layout
+    output_stl = output_layout.device_layout
+    same_stick = input_stl.stride_map[-1] == output_stl.stride_map[-1]
+    outer_layout_changed = list(input_stl.device_size) != list(
+        output_stl.device_size
+    ) or list(input_stl.stride_map) != list(output_stl.stride_map)
+    return same_stick and outer_layout_changed
+
+
 def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
     """True if an opaque extern kernel runs at any point while the buffer is live.
 
@@ -426,6 +464,8 @@ class ScratchpadAllocator:
         """
         if op is None or not self._op_output_good_for_lx_reuse(op, planned_lx_buffers):
             return "op not allowed"
+        if _is_outer_layout_restickify(graph, op):
+            return "outer-layout restickify output requires global addressing"
         if not hasattr(getattr(op, "layout", None), "device_layout"):
             # No device layout => no computable footprint (e.g. a
             # MultiOutputLayout tuple op). There is nothing to place, and the

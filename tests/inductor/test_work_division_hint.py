@@ -50,7 +50,10 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
 )
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg, TensorWorkDivision
 from torch_spyre._inductor.pass_utils import PerCoreView
-from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+from torch_spyre._inductor.scratchpad.allocator import (
+    ScratchpadAllocator,
+    _is_outer_layout_restickify,
+)
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from torch_spyre._inductor.spyre_kernel import _remap_work_division, simplify_op_spec
@@ -816,6 +819,51 @@ def test_lx_relayout_consumers_share_destination_view(second_consumer):
     if not shares_destination:
         expected_destinations.add("sympify('c0'): 8")
     assert {pair[1] for pair in divisions} == expected_destinations
+
+
+@pytest.mark.parametrize(
+    "output_stick_stride,expected",
+    [(1, True), (128, False)],
+    ids=["outer-layout", "different-stick"],
+)
+def test_outer_layout_restickify_requires_global_addressing(
+    output_stick_stride, expected
+):
+    input_stl = SimpleNamespace(
+        device_size=[64, 2, 16, 64],
+        stride_map=[128, 64, 8192, 1],
+    )
+    output_stl = SimpleNamespace(
+        device_size=[16, 64, 2, 64],
+        stride_map=[8192, 128, 64, output_stick_stride],
+    )
+    input_layout = SimpleNamespace(device_layout=input_stl)
+    output_layout = SimpleNamespace(device_layout=output_stl)
+    read = SimpleNamespace(name="source")
+    op = SimpleNamespace(get_layout=lambda: output_layout)
+    graph = SimpleNamespace(
+        get_buffer=lambda _name: SimpleNamespace(get_layout=lambda: input_layout)
+    )
+
+    with (
+        mock_patch(
+            "torch_spyre._inductor.scratchpad.allocator.op_short_name",
+            return_value="restickify",
+        ),
+        mock_patch(
+            "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
+            return_value=SimpleNamespace(reads=[read]),
+        ),
+        mock_patch(
+            "torch_spyre._inductor.scratchpad.allocator.FixedTiledLayout",
+            SimpleNamespace,
+        ),
+        mock_patch(
+            "torch_spyre._inductor.scratchpad.allocator.MemoryDep",
+            SimpleNamespace,
+        ),
+    ):
+        assert _is_outer_layout_restickify(graph, op) is expected
 
 
 def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
