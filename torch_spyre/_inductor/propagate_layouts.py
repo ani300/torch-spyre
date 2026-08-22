@@ -85,6 +85,7 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    matmul_output_batch_vars,
     normalize_matmul_input_layout,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -819,9 +820,12 @@ def find_stick_compatible_input_layout(
     for stl, dev_coords in candidates:
         if reduction_var in dev_coords[-1].free_symbols:
             if matmul_batch_vars is not None:
-                return normalize_matmul_input_layout(
+                normalized = normalize_matmul_input_layout(
                     stl, dev_coords, reduction_var, matmul_batch_vars
                 )
+                if normalized is None:
+                    continue
+                return normalized
             return stl
 
     # Pass 2: can be restickified — find the resolvable device coord for reduction_var
@@ -844,6 +848,8 @@ def find_stick_compatible_input_layout(
                 result = normalize_matmul_input_layout(
                     result, result_coords, reduction_var, matmul_batch_vars
                 )
+                if result is None:
+                    continue
             return result
 
     raise Unsupported(
@@ -884,7 +890,7 @@ def _matmul_layouts(
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var(x.dep, output_dep)
     generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
-    batch_vars = set().union(*(coord.free_symbols for coord in out_coords[:-2]))
+    batch_vars = matmul_output_batch_vars(output, output_dep)
 
     x_req_stl = find_stick_compatible_input_layout(
         x,

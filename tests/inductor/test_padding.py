@@ -183,7 +183,19 @@ class TestInsertPaddingIR(unittest.TestCase):
         return [op for op in ops if isinstance(op, SpyreConstantFallback)]
 
     def _assert_constant_pad_nd_ops(self, ops: list[Operation]) -> None:
-        """Assert the constant_pad_nd 4-op pattern."""
+        """Assert the constant_pad_nd 4-op pattern.
+
+        Layout propagation may insert ownership-normalizing restickifies before
+        the matmul alongside the padding sequence.  Restrict this structural
+        assertion to operations originating from the pad node so those required
+        input-layout copies do not look like extra padding operations.
+        """
+
+        padded_buf_op = next(iter(self._padded_buf_ops(ops)), None)
+        self.assertIsNotNone(padded_buf_op, "Expected 1 output buffer")
+        assert padded_buf_op is not None
+        pad_origin = padded_buf_op.origin_node
+        ops = [op for op in ops if pad_origin in op.origins]
 
         # Expected 4 operations (all with FixedTiledLayout):
         # 1. ComputedBuffer: output buffer allocation
@@ -230,8 +242,11 @@ class TestInsertPaddingIR(unittest.TestCase):
             "One mutation op should read from constant buffer",
         )
         self.assertTrue(
-            any("arg" in name for op in mutation_ops for name in op.get_read_names()),
-            "One mutation op should read from input buffer",
+            any(
+                op.get_read_names() and constant_op.name not in op.get_read_names()
+                for op in mutation_ops
+            ),
+            "One mutation op should read from the source tensor",
         )
 
     # ------------------------------------------------------------------
@@ -697,9 +712,8 @@ class TestInsertPaddingIR(unittest.TestCase):
         reduction = mm.data
         assert isinstance(reduction, Reduction)
         self.assertEqual(int(reduction.reduction_ranges[0]), K)
-        # ops_before contains a restickify op for x in addition to the 4-op
-        # padding sequence for y, so _assert_constant_pad_nd_ops (which expects
-        # exactly 4 ops) cannot be used here.  Correctness is verified by assert_close.
+        ops_before = self._ops_before(ops, mm)
+        self._assert_constant_pad_nd_ops(ops_before)
         torch.testing.assert_close(fn(x_cpu, y_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
 
