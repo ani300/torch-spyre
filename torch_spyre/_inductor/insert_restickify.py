@@ -158,6 +158,12 @@ def _create_restickify_node(
         restick_fx_node = fx_graph.create_node(
             "call_function", torch.ops.spyre.restickify.default, (fx_arg_node,)
         )
+    # Restickify changes only the physical device layout.  Its logical tensor
+    # metadata (shape, dtype, stride, and any custom hints) is identical to the
+    # source node's.  Later IR passes such as BMM padding inspect ``meta["val"]``
+    # on the restickify origin, so preserve the complete FX metadata before
+    # lowering the new node.
+    restick_fx_node.meta.update(fx_arg_node.meta)
     # Lower the FX node; run_node registers the output in graph.buffers and graph.operations.
     restick_tb = graph_lowering.run_node(restick_fx_node)
     restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
