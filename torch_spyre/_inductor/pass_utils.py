@@ -1551,9 +1551,10 @@ def normalize_matmul_input_layout(
     stick is insufficient: a non-unit batch axis between an outer stick tile
     and the inner stick changes which core owns each tile.
 
-    Unit axes do not affect physical ownership, so leave their positions alone
-    and stable-sort only non-unit outer axes.  This avoids manufacturing distinct
-    layouts for harmless padding axes.
+    Unit axes do not affect physical ownership.  Among non-unit axes, reorder
+    only the batch and outer-stick ownership subsequence so every batch axis
+    precedes the outer stick tile.  Unrelated axes keep their physical slots;
+    moving them would manufacture full-tensor copies for ordinary 2D matmuls.
 
     Return ``None`` when a non-unit physical coordinate mixes the stick variable
     with a batch variable.  Free-symbol membership cannot distinguish, for
@@ -1582,22 +1583,24 @@ def normalize_matmul_input_layout(
 
     def matmul_axis_role(axis: int) -> int:
         axis_vars = device_coords[axis].free_symbols
-        if axis_vars & batch_vars:
-            return 0
-        if stick_var in axis_vars:
-            return 2
-        return 1
+        return 0 if axis_vars & batch_vars else 1
 
-    ordered_axes = sorted(
-        physical_axes,
+    ownership_axes = [
+        axis
+        for axis in physical_axes
+        if device_coords[axis].free_symbols & batch_vars
+        or stick_var in device_coords[axis].free_symbols
+    ]
+    ordered_ownership_axes = sorted(
+        ownership_axes,
         key=matmul_axis_role,
     )
-    if ordered_axes == physical_axes:
+    if ordered_ownership_axes == ownership_axes:
         return stl
 
     old_size = list(device_size)
     old_stride = list(stride_map)
-    for destination, source in zip(physical_axes, ordered_axes):
+    for destination, source in zip(ownership_axes, ordered_ownership_axes):
         device_size[destination] = old_size[source]
         stride_map[destination] = old_stride[source]
     return SpyreTensorLayout(
