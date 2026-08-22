@@ -7123,9 +7123,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_sdpa_bf16_gqa_decode_query_is_canonicalized(self):
-        """Decode SDPA must canonicalize a physically heads-inner query."""
-        num_heads, num_kv_heads, head_dim = 16, 1, 512
+    def test_sdpa_bf16_gqa_decode_restickifies_batch_axes(self):
+        """Decode SDPA must restickify heads split across both BMM inputs."""
+        num_heads, num_kv_heads, head_dim = 16, 8, 512
         generator = torch.Generator().manual_seed(1337)
         query = (
             torch.randn(
@@ -7137,7 +7137,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         key = (
             torch.randn(
-                (1, num_kv_heads, 64, head_dim),
+                (1, num_kv_heads, 128, head_dim),
                 dtype=torch.bfloat16,
                 generator=generator,
             )
@@ -7145,13 +7145,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         value = (
             torch.randn(
-                (1, num_kv_heads, 64, head_dim),
+                (1, num_kv_heads, 128, head_dim),
                 dtype=torch.bfloat16,
                 generator=generator,
             )
             * 0.1
         )
-        mask = torch.zeros((1, 1, 1, 64), dtype=torch.bfloat16)
+        mask = torch.zeros((1, 1, 1, 128), dtype=torch.bfloat16)
 
         def fn(query, key, value, mask):
             return F.scaled_dot_product_attention(
@@ -7217,7 +7217,84 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         query_elems = num_heads * head_dim
         query_sizes = [ds for ds in bmm_x_sizes if math.prod(ds) == query_elems]
         assert query_sizes, f"no score-matmul query found in {bmm_x_sizes}"
-        assert all(ds[0] == num_heads for ds in query_sizes), query_sizes
+        assert all(
+            [size for size in ds[:-1] if size > 1] == [num_heads, head_dim // 64]
+            for ds in query_sizes
+        ), query_sizes
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_sdpa_bf16_gqa_decode_with_in_graph_rope_query(self):
+        """An LX-resident RoPE result must retain its ownership into SDPA."""
+        num_heads, num_kv_heads, head_dim = 16, 1, 512
+        generator = torch.Generator().manual_seed(1337)
+        query = (
+            torch.randn(
+                (1, num_heads, 1, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        key = (
+            torch.randn(
+                (1, num_kv_heads, 128, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        value = (
+            torch.randn(
+                (1, num_kv_heads, 128, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        mask = torch.zeros((1, 1, 1, 128), dtype=torch.bfloat16)
+        freqs = torch.zeros((1, 1, 2, 2, head_dim // 2), dtype=torch.bfloat16)
+        freqs[:, :, 0, 0, :] = 1
+        freqs[:, :, 1, 1, :] = 1
+
+        def fn(query, key, value, mask, freqs):
+            batch, heads, length, dim = query.shape
+            query_pairs = query.transpose(1, 2).reshape(
+                batch, length, heads, 2, dim // 2
+            )
+            query = (
+                freqs[:, :, None, :, :, :]
+                .mul(query_pairs.unsqueeze(-3))
+                .sum(4, keepdim=True)
+                .flatten(3)
+                .transpose(1, 2)
+            )
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=1.0,
+                enable_gqa=True,
+            )
+
+        expected = fn(query, key, value, mask, freqs)
+        with fresh_inductor_cache():
+            actual = torch.compile(fn, dynamic=False)(
+                query.to("spyre"),
+                key.to("spyre"),
+                value.to("spyre"),
+                mask.to("spyre"),
+                freqs.to("spyre"),
+            ).cpu()
+
+        cosine = F.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        ).item()
+        assert torch.isfinite(actual).all() and cosine >= 0.99, (
+            f"cosine={cosine:.8f} "
+            f"max_abs={(actual.float() - expected.float()).abs().max().item():.8f}"
+        )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):

@@ -85,6 +85,7 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    normalize_matmul_input_layout,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -794,6 +795,8 @@ def find_stick_compatible_input_layout(
     reduction_var: sympy.Symbol,
     reduction_type: str,
     label: str,
+    *,
+    matmul_batch_vars: set[sympy.Symbol] | None = None,
 ) -> SpyreTensorLayout:
     """Find the required STL for a matmul input by iterating all candidate layouts.
 
@@ -815,6 +818,10 @@ def find_stick_compatible_input_layout(
     # to know if this input's stick coord already carries the target loop variable.
     for stl, dev_coords in candidates:
         if reduction_var in dev_coords[-1].free_symbols:
+            if matmul_batch_vars is not None:
+                return normalize_matmul_input_layout(
+                    stl, dev_coords, reduction_var, matmul_batch_vars
+                )
             return stl
 
     # Pass 2: can be restickified — find the resolvable device coord for reduction_var
@@ -830,6 +837,13 @@ def find_stick_compatible_input_layout(
             stl, arg.layout, target_stick_expr, arg_host_coords, dev_coords
         )
         if result is not None:
+            if matmul_batch_vars is not None:
+                result_coords = try_device_coordinates(result, arg.dep, None)
+                if result_coords is None:
+                    continue
+                result = normalize_matmul_input_layout(
+                    result, result_coords, reduction_var, matmul_batch_vars
+                )
             return result
 
     raise Unsupported(
@@ -870,12 +884,21 @@ def _matmul_layouts(
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var(x.dep, output_dep)
     generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
+    batch_vars = set().union(*(coord.free_symbols for coord in out_coords[:-2]))
 
     x_req_stl = find_stick_compatible_input_layout(
-        x, reduction_var, data.reduction_type, "x"
+        x,
+        reduction_var,
+        data.reduction_type,
+        "x",
+        matmul_batch_vars=batch_vars,
     )
     y_req_stl = find_stick_compatible_input_layout(
-        y, generated_var, data.reduction_type, "y"
+        y,
+        generated_var,
+        data.reduction_type,
+        "y",
+        matmul_batch_vars=batch_vars,
     )
 
     out_stick_dim = next(

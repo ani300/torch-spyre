@@ -1538,6 +1538,77 @@ def compute_restickify_target_layout(
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
 
 
+def normalize_matmul_input_layout(
+    stl: SpyreTensorLayout,
+    device_coords: list[sympy.Expr],
+    stick_var: sympy.Symbol,
+    batch_vars: set[sympy.Symbol],
+) -> SpyreTensorLayout:
+    """Keep a matmul stick variable's outer tiles physically next to its stick.
+
+    Matmul kernels consume the outer tiles of their stick dimension as one
+    contiguous ownership block.  Merely putting ``stick_var`` on the inner
+    stick is insufficient: a non-unit batch axis between an outer stick tile
+    and the inner stick changes which core owns each tile.
+
+    Unit axes do not affect physical ownership, so leave their positions alone
+    and stable-sort only non-unit outer axes.  This avoids manufacturing distinct
+    layouts for harmless padding axes.
+    """
+    assert len(device_coords) == len(stl.device_size)
+    if stick_var not in device_coords[-1].free_symbols:
+        return stl
+
+    device_size = list(stl.device_size)
+    stride_map = list(stl.stride_map)
+    physical_axes = [axis for axis, size in enumerate(device_size[:-1]) if size > 1]
+
+    def matmul_axis_role(axis: int) -> int:
+        axis_vars = device_coords[axis].free_symbols
+        if axis_vars & batch_vars:
+            return 0
+        if stick_var in axis_vars:
+            return 1
+        return 2
+
+    ordered_axes = sorted(
+        physical_axes,
+        key=matmul_axis_role,
+    )
+    if ordered_axes == physical_axes:
+        return stl
+
+    old_size = list(device_size)
+    old_stride = list(stride_map)
+    for destination, source in zip(physical_axes, ordered_axes):
+        device_size[destination] = old_size[source]
+        stride_map[destination] = old_stride[source]
+    return SpyreTensorLayout(
+        device_size,
+        stride_map,
+        stl.device_dtype,
+        stl.element_arrangement,
+    )
+
+
+def matmul_batch_vars(op: ComputedBuffer) -> set[sympy.Symbol]:
+    """Return variables carried by the matmul output's leading batch axes.
+
+    A batch axis may be broadcast by either input, so intersecting both input
+    dependencies loses precisely the GQA/value-matmul case where the rhs has a
+    unit head dimension. Matmul's output contract identifies batch axes
+    unambiguously: every logical dimension before M and N.
+    """
+    write_deps = [
+        dep for dep in op_read_writes(op).writes if isinstance(dep, MemoryDep)
+    ]
+    if not write_deps:
+        return set()
+
+    output_coords = host_coordinates(op.layout, write_deps[0], None)
+    return set().union(*(coord.free_symbols for coord in output_coords[:-2]))
+
+
 def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     """Return True if all tensors are stick-compatible.
 
@@ -1597,9 +1668,27 @@ def compute_restickify_needed(
         return True, None
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
+    is_matmul = (
+        op is not None
+        and getattr(getattr(op, "data", None), "reduction_type", None)
+        in MATMUL_REDUCTION_OPS
+    )
+    target_stick_vars = out_idc[-1].free_symbols
+    matmul_stick_var = (
+        next(iter(target_stick_vars))
+        if is_matmul and len(target_stick_vars) == 1
+        else None
+    )
+    batch_vars = matmul_batch_vars(op) if is_matmul else set()
     # Input stick with an offset always needs restickify to remove the offset.
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
     if in_stick_offset_free and stick_compatible([idc, out_idc]):
+        if matmul_stick_var is not None:
+            normalized = normalize_matmul_input_layout(
+                in_stl, idc, matmul_stick_var, batch_vars
+            )
+            if normalized != in_stl:
+                return True, normalized
         return False, None
     ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]
@@ -1612,9 +1701,16 @@ def compute_restickify_needed(
         if reduction_vars:
             red_var = next(iter(reduction_vars))
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
-    return True, compute_restickify_target_layout(
+    target_stl = compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc
     )
+    if target_stl is not None and matmul_stick_var is not None:
+        target_idc = try_device_coordinates(target_stl, in_dep, ind_sizes)
+        if target_idc is not None:
+            target_stl = normalize_matmul_input_layout(
+                target_stl, target_idc, matmul_stick_var, batch_vars
+            )
+    return True, target_stl
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
@@ -2152,6 +2248,7 @@ def _per_core_view_from_prep(
 
     device_size = prep.device_size
     stride_map = prep.stride_map
+    elems_per_stick = prep.elems_per_stick
     device_stride_to_dim = prep.device_stride_to_dim
     stick_host_stride = prep.stick_host_stride
     num_stick_dim = prep.num_stick_dim
@@ -2185,6 +2282,25 @@ def _per_core_view_from_prep(
         dev_dim = device_stride_to_dim.get(h)
         if h == stick_host_stride:
             dev_dim = num_stick_dim
+        # A lower-rank reshape can flatten outer axes into the stickified axis.
+        # Mapping that loop only by its host-stride then falsely attributes the
+        # split to num_stick_dim. The full physical capacity of that host axis
+        # is known exactly, so an iteration spanning beyond it proves compound
+        # ownership that PerCoreView cannot express. Keep the buffer in HBM.
+        if h == stick_host_stride and dev_dim is not None:
+            iter_extent_expr = iter_space[sym]
+            if isinstance(iter_extent_expr, tuple):
+                iter_extent_expr = iter_extent_expr[0]
+            iter_extent = concretize_expr(iter_extent_expr)
+            stickified_extent = num_stick * elems_per_stick
+            if iter_extent > stickified_extent:
+                logger.debug(
+                    f"iteration {sym} extent {iter_extent} spans beyond mapped "
+                    f"stickified dim {dev_dim} extent {stickified_extent}; "
+                    f"returning empty_view"
+                )
+                return unrepresentable
+
         # Multi-stick-stride rescue: a consumer view subdivides the stickified
         # axis at k sticks per step (h = k * num_stick_stride). Only safe when
         # split*k fully covers num_stick_dim — partial coverage would
