@@ -564,6 +564,33 @@ def test_bmm_xt_yt(bmm_tensors_ab_ba):
     _compare(lambda x, y: torch.matmul(x.transpose(1, 2), y.transpose(1, 2)), x, y)
 
 
+def test_bmm_shared_batch_does_not_reorder_outer_stick_tiles():
+    """A batch axis carried by both operands does not need canonicalization."""
+    batch, m, k, n = 4, 1, 128, 128
+    x = torch.randn((batch, m, k), dtype=torch.float16) * 0.1
+    y = torch.randn((batch, k, n), dtype=torch.float16) * 0.1
+
+    _compare(torch.matmul, x, y, optimal_cost=0)
+
+
+def test_bmm_shared_batch_with_sufficient_output_work_avoids_copy():
+    """M/N work that fills every core makes outer-tile order irrelevant."""
+    batch, m, k, n = 4, 64, 128, 256
+    x = torch.randn((batch, m, k), dtype=torch.float16) * 0.1
+    y = torch.randn((batch, k, n), dtype=torch.float16) * 0.1
+
+    _compare(torch.matmul, x, y, optimal_cost=0)
+
+
+def test_bmm_shared_batch_with_exposed_unequal_tiles_reorders():
+    """Decode-like BMMs need canonical ownership when K/N tile counts differ."""
+    batch, m, k, n = 4, 1, 128, 256
+    x = torch.randn((batch, m, k), dtype=torch.float16) * 0.1
+    y = torch.randn((batch, k, n), dtype=torch.float16) * 0.1
+
+    _compare(torch.matmul, x, y, optimal_cost=x.numel() + y.numel())
+
+
 def test_bmm_x_restickifies_interleaved_tiles_with_broadcast_batch():
     """The lhs K tiles must remain adjacent to K even when rhs broadcasts H.
 
