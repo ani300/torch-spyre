@@ -686,6 +686,17 @@ def _pattern_resolve(variant, args):
     raise ValueError(f"unknown transpose suite variant {variant}")
 
 
+def _make_keep_by_index_test(shape, dim, k, fill_value):
+    """Generate keep_by_index test case with topk indices."""
+    # Create values with random data
+    values = torch.randn(shape, dtype=torch.float16)
+
+    # Get indices from topk
+    topk_values, indices = torch.topk(values, min(k, shape[dim]), dim=dim, largest=True)
+
+    return (values, indices, dim, fill_value)
+
+
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
 
@@ -1299,6 +1310,41 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     unique_randn_along_dim((256, 64), dim=0),
                     128,
                     0,
+                ),
+                # Regression: MoE-decode router top-k. At T=1 (batch collapsed
+                # to a single row) the search is over the innermost dim, so the
+                # topk result buffer's innermost device coordinate is constant
+                # and its stick dim resolved to None -> the split-k (k>4) chunk
+                # landed on the reduced search dim's stick, not k's, and the
+                # backend aborted with "Incorrect chunk size in bytes". The
+                # earlier k>4 cases all keep a non-trivial batch dim, so they
+                # never exercised this collapse. k=8 forces the 4+4 core split.
+                "2d_k8_dim_minusone_unitbatch": (
+                    unique_randn_along_dim((1, 128), dim=-1),
+                    8,
+                    -1,
+                ),
+            },
+        },
+        ("test_keep_by_index", "test_keep_by_index_cpu"): {
+            "param_sets": {
+                "2d_dim0": _make_keep_by_index_test(
+                    (67, 256), dim=0, k=3, fill_value=-1.0
+                ),
+                "3d_dim0": _make_keep_by_index_test(
+                    (67, 71, 256), dim=0, k=2, fill_value=0.0
+                ),
+                "3d_dim1": _make_keep_by_index_test(
+                    (67, 71, 256), dim=1, k=4, fill_value=-1.0
+                ),
+                "4d_dim0": _make_keep_by_index_test(
+                    (6, 17, 7, 64), dim=0, k=2, fill_value=-1.0
+                ),
+                "4d_dim1": _make_keep_by_index_test(
+                    (6, 17, 7, 64), dim=1, k=3, fill_value=0.0
+                ),
+                "4d_dim2": _make_keep_by_index_test(
+                    (6, 17, 7, 64), dim=2, k=2, fill_value=-1.0
                 ),
             },
         },
@@ -6106,6 +6152,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [x],
                 "spyre",
             )
+
+    def test_keep_by_index_cpu(self, x, indices, dim: int, fill_value: float):
+        # indices come from topk, so topk_values has the actual kept values
+        topk_values = torch.topk(x, indices.shape[dim], dim=dim, largest=True)[0]
+
+        def fn(x, indices):
+            return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
+
+        # Run on spyre
+        result_spyre = fn(x.to("spyre"), indices.to("spyre")).cpu()
+
+        # Verify: result should contain only values from topk_values where they were kept
+        # Extract the kept values and check they match topk output
+        kept_mask = result_spyre != fill_value
+        result_kept_values = result_spyre[kept_mask]
+        topk_kept_values = topk_values[kept_mask]
+
+        torch.testing.assert_close(
+            result_kept_values, topk_kept_values, atol=0.1, rtol=0.1
+        )
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)

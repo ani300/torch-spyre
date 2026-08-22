@@ -259,6 +259,67 @@ def dma_moe_expert_weight_to_spyre(
     return dst
 
 
+def dma_moe_per_expert_scale_to_spyre(
+    scale: torch.Tensor,
+    target_dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    """Transfer a 1-D ``[E]`` per-expert scale to Spyre as a gather-ready ``[E, eps]``.
+
+    The MoE decode leg gathers this scale by expert id (``scale[idx]``), so like
+    the embedding table and expert weights it needs the indexed (expert) dim
+    outermost. But a bare ``[E]`` tensor has no feature/stick dim for indirect
+    access to sit on, and materializing one *in the graph* (the former
+    ``scale[:, None].expand(-1, eps).contiguous()``) is a broadcast-into-the-stick
+    the layout pass cannot express: it would need the packed 1-D ``[E]`` input to
+    gain a rank before the clone, which no restickify can do.
+
+    So we do the widening on the host instead, mirroring
+    :func:`dma_moe_expert_weight_to_spyre`: give the source a real ``eps``-wide
+    innermost feature by replicating each expert's scalar across a full stick
+    (``[E] -> [E, eps]``, every lane of a row equal), place the expert dim
+    outermost, and lay the replicated feature on the stick. The gather then reads
+    an already-sticked ``[E, eps]`` device tensor and yields ``[T, K, eps]``; the
+    caller recovers the per-(token, expert) scalar with a mean over the identical
+    lanes.
+
+    The device layout is ``[E, 1, eps]`` (expert outermost, one un-split stick of
+    ``eps`` replicated values) with ``stride_map = [eps, eps, 1]``. The logical
+    PyTorch shape is a genuine 2-D ``[E, eps]`` so Dynamo traces the gather's
+    ``[T, K, eps]`` result correctly.
+
+    Uses the 3-arg device-dims ``SpyreTensorLayout`` overload with the *device*
+    dtype (``get_device_dtype``).
+
+    Caller must ensure ``scale.ndim == 1``.
+    """
+    assert scale.ndim == 1, "per-expert-scale path is for 1D [E] tensors only"
+
+    if not scale.is_contiguous():
+        scale = scale.contiguous()
+    dev_dtype = target_dtype if target_dtype is not None else scale.dtype
+
+    experts = scale.shape[0]
+    # elems_per_stick is dtype-aware (64 at fp16/bf16, 32 at fp32), so query it
+    # rather than hardcoding a stick size.
+    eps = SpyreTensorLayout([experts, 1], dev_dtype).elems_per_stick()
+
+    # Widen on the host: replicate each expert's scalar across a full stick so
+    # indirect access has a stick to gather. Every lane of a row is equal, so the
+    # caller's mean over the last dim recovers the original scalar exactly.
+    widened = scale[:, None].expand(-1, eps).contiguous()  # [E, eps]
+
+    layout = SpyreTensorLayout(
+        [experts, 1, eps],  # device_size: expert dim outermost, one replicated stick
+        [eps, eps, 1],  # stride_map
+        get_device_dtype(dev_dtype),
+    )
+    dst = spyre_empty_with_layout(
+        widened.size(), widened.stride(), dev_dtype, layout
+    )
+    copy_tensor(widened, dst, non_blocking=False)
+    return dst
+
+
 # --- Model loading ---------------------------------------------------
 
 

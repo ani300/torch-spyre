@@ -42,7 +42,12 @@ from torch_spyre._inductor.op_spec import IndirectAccess
 
 from . import config
 from .core_mapping import core_to_slice_mapping
-from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS, TOPK_OPS
+from .constants import (
+    ELIDED_COPY_BACK_ATTR,
+    KEEP_BY_INDEX_OP,
+    MATMUL_REDUCTION_OPS,
+    TOPK_OPS,
+)
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
@@ -389,15 +394,31 @@ def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
 
     ``in_coords`` / ``out_coords`` are the operands' device-space coordinates.
     It is a restickify iff a *different* host dim lands within the stick (the
-    within-stick coords carry different free symbols) -- except a broadcast (an
-    all-zero input expanding to non-scalar output), which is an identity fill.
+    within-stick coords carry different free symbols) -- except a broadcast,
+    which is an identity fill, not a swap.  Two broadcast shapes are excluded:
+
+    - a fully scalar input (all coords 0) expanding to a non-scalar output, and
+    - a broadcast INTO the stick: the output's within-stick symbol appears
+      nowhere in the input, so the stick is being filled from a value that does
+      not vary along it (e.g. the MoE per-expert scale ``x[1, E, 1] -> expand ->
+      [1, E, 64]``, input stick on the elided trailing size-1 dim).  The new
+      within-stick dim is materialised by the broadcast itself, not moved from an
+      input dim, so there is no stick to restickify -- and no input host dim to
+      pad, which is why treating it as a restickify made _pad_restickify_input
+      abort with "no input host dim carries new-stick symbol".
 
     The authoritative test, shared by the codegen store side and the padding
     pass matcher (``is_restickify_op``) so the two cannot disagree.
     """
     if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
         return False  # broadcast: scalar input expanding to non-scalar output
-    return in_coords[-1].free_symbols != out_coords[-1].free_symbols
+    out_stick_syms = out_coords[-1].free_symbols
+    if out_stick_syms == in_coords[-1].free_symbols:
+        return False  # same host dim within the stick: identity, not a swap
+    in_syms = set().union(*(c.free_symbols for c in in_coords)) if in_coords else set()
+    if out_stick_syms and not (out_stick_syms & in_syms):
+        return False  # broadcast into the stick: new-stick dim absent from input
+    return True
 
 
 def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
@@ -2003,6 +2024,15 @@ def is_topk(op: Operation) -> bool:
         isinstance(op, ComputedBuffer)
         and isinstance(op.data, Reduction)
         and op.data.reduction_type in TOPK_OPS
+    )
+
+
+def is_keep_by_index(op: Operation) -> bool:
+    """Return True iff ``op`` is a ``ComputedBuffer`` computing a keep_by_index reduction."""
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type == KEEP_BY_INDEX_OP
     )
 
 

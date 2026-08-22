@@ -402,15 +402,22 @@ def get_per_core_span(
     itemsize = td.layout.dtype.itemsize
     for d, coord in enumerate(td.device_coords[:-1]):
         if hasattr(coord, "has") and coord.has(IndirectAccess):
-            # Data-dependent gather axis: any core may address any row, so the
-            # whole device extent counts toward the span and this axis is never
-            # split. Returning the full extent here also avoids looking up the
-            # index-tensor name symbol (IndirectAccess's argument), which is not an
-            # iteration variable and is absent from it_space_orig.
-            per_core_size = device_size[d]
-            if per_core_size > 1:
-                stride_elems = math.prod(device_size[d + 1 :])
-                return per_core_size * stride_elems * itemsize
+            # Data-dependent gather axis. Any core may address any row, so this
+            # axis is never split (the caller keeps it in the forbidden set) — but
+            # the row is reached by the index unit (indexTensorType_="index"), and
+            # the value tensor's indexed axis is emitted with maxDimSize == 1
+            # (indirect_access.py compute_indirect_max_dim_sizes), so the axis
+            # contributes NO linear stepping to the MVLOC descriptor. The span the
+            # MVLOC range must hold is therefore one row's footprint (the stride
+            # below this axis), not row_count * row_stride. Counting the full
+            # extent here was a false-positive overflow for large gather tables
+            # (e.g. a 256K-vocab embedding weight). Skipping the axis's own extent
+            # also avoids looking up the index-tensor name symbol (IndirectAccess's
+            # argument), which is not an iteration var and is absent from
+            # it_space_orig.
+            stride_elems = math.prod(device_size[d + 1 :])
+            if stride_elems > 1:
+                return stride_elems * itemsize
             continue
         if not coord.free_symbols:
             continue

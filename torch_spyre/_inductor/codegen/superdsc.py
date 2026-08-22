@@ -43,6 +43,7 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     RESTICKIFY_OP,
     TOPK_OPS,
+    KEEP_BY_INDEX_OP,
 )
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
@@ -1163,6 +1164,47 @@ def _create_sdsc_tensors(
                 arg, symbol_mapping, op_spec, tensor_position=i
             )
 
+        # topk result buffer (the last arg): at T=1 the output's innermost
+        # device coordinate is a constant (device_coordinates ~ [0, c0, 0]), so
+        # _get_device_dim_order returns stick_dim=None. We deliberately leave
+        # stick_dim=None here: the synthetic extent-1 topk_missing_dim injected
+        # into parse_op_spec (below, applied at the "inject topk_missing_dim"
+        # block) becomes the stick dim, keeping mb (=k) OFF the stick. Two
+        # scheduler asserts must both hold:
+        #   * L3DlOpsScheduler:1374 "at least one valid candidate" -- each
+        #     candidate k-split value `param` (a divisor of k) is checked
+        #     `param % getStickSize(mb) == 0`. With k OFF the stick
+        #     getStickSize(mb)=1, so 8 % 1 == 0 passes; with k ON the stick
+        #     getStickSize(mb)=64 and no divisor of 8 is a multiple of 64 ->
+        #     empty candidate list -> fatal.
+        #   * L3DlOpsScheduler:1714 "Incorrect chunk size in bytes" --
+        #     buffer capacity must be a 128-byte multiple. The synthetic stick
+        #     dim rounds to 64 elems (x fp16 wordLength 2 = 128 B/stick) and
+        #     mb=8 merely multiplies the stick count, so the total stays a
+        #     multiple of 128 B.
+
+        # A 0-dim scalar / all-broadcast operand has only constant device
+        # coordinates, so _get_device_dim_order returns an empty dim_order and
+        # stick_dim=None. That would produce an empty scheduleTree
+        # layoutDimOrder_ for an HBM-resident tensor, which the backend rejects
+        # (SdscCoreletSplit.cpp getPagedDimensions: "Expect valid
+        # layoutDimOrder_."). Give the operand the op's full layout so the
+        # backend's ddl dimension-mapping finds candidates for every output dim,
+        # and mark all its dims broadcast via negative scales below (scale < 0 =
+        # broadcast in dsc2.cpp getNonBroadcastLdsDimSet/hasBroadcastLdsDims):
+        # the same single element is read for every output coordinate. Skip index
+        # tensors -- their empty-dim_order case (P=1 gathers) is handled by
+        # mb_sym injection above.
+        scalar_broadcast_operand = (
+            not dim_order
+            and stick_dim is None
+            and op_stick_dim is not None
+            and not (has_indirect_access and i in index_tensor_indices)
+        )
+        if scalar_broadcast_operand:
+            dim_order = list(op_dim_order)
+            stick_dim = op_stick_dim
+
         # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
         # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
         # advance, stamped by coarse_tile._propagate_tiled_op (host-stride
@@ -1202,7 +1244,12 @@ def _create_sdsc_tensors(
         reduced_dims: list = []
 
         # Step 2: Handle reduced dimensions — skip for index tensors.
-        if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
+        if (
+            use_op_dims
+            and dim_order != dims
+            and not _is_topk(op_spec.op)
+            and op_spec.op != "keepbyindex"
+        ):
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
                     d for d in op_dim_order if d not in dim_order and d is not mb_sym
@@ -1233,7 +1280,12 @@ def _create_sdsc_tensors(
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
 
-            if has_indirect_access and (
+            if scalar_broadcast_operand:
+                # Broadcast every dim (scale < 0): dsc2.cpp reads the single
+                # stored element for all output coordinates. Stick dim -> -2
+                # (dimSize=stickSizePerDim), non-stick -> -1 (dimSize=1).
+                scales[dim] = -2 if dim is stick_dim else -1
+            elif has_indirect_access and (
                 i in index_tensor_indices or is_indirect_value_tensor(arg)
             ):
                 scales[dim] = 1
@@ -1374,7 +1426,20 @@ def _create_sdsc_tensors(
                 len(dim_order) - 1, arg.device_size
             )
             offsets[topk_missing_dim] = 0
+            # max_dim_size=-1 => use the iteration-space extent. parse_op_spec
+            # sizes that extent to one full stick (elems_per_stick) precisely
+            # when this dim will become the stick (stick_dim is None below), so
+            # its unchunked per-core extent is a stick multiple and the
+            # L3DlOpsScheduler:1248 shortcut check passes.
             max_dim_sizes[topk_missing_dim] = -1
+            # Make the synthetic dim the stick dim so mb (=k) stays OFF the
+            # stick (getStickSize(mb)=1). See the topk-result comment in
+            # _get_device_dim_order handling above for why both scheduler
+            # asserts (1374 and 1714) then hold. Only meaningful when this arg
+            # had no natural non-reduced stick dim of its own (stick_dim is
+            # None); otherwise the arg keeps its own stick.
+            if stick_dim is None:
+                stick_dim = topk_missing_dim
 
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
@@ -1465,6 +1530,7 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
         and not _is_topk(op)
         and not _is_conv(op)
         and -2 not in output_scales.values()
+        and op != "keepbyindex"
     ):
         return op + "nonstick"
     return op
@@ -1970,15 +2036,45 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         input_arg = op_spec.args[0]
         output_arg = op_spec.args[-1]
         input_dim_order, _ = _get_device_dim_order(input_arg, symbol_mapping, op_spec)
-        output_dim_order, _ = _get_device_dim_order(output_arg, symbol_mapping, op_spec)
+        output_dim_order, output_stick_dim = _get_device_dim_order(
+            output_arg, symbol_mapping, op_spec
+        )
         output_only_dims = [d for d in output_dim_order if d not in input_dim_order]
-        if not output_only_dims:
-            # No new output dimension; add one to the iteration space with size 1.
+        # Inject a synthetic extent-1 dim when EITHER:
+        #  * the output has no new dim vs the reduced input (output_only_dims
+        #    empty) -- the original case; the synthetic dim gives the op an
+        #    iteration dim to write across, OR
+        #  * the output has no natural non-reduced stick dim of its own
+        #    (output_stick_dim is None). This is the T=1 collapse: the topk
+        #    result is [1, k] and its innermost device coordinate is constant,
+        #    so without a synthetic dim the k (mb) dim would fall onto the
+        #    stick and break the 1374 candidate check. Giving it a synthetic
+        #    unit stick dim keeps k OFF the stick. See the topk-result
+        #    handling in _create_sdsc_tensors.
+        if not output_only_dims or output_stick_dim is None:
+            # No usable output stick dim; add one to the iteration space.
             idx = len(sdsc_iteration_space)
             if idx < len(INPUT_DIM_LABELS):
                 missing_dim_label = INPUT_DIM_LABELS[idx]
                 topk_missing_dim = Symbol(missing_dim_label)
-                sdsc_iteration_space[topk_missing_dim] = 1
+                # When the result arg has no natural non-reduced stick dim of
+                # its own (T=1 collapse: output_stick_dim is None), the synthetic
+                # dim BECOMES the stick dim (see _create_sdsc_tensors, "Make the
+                # synthetic extent-1 dim the stick dim"). It is unchunked
+                # (work_slices=1), so the scheduler processes it in the
+                # lBound==uBound shortcut (L3DlOpsScheduler:1223-1250), which
+                # asserts `ubound_lds % getStickSize(dim) == 0`. A stick dim has
+                # getStickSize=elems_per_stick (64 fp16), so its per-core extent
+                # must be a multiple of that or the assert fails at line 1248
+                # ("Expect parameter value is multiple of stick size."). Size it
+                # to exactly one full stick. When the synthetic dim is instead a
+                # non-stick filler (the `not output_only_dims` path, result keeps
+                # its own stick), getStickSize=1 and extent 1 already satisfies
+                # the assert, so keep it minimal there.
+                synthetic_extent = 1
+                if output_stick_dim is None:
+                    synthetic_extent = output_arg.device_dtype.elems_per_stick()
+                sdsc_iteration_space[topk_missing_dim] = synthetic_extent
                 dim_splits[topk_missing_dim] = 1
                 work_slices[topk_missing_dim] = 1
                 injected_dims["topk_missing_dim"] = topk_missing_dim
@@ -2089,7 +2185,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
-
+    if op_spec.op == KEEP_BY_INDEX_OP:
+        num_inputs = 2
     if is_pool:
         num_inputs = 1  # avgpool has exactly 1 input tensor and 1 output tensor
         # The pool hardware accumulates the full kernel window on each core.

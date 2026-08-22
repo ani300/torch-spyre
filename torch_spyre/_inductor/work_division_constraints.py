@@ -38,7 +38,9 @@ from .errors import Unsupported
 from .pass_utils import (
     concretize_expr,
     indirect_forbidden_split_syms,
+    indirect_info_from_op,
     indirect_store_entry_syms,
+    is_keep_by_index,
     is_topk,
     op_read_writes,
 )
@@ -263,30 +265,32 @@ def qfp8wt_matmul_k_pinned(ctx: WorkDivConstraintContext) -> ConstraintResult:
 
 
 def topk_pinned_search_space_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Pin the search-space (reduction) dim to split=1 for topk ops.
+    """Pin the search-space (reduction) dim to split=1 for topk and keep_by_index ops.
 
     The topk hardware op searches the full dimension on one core to compute
     the top-k results. Splitting the search-space would require merging
     partial top-k results across cores, which the hardware does not support.
+    keep_by_index has the same constraint: it must run single-core.
     """
-    if not is_topk(ctx.op):
+    if not (is_topk(ctx.op) or is_keep_by_index(ctx.op)):
         return ConstraintResult()
 
     return ConstraintResult(pinned={v: 1 for v in ctx.reduction_vars})
 
 
 def topk_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Pin k to the smallest valid split for topk ops.
+    """Pin k to the smallest valid split for topk and keep_by_index ops.
 
     Each core can produce at most 4 top-k results per pass. The smallest valid
     k-split is ceil(k / 4), chosen to minimize core usage while satisfying the
     hardware constraint. This is pinned as a hard constraint to ensure the
     work_distribution planner picks the minimal k-split rather than a
-    larger one that leaves more cores for other dims.
+    larger one that leaves more cores for other dims. keep_by_index has the
+    same constraint on k since it processes indices in a similar fashion.
     """
     from sympy import divisors
 
-    if not is_topk(ctx.op):
+    if not (is_topk(ctx.op) or is_keep_by_index(ctx.op)):
         return ConstraintResult()
 
     # Find k's symbol (output dim absent from every input's device coords).
@@ -312,8 +316,9 @@ def topk_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
             break
 
     if min_k_split is None:
+        op_name = "keep_by_index" if is_keep_by_index(ctx.op) else "topk"
         raise Unsupported(
-            f"topk(k={k_val}): no divisor of k in [1, {max_cores}] gives "
+            f"{op_name}(k={k_val}): no divisor of k in [1, {max_cores}] gives "
             f"k_per_core <= {_TOPK_MAX_K_PER_CORE}, so k cannot be split "
             f"across at most {max_cores} cores"
         )

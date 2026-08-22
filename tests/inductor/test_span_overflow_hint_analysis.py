@@ -39,7 +39,12 @@ import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from torch_spyre._inductor.work_division import MAX_SPAN_BYTES
+from torch_spyre._inductor.work_division import (
+    MAX_SPAN_BYTES,
+    get_per_core_span,
+    raise_if_per_core_overflow,
+)
+from torch_spyre._inductor.op_spec import IndirectAccess
 
 import sympy
 import torch
@@ -5289,3 +5294,104 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             "untiled baseline at the same reduction depth, suggesting the "
             "join introduces extra error beyond ordinary fp16 noise.",
         )
+
+
+# ===========================================================================
+# get_per_core_span: indirect (gather) value-table span
+# ===========================================================================
+class _StubDeviceLayout:
+    """Minimal device layout exposing only ``device_size`` (what the span
+    functions read)."""
+
+    def __init__(self, device_size):
+        self.device_size = list(device_size)
+
+
+class _StubLayout:
+    """Minimal FixedTiledLayout stand-in for get_per_core_span.
+
+    get_per_core_span touches only ``layout.device_layout.device_size``,
+    ``layout.dtype``, and (in the raise path) ``layout.size``. A stub keeps
+    the regression test device-free and independent of SpyreTensorLayout
+    construction details.
+    """
+
+    def __init__(self, size, device_size, dtype):
+        self.size = list(size)
+        self.dtype = dtype
+        self.device_layout = _StubDeviceLayout(device_size)
+
+
+class _StubTensorDep:
+    """A TensorDep whose device_coords are supplied directly.
+
+    The real TensorDep computes device_coords from a MemoryDep in
+    __post_init__; here we hand them in so a gather value table's
+    IndirectAccess-marked outer coordinate can be constructed without a
+    device layout / lowering.
+    """
+
+    def __init__(self, layout, device_coords):
+        self.layout = layout
+        self.device_coords = device_coords
+
+
+class TestIndirectValueTableSpan(InductorTestCase):
+    """get_per_core_span must not treat a gather value table as materialized.
+
+    Regression for the Gemma-4 256K-vocab embedding: buf0 is the gather value
+    table [vocab=262144, hidden=2816], fp16, device_size=[262144, 44, 64].
+    Its outer device coordinate carries IndirectAccess(index_tensor) -- the row
+    is chosen at runtime by the index unit and emitted with maxDimSize == 1, so
+    it contributes no linear stepping to the MVLOC descriptor. The span the
+    MVLOC range must hold is one row's footprint (44*64 = 2816 elements), not
+    the whole table. Counting the full extent was a false-positive overflow
+    (1408 MB > 256 MB) that aborted the very first op of the forward.
+    """
+
+    # buf0's real device_size: [vocab, hidden/64, 64] = [262144, 44, 64].
+    _VOCAB = 262144
+    _DEVICE_SIZE = [262144, 44, 64]
+    _DTYPE = torch.float16
+
+    def _embedding_table_dep(self):
+        # device_coords for a gather value table, mirroring the real buf0:
+        #   [IndirectAccess(index), floor(d1/64), Mod(d1, 64)]
+        # The last coord is the within-stick coordinate (dropped by
+        # get_per_core_span, which iterates device_coords[:-1]).
+        d1 = sympy.Symbol("d1")
+        coords = [
+            IndirectAccess(sympy.Symbol("arg1_1")),
+            sympy.floor(d1 / 64),
+            sympy.Mod(d1, 64),
+        ]
+        layout = _StubLayout(
+            size=[self._VOCAB, 2816],
+            device_size=self._DEVICE_SIZE,
+            dtype=self._DTYPE,
+        )
+        return _StubTensorDep(layout, coords)
+
+    def test_indirect_value_table_span_is_one_row_not_full_extent(self):
+        td = self._embedding_table_dep()
+        # Even under a split of the indexed (vocab) axis, the span is one row.
+        splits = {sympy.Symbol("d1"): 1}
+        span = get_per_core_span(td, splits, {}, {})
+
+        # One row's footprint below the indexed axis: 44 * 64 elements * 2 B.
+        expected = 44 * 64 * self._DTYPE.itemsize
+        self.assertEqual(span, expected)
+
+    def test_indirect_value_table_does_not_overflow(self):
+        td = self._embedding_table_dep()
+        # The full table is 262144 * 2816 * 2 B = 1408 MB > 256 MB; the fix
+        # must keep the span far under MAX_SPAN_BYTES so no Unsupported raises.
+        self.assertLess(get_per_core_span(td, {}, {}, {}), MAX_SPAN_BYTES)
+        raise_if_per_core_overflow([td], {}, {}, "buf0", {})  # must not raise
+
+    def test_full_extent_would_have_overflowed(self):
+        # Guard the premise: the whole-table extent this table would have been
+        # charged pre-fix genuinely exceeds the limit, so the test is not
+        # vacuously passing on a table that fits anyway.
+        full_extent_bytes = self._VOCAB * 2816 * self._DTYPE.itemsize
+        self.assertGreater(full_extent_bytes, MAX_SPAN_BYTES)

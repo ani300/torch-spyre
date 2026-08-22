@@ -871,15 +871,17 @@ def _matmul_layouts(
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var(x.dep, output_dep)
+    # For a matmul, N is always the last logical output coordinate. When the
+    # generated-var set is ambiguous (>1) -- e.g. a broadcast batch dim that is
+    # constant-folded out of x's index and so survives the set subtraction --
+    # narrowing by the last output coord picks the true N. This holds for ANY
+    # matmul, not just coarse-tile direct-read candidates (the original gate),
+    # so pass output_n_coord unconditionally.
     generated_var = find_matmul_generated_var(
         y.dep,
         x.dep,
         output_dep,
-        output_n_coord=(
-            out_coords[-1]
-            if getattr(op, "_coarse_tile_direct_read_candidate", None) is not None
-            else None
-        ),
+        output_n_coord=out_coords[-1] if out_coords else None,
     )
 
     x_req_stl = find_stick_compatible_input_layout(
@@ -1386,6 +1388,11 @@ def compute_layouts(
         return _topk_layouts(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
+    if aten_op == spyreop.keep_by_index.default:
+        # keep_by_index: output matches values (arg 0) layout.
+        # indices (arg 1) is a multi-arg case, use the standard multi-arg handler.
+        return _multi_arg_pointwise_layouts(op, output, output_dep, args)
+
     if aten_op == spyreop.layernormnorm.default:
         # layernormnorm is pointwise but special: it has multiple args, input and
         # output must have matching size/stride, and x's stick must match

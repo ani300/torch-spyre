@@ -2194,6 +2194,46 @@ def test_restickify_coverage_gap(shape):
     _strict(lambda t: (t + t).transpose(0, -1).contiguous(), x)
 
 
+# --- broadcast-INTO-stick: an elided input stick filled by a broadcast ------
+#
+# The Gemma-4 MoE decode router materialised a per-expert scale [1, E, 1] (stick
+# on the trailing size-1 dim) and broadcast it to [1, E, 64] via
+# expand(...).contiguous(), so the new within-stick dim of size 64 is a PURE
+# broadcast: the input's own within-stick coord is elided (its stick dim is
+# size 1) AND the output's new-stick symbol appears in no input coordinate.
+#
+# This is a broadcast FILL, not a stick swap -- every within-stick slot gets the
+# same input value -- but is_restickify_coords used to classify it as a restickify
+# purely because the within-stick symbols differed.  That sent it into
+# _pad_restickify_input, which aborted with "no input host dim carries new-stick
+# symbol ... (layout invariant broken)" because there is no input dim carrying the
+# broadcast stick to pad.  is_restickify_coords now recognises the broadcast
+# (new-stick symbol absent from the input) and returns IDENTITY, whose codegen
+# fills the elided input across the broadcast stick correctly.
+#
+# NOTE: the input stick must be ELIDED (a size-1 trailing dim, [B, E, 1]).  A
+# broadcast whose input keeps a real dim in the stick (e.g. [1, 8] unsqueezed to
+# [1, 8, 64], 8 still in-stick) is a genuine stick-swap-plus-broadcast the backend
+# does not support (identity codegen rejects two differing stick vars); that shape
+# never arises in the MoE path and is out of scope here.
+_BROADCAST_INTO_STICK_SHAPES = [
+    ((1, 8, 1), 64),  # the MoE [1, 8, 1] -> [1, 8, 64] per-expert scale broadcast
+    ((1, 8, 1), 67),  # unaligned broadcast width
+    ((3, 5, 1), 64),  # >1 leading dims, aligned broadcast
+    ((1, 1, 1), 64),  # fully-collapsed input, aligned broadcast
+]
+
+
+@pytest.mark.parametrize(
+    "shape,bwidth",
+    _BROADCAST_INTO_STICK_SHAPES,
+    ids=[f"{'x'.join(map(str, s))}_b{b}" for s, b in _BROADCAST_INTO_STICK_SHAPES],
+)
+def test_restickify_broadcast_into_stick(shape, bwidth):
+    x = _arange(*shape, span=511)
+    _strict(lambda t: t.expand(*shape[:-1], bwidth).contiguous(), x)
+
+
 # --------------------------------------------------------------------------
 # White-box (device-free) geometry of the size-1 stick allocation grow.
 #
