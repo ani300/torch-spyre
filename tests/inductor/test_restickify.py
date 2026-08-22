@@ -587,7 +587,7 @@ def test_bmm_x_restickifies_interleaved_tiles_with_broadcast_batch():
         x,
         y,
         device_args=[x.to(device_layout=x_layout), y.to(DEVICE)],
-        optimal_cost=x.numel() + y.numel(),
+        optimal_cost=x.numel(),
     )
 
 

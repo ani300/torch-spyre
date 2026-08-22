@@ -201,7 +201,7 @@ def test_matmul_layout_normalization_rejects_mixed_axis_roles(mixed_coord):
     )
 
 
-def test_matmul_layout_normalization_keeps_outer_stick_tile_innermost():
+def test_matmul_layout_normalization_moves_batch_before_outer_stick_tile():
     batch, row, k = sympy.symbols("batch row k")
     layout = pass_utils_module.SpyreTensorLayout(
         [64, 2, 16, 64],
@@ -217,5 +217,23 @@ def test_matmul_layout_normalization_keeps_outer_stick_tile_innermost():
     )
 
     assert normalized is not None
-    assert list(normalized.device_size) == [16, 64, 2, 64]
-    assert list(normalized.stride_map) == [8192, 128, 64, 1]
+    assert list(normalized.device_size) == [64, 16, 2, 64]
+    assert list(normalized.stride_map) == [128, 8192, 64, 1]
+
+
+def test_matmul_layout_normalization_leaves_unbatched_axes_unchanged():
+    row, k = sympy.symbols("row k")
+    layout = pass_utils_module.SpyreTensorLayout(
+        [2, 64, 64],
+        [64, 128, 1],
+        DataFormats.SEN169_FP16,
+    )
+
+    normalized = pass_utils_module.normalize_matmul_input_layout(
+        layout,
+        [sympy.floor(k / 64), row, sympy.Mod(k, 64)],
+        k,
+        set(),
+    )
+
+    assert normalized is layout
