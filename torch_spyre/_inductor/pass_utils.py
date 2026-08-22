@@ -1543,7 +1543,7 @@ def normalize_matmul_input_layout(
     device_coords: list[sympy.Expr],
     stick_var: sympy.Symbol,
     batch_vars: set[sympy.Symbol],
-) -> SpyreTensorLayout:
+) -> SpyreTensorLayout | None:
     """Keep a matmul stick variable's outer tiles physically next to its stick.
 
     Matmul kernels consume the outer tiles of their stick dimension as one
@@ -1554,6 +1554,12 @@ def normalize_matmul_input_layout(
     Unit axes do not affect physical ownership, so leave their positions alone
     and stable-sort only non-unit outer axes.  This avoids manufacturing distinct
     layouts for harmless padding axes.
+
+    Return ``None`` when a non-unit physical coordinate mixes the stick variable
+    with a batch variable.  Free-symbol membership cannot distinguish, for
+    example, ``8 * batch + k_tile`` from ``16 * k_tile + batch``; accepting
+    either expression based only on its symbols could silently choose the wrong
+    physical ownership order.
     """
     assert len(device_coords) == len(stl.device_size)
     if stick_var not in device_coords[-1].free_symbols:
@@ -1563,13 +1569,24 @@ def normalize_matmul_input_layout(
     stride_map = list(stl.stride_map)
     physical_axes = [axis for axis, size in enumerate(device_size[:-1]) if size > 1]
 
+    for axis in physical_axes:
+        axis_vars = device_coords[axis].free_symbols
+        if stick_var in axis_vars and axis_vars & batch_vars:
+            return None
+
+    # There is no outer ownership block to protect when the stick dimension
+    # fits in one stick.  Reordering batch and unrelated matmul axes in that
+    # case only creates a redundant full-tensor copy.
+    if not any(stick_var in device_coords[axis].free_symbols for axis in physical_axes):
+        return stl
+
     def matmul_axis_role(axis: int) -> int:
         axis_vars = device_coords[axis].free_symbols
         if axis_vars & batch_vars:
             return 0
         if stick_var in axis_vars:
-            return 1
-        return 2
+            return 2
+        return 1
 
     ordered_axes = sorted(
         physical_axes,
@@ -1591,22 +1608,30 @@ def normalize_matmul_input_layout(
     )
 
 
-def matmul_batch_vars(op: ComputedBuffer) -> set[sympy.Symbol]:
-    """Return variables carried by the matmul output's leading batch axes.
+def matmul_output_batch_vars(
+    output_layout: FixedLayout,
+    output_dep: MemoryDep,
+) -> set[sympy.Symbol]:
+    """Return variables carried by a matmul output's leading batch axes.
 
     A batch axis may be broadcast by either input, so intersecting both input
     dependencies loses precisely the GQA/value-matmul case where the rhs has a
     unit head dimension. Matmul's output contract identifies batch axes
     unambiguously: every logical dimension before M and N.
     """
+    output_coords = host_coordinates(output_layout, output_dep, None)
+    return set().union(*(coord.free_symbols for coord in output_coords[:-2]))
+
+
+def matmul_batch_vars(op: ComputedBuffer) -> set[sympy.Symbol]:
+    """Return the output batch variables for a lowered matmul operation."""
     write_deps = [
         dep for dep in op_read_writes(op).writes if isinstance(dep, MemoryDep)
     ]
     if not write_deps:
         return set()
 
-    output_coords = host_coordinates(op.layout, write_deps[0], None)
-    return set().union(*(coord.free_symbols for coord in output_coords[:-2]))
+    return matmul_output_batch_vars(op.layout, write_deps[0])
 
 
 def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
@@ -1687,6 +1712,15 @@ def compute_restickify_needed(
             normalized = normalize_matmul_input_layout(
                 in_stl, idc, matmul_stick_var, batch_vars
             )
+            if normalized is None:
+                # The source's physical ownership order is ambiguous.  Do not
+                # accept it as a zero-cost matmul input.  The required input
+                # layout is an independent target selected by propagation, so
+                # use it only if its ownership order can be validated.
+                normalized_target = normalize_matmul_input_layout(
+                    out_stl, out_idc, matmul_stick_var, batch_vars
+                )
+                return True, normalized_target
             if normalized != in_stl:
                 return True, normalized
         return False, None
@@ -1706,10 +1740,11 @@ def compute_restickify_needed(
     )
     if target_stl is not None and matmul_stick_var is not None:
         target_idc = try_device_coordinates(target_stl, in_dep, ind_sizes)
-        if target_idc is not None:
-            target_stl = normalize_matmul_input_layout(
-                target_stl, target_idc, matmul_stick_var, batch_vars
-            )
+        if target_idc is None:
+            return True, None
+        target_stl = normalize_matmul_input_layout(
+            target_stl, target_idc, matmul_stick_var, batch_vars
+        )
     return True, target_stl
 
 

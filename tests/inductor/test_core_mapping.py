@@ -167,3 +167,55 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
     }
     assert representable
     assert dict(planner_view.core_to_slot) == sdsc_output_mapping
+
+@pytest.mark.parametrize(
+    "mixed_coord",
+    [
+        lambda batch, k_tile: 8 * batch + k_tile,
+        lambda batch, k_tile: 16 * k_tile + batch,
+    ],
+    ids=["batch-major", "stick-major"],
+)
+def test_matmul_layout_normalization_rejects_mixed_axis_roles(mixed_coord):
+    """Symbol sets alone cannot prove ownership order within a physical axis."""
+    batch, k_tile = sympy.symbols("batch k_tile")
+    layout = pass_utils_module.SpyreTensorLayout(
+        [16, 8, 64],
+        [512, 64, 1],
+        DataFormats.SEN169_FP16,
+    )
+    device_coords = [
+        mixed_coord(batch, k_tile),
+        batch,
+        sympy.Mod(k_tile, 64),
+    ]
+
+    assert (
+        pass_utils_module.normalize_matmul_input_layout(
+            layout,
+            device_coords,
+            k_tile,
+            {batch},
+        )
+        is None
+    )
+
+
+def test_matmul_layout_normalization_keeps_outer_stick_tile_innermost():
+    batch, row, k = sympy.symbols("batch row k")
+    layout = pass_utils_module.SpyreTensorLayout(
+        [64, 2, 16, 64],
+        [128, 64, 8192, 1],
+        DataFormats.SEN169_FP16,
+    )
+
+    normalized = pass_utils_module.normalize_matmul_input_layout(
+        layout,
+        [row, sympy.floor(k / 64), batch, sympy.Mod(k, 64)],
+        k,
+        {batch},
+    )
+
+    assert normalized is not None
+    assert list(normalized.device_size) == [16, 64, 2, 64]
+    assert list(normalized.stride_map) == [8192, 128, 64, 1]
