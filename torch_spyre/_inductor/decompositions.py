@@ -447,6 +447,24 @@ def spyre__sdpa_overrideable(
         key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
 
+    # A decode query commonly arrives as a logical [B, H, 1, D] view of
+    # physical [B, 1, H, D] storage. The score matmul can accept that view as
+    # stick-compatible even though it consumes a canonical heads-outer layout,
+    # so whether the query is read correctly can depend on an unrelated LX
+    # allocation decision. Ordinary clones are removed by Inductor; copying
+    # into a fresh contiguous destination forces a real canonical buffer.
+    if max_seqlen_q == 1:
+        query_for_scores = torch.ops.spyre.opaque_copy_(
+            query,
+            torch.zeros(
+                (batch_size, num_heads, max_seqlen_q, head_dim),
+                device=query.device,
+                dtype=query.dtype,
+            ),
+        )
+    else:
+        query_for_scores = query
+
     # Fixed block size of 64 gave num_blocks = ceil(Skv/64), which climbs
     # with sequence length -- 8k KV = 128 blocks, and block counts > 6 do
     # not yet compile (PR #3672). Size the block at ~1/4 of the KV length
@@ -509,7 +527,7 @@ def spyre__sdpa_overrideable(
     # Renaming "_b" -> "batch_size" is all it takes to light up the batch tile
     # in a follow-up.
     with spyre_hint(named_dims=["_b", "num_heads", "max_seqlen_q", "head_dim"]):
-        q_scaled = query * scaling_factor
+        q_scaled = query_for_scores * scaling_factor
 
     with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
         with spyre_hint(tiles={"num_heads": max(1, num_heads // 4)}):
