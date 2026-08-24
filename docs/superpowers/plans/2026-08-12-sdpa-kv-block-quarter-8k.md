@@ -34,21 +34,25 @@ The merge with main pulled in `register_kernel_provenance` (commit `36af10b`); t
 - [ ] **Step 1: Confirm the rebuilt extension exports the new symbol**
 
 Run:
+
 ```bash
 cd /mnt/home/spyre/torch-spyre
 python3 -c "import torch; from torch_spyre import _C; print('sym:', hasattr(_C,'register_kernel_provenance'))"
 ```
+
 Expected: `sym: True`
 
 - [ ] **Step 2: Run the SDPA prefill baseline (non-causal, non-tail, non-mask)**
 
 Run:
+
 ```bash
 cd /mnt/home/spyre/torch-spyre
 python3 -m pytest "tests/inductor/test_inductor_ops.py" \
   -k "test_sdpa and (mha_prefill or gqa_prefill) and not causal and not kv_tail and not mask and not 8k" \
   -q -p no:cacheprovider 2>&1 | grep -vE "DEBUG|__trace" | tail -15
 ```
+
 Expected: `2 passed` (the `mha_prefill` and `gqa_prefill` cases). If either fails with anything other than a pre-known deferred cause, STOP and diagnose the build before proceeding — do not start Task 1 against a red baseline.
 
 - [ ] **Step 3: No commit** (verification only).
@@ -94,21 +98,25 @@ with:
 - [ ] **Step 3: Re-run the baseline to prove the change is a no-op for small KV**
 
 Run:
+
 ```bash
 cd /mnt/home/spyre/torch-spyre
 python3 -m pytest "tests/inductor/test_inductor_ops.py" \
   -k "test_sdpa and (mha_prefill or gqa_prefill) and not causal and not kv_tail and not mask and not 8k" \
   -q -p no:cacheprovider 2>&1 | grep -vE "DEBUG|__trace" | tail -15
 ```
+
 Expected: `2 passed`. For KV=128 the formula yields `max(64, ceil(128/4)=32 -> 64) = 64`, identical to the old fixed value, so these must stay green. If they regress, the formula or an unrelated build issue is at fault — STOP and diagnose.
 
 - [ ] **Step 4: Lint the changed file**
 
 Run:
+
 ```bash
 cd /mnt/home/spyre/torch-spyre
 pre-commit run --files torch_spyre/_inductor/decompositions.py
 ```
+
 Expected: all hooks pass (ruff line-length, regex-import, etc.). Fix any reported issues and re-run.
 
 - [ ] **Step 5: Commit**
@@ -179,33 +187,39 @@ Do NOT add these keys to the `"expect_fail"` list — they are expected to pass.
 - [ ] **Step 2: Run the two 8k cases on-device**
 
 Run (each compiles ~46s+, so target them; single process):
+
 ```bash
 cd /mnt/home/spyre/torch-spyre
 python3 -m pytest "tests/inductor/test_inductor_ops.py" \
   -k "test_sdpa and 8k" \
   -q -p no:cacheprovider 2>&1 | grep -vE "DEBUG|__trace" | tail -25
 ```
+
 Expected: `2 passed` — `test_sdpa_mha_prefill_8k`, `test_sdpa_gqa_prefill_8k`. The `compare_with_cpu` framework asserts the Spyre output matches the CPU `scaled_dot_product_attention` reference within tolerance.
 
 - [ ] **Step 3: If a case fails, diagnose (do not mask)**
 
 If either 8k case fails:
 - Capture the real error (not the DEBUG spew):
+
   ```bash
   cd /mnt/home/spyre/torch-spyre
   python3 -m pytest "tests/inductor/test_inductor_ops.py::TestOps::test_sdpa_mha_prefill_8k" \
     -q -p no:cacheprovider 2>&1 | grep -vE "DEBUG|__trace" | tail -40
   ```
+
 - A `hint_id appears in more than one group` / restickify / bundle (`sdsc_*.json`) error is a codegen path issue at scale — invoke `superpowers:systematic-debugging`. Do NOT add the case to `expect_fail` to make the suite pass; the case exists to prove correctness.
 - A numeric mismatch (`compare_with_cpu` tolerance) means the ¼-block online-softmax recurrence is wrong at 4 blocks — check the `correction`/`new_max` carry across the (now 4) blocks.
 
 - [ ] **Step 4: Lint the changed file**
 
 Run:
+
 ```bash
 cd /mnt/home/spyre/torch-spyre
 pre-commit run --files tests/inductor/test_inductor_ops.py
 ```
+
 Expected: all hooks pass. Fix and re-run if needed.
 
 - [ ] **Step 5: Commit**
@@ -239,12 +253,14 @@ Confirm the change did not shift any other SDPA case's status (the deferred caus
 - [ ] **Step 1: Run the entire SDPA param family**
 
 Run:
+
 ```bash
 cd /mnt/home/spyre/torch-spyre
 python3 -m pytest "tests/inductor/test_inductor_ops.py" \
   -k "test_sdpa" \
   -q -p no:cacheprovider 2>&1 | grep -vE "DEBUG|__trace" | tail -30
 ```
+
 Expected: `mha_prefill`, `gqa_prefill`, `mha_prefill_8k`, `gqa_prefill_8k` pass. The deferred cases (`mha_prefill_causal`, `gqa_prefill_causal`, `mha_prefill_mask`, `mha_prefill_kv_tail`, `mha_prefill_kv_tail_causal`) fail or xfail exactly as they did before Task 1 — no NEW failures introduced, and no previously-failing case silently changed status.
 
 - [ ] **Step 2: Record the outcome**

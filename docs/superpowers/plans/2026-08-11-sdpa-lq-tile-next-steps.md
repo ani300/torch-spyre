@@ -63,13 +63,13 @@ group invariant.
 that raises), and how the mask-add op lands relative to the tiled scores. The mask
 add is currently *inside* the tile scope but *outside* the seeded producers.
 **Candidate approaches:**
-   - Seed the mask-add output too (`named_dims=["_b","_h","max_seqlen_q","blk_len"]`)
-     so it joins the same group instead of forming a second one.
-   - Precompute the full additive mask once and slice per block (already partly
-     done for causal at line 471) — check whether the *slice* op is the one
-     landing in the second group.
-   - Investigate whether coarse_tile can tolerate a hint_id spanning groups
-     (backend change, larger).
+- Seed the mask-add output too (`named_dims=["_b","_h","max_seqlen_q","blk_len"]`)
+  so it joins the same group instead of forming a second one.
+- Precompute the full additive mask once and slice per block (already partly
+  done for causal at line 471) — check whether the *slice* op is the one
+  landing in the second group.
+- Investigate whether coarse_tile can tolerate a hint_id spanning groups
+  (backend change, larger).
 **Note:** `causal_mask` is top-left aligned (matches `spyre::causal_mask` tril);
 see memory `torch-spyre-sdpa-causal-alignment` — don't reintroduce a bottom-right
 assumption.
@@ -88,13 +88,13 @@ block (64) and the tail block (2) mismatches. Check `_named_dims` declare-once
 semantics (propagate_named_dims.py:454 `setdefault`) — `blk_len` is pinned to 64,
 so the size-2 tail under-tiles or mis-strides.
 **Candidate approaches:**
-   - Pad the last KV block to `kv_block_size` (mask the padding to -inf in scores)
-     so every block is size 64 and `blk_len` is uniform. Cleanest; matches how
-     many flash kernels handle ragged KV.
-   - Give the tail block a distinct named dim (`blk_len_tail`) so it declares its
-     own size — messier, more scopes.
-   - Investigate the `sdsc_*.json` bundle failure directly (may be a symptom, not
-     the cause).
+- Pad the last KV block to `kv_block_size` (mask the padding to -inf in scores)
+  so every block is size 64 and `blk_len` is uniform. Cleanest; matches how
+  many flash kernels handle ragged KV.
+- Give the tail block a distinct named dim (`blk_len_tail`) so it declares its
+  own size — messier, more scopes.
+- Investigate the `sdsc_*.json` bundle failure directly (may be a symptom, not
+  the cause).
 
 ### 3. Activate the `batch_size` / `num_heads` tiles
 Currently the batch/head seeds are placeholders `"_b"`/`"_h"` that deliberately do
@@ -125,7 +125,7 @@ tiled-matmul-output path has a guard independent of the full SDPA op.
   that cracked the transposed-layout bug), `probe_tile_fires.py` (assign_dim_hints
   dump), `probe_named_sizes.py` (`_named_dims` contents).
 - `assign_dim_hints` INFO dump: set `update_log_level("assign_dim_hints","INFO")`
-  + `torch._inductor.config.compile_threads = 1`. Look for
+  - `torch._inductor.config.compile_threads = 1`. Look for
   `['max_seqlen_q'] range=128 split_count=2 -> 64 per tile loop_var=d2`.
 - Run the passing baseline: `pytest "tests/inductor/test_inductor_ops.py::TestOps"
   -k "(sdpa_mha_prefill or sdpa_gqa_prefill) and not causal and not kv_tail and not
