@@ -564,6 +564,33 @@ def test_bmm_xt_yt(bmm_tensors_ab_ba):
     _compare(lambda x, y: torch.matmul(x.transpose(1, 2), y.transpose(1, 2)), x, y)
 
 
+def test_bmm_x_restickifies_interleaved_tiles_with_broadcast_batch():
+    """The lhs K tiles must remain adjacent to K even when rhs broadcasts H.
+
+    Decode SDPA's value matmul has x=[B,H,M,K] and y=[B,1,K,N].  The rhs does
+    not carry H, but H is still a batch axis of the output and must precede x's
+    K tiles.  The input layout below is K-stick-compatible while physically
+    nesting H after K_outer, so it requires a relayout before batchmatmul.
+    """
+    # SDPA pads its single query row to a 64-row block. Keep M=64 so the
+    # relayout exchanges M and H ownership across the BMM core split.
+    batch, heads, m, k, n = 1, 16, 64, 128, 512
+    x = torch.randn((batch, heads, m, k), dtype=torch.float16) * 0.1
+    y = torch.randn((batch, 1, k, n), dtype=torch.float16) * 0.1
+    x_layout = SpyreTensorLayout(
+        list(x.size()), list(x.stride()), x.dtype, [1, 0, 2, 3]
+    )
+    assert list(x_layout.device_size) == [1, m, 2, heads, 64]
+
+    _compare(
+        torch.matmul,
+        x,
+        y,
+        device_args=[x.to(device_layout=x_layout), y.to(DEVICE)],
+        optimal_cost=x.numel() + y.numel(),
+    )
+
+
 # ------- FallbackKernel + restickify regression test ---------
 
 
