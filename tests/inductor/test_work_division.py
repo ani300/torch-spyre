@@ -23,7 +23,10 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
-from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_OP,
+    MATMUL_NO_BATCH_SPLIT_ATTR,
+)
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.work_division import (
@@ -40,6 +43,7 @@ from torch_spyre._inductor.work_division_constraints import (
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
     indirect_access_constraints,
+    matmul_ownership_forbidden_split_vars,
     qfp8wt_matmul_k_pinned,
     qfp8wt_pinned_vars,
 )
@@ -200,6 +204,52 @@ class TestCoordinateMaskBlockedVars(unittest.TestCase):
         )
         result = coordinate_mask_blocked_vars(ctx)
         self.assertEqual(result.blocked, set())
+
+
+class TestMatmulOwnershipForbiddenSplitVars(unittest.TestCase):
+    _PLACEHOLDER_TD = _tensor_dep("matmul_placeholder", (4,), (_isym("_placeholder"),))
+
+    def test_marked_batch_var_is_hard_forbidden(self):
+        batch = _isym("batch")
+        op = _computed_buffer((4,), name="matmul_out")
+        setattr(op, MATMUL_NO_BATCH_SPLIT_ATTR, frozenset({batch}))
+        ctx = _make_context(
+            op,
+            self._PLACEHOLDER_TD,
+            it_space={batch: 4},
+        )
+
+        result = matmul_ownership_forbidden_split_vars(ctx)
+
+        self.assertEqual(result.forbidden, {batch})
+
+    def test_missing_marked_batch_var_raises(self):
+        batch = _isym("batch")
+        other = _isym("other")
+        op = _computed_buffer((4,), name="matmul_out")
+        setattr(op, MATMUL_NO_BATCH_SPLIT_ATTR, frozenset({batch}))
+        ctx = _make_context(
+            op,
+            self._PLACEHOLDER_TD,
+            it_space={other: 4},
+        )
+
+        with self.assertRaisesRegex(Unsupported, "no longer present"):
+            matmul_ownership_forbidden_split_vars(ctx)
+
+    def test_committed_split_on_marked_batch_var_raises(self):
+        batch = _isym("batch")
+        op = _computed_buffer((4,), name="matmul_out")
+        setattr(op, MATMUL_NO_BATCH_SPLIT_ATTR, frozenset({batch}))
+        ctx = _make_context(
+            op,
+            self._PLACEHOLDER_TD,
+            it_space={batch: 4},
+            committed_splits={batch: 2},
+        )
+
+        with self.assertRaisesRegex(Unsupported, "hard-forbidden split"):
+            collect_work_division_constraints(ctx)
 
 
 class TestHardForbiddenSplits(unittest.TestCase):

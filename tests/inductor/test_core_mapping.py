@@ -168,6 +168,7 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
     assert representable
     assert dict(planner_view.core_to_slot) == sdsc_output_mapping
 
+
 @pytest.mark.parametrize(
     "mixed_coord",
     [

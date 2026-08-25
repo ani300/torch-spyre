@@ -118,6 +118,11 @@ ELIDED_COPY_BACK_ATTR = "_spyre_writes_copy_back_target"
 SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY = "_spyre_shared_weight_unit_bmm"
 SHARED_WEIGHT_UNIT_BMM_INFO_KEY = "shared_weight_unit_bmm"
 
+# Set of matmul output batch symbols whose physical input layouts are safe only
+# while those dimensions remain unsplit across cores. Layout propagation stamps
+# this on the ComputedBuffer and work division enforces it as a hard constraint.
+MATMUL_NO_BATCH_SPLIT_ATTR = "_spyre_matmul_no_batch_split_vars"
+
 
 SEGMENT_OFFSETS = [
     0x0,

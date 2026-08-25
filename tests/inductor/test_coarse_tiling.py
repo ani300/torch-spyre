@@ -68,6 +68,7 @@ from torch_spyre._inductor.codegen.superdsc import (
     parse_op_spec,
 )
 from torch_spyre._inductor.constants import (
+    MATMUL_NO_BATCH_SPLIT_ATTR,
     SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
@@ -7184,6 +7185,16 @@ class TestCopyOpMetadataAttrCoverage(unittest.TestCase):
         dst = SimpleNamespace()
         copy_op_metadata(src, dst)
         self.assertFalse(hasattr(dst, "_coarse_tile_dim_advance"))
+
+    def test_copy_op_metadata_preserves_matmul_no_batch_split_contract(self):
+        batch = Symbol("batch")
+        src = SimpleNamespace()
+        setattr(src, MATMUL_NO_BATCH_SPLIT_ATTR, frozenset({batch}))
+        dst = SimpleNamespace()
+
+        copy_op_metadata(src, dst)
+
+        self.assertEqual(getattr(dst, MATMUL_NO_BATCH_SPLIT_ATTR), frozenset({batch}))
 
 
 class TestCoeffThroughFloor(unittest.TestCase):
