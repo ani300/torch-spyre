@@ -910,11 +910,13 @@ def _apply_user_hint(
     max_cores: int,
     blocked: set[Symbol] | None = None,
     pinned: dict[Symbol, int] | None = None,
+    forbidden: set[Symbol] | None = None,
 ) -> dict[Symbol, int]:
     """Apply splits in insertion order, pruning lower-priority overflows."""
     op_name = op.get_name()
     blocked = blocked or set()
     pinned = pinned or {}
+    forbidden = forbidden or set()
 
     splits: dict[Symbol, int] = {}
     cores_used = 1
@@ -940,6 +942,10 @@ def _apply_user_hint(
         if split > 1 and sym in blocked:
             raise Unsupported(
                 f"work_division_hint: {op_name} cannot split constrained dim {sym}."
+            )
+        if split > 1 and sym in forbidden:
+            raise Unsupported(
+                f"work_division_hint: {op_name} cannot split hard-forbidden dim {sym}."
             )
         if sym in pinned and split != pinned[sym]:
             raise Unsupported(
@@ -1260,6 +1266,7 @@ def work_distribution_pass(
                 max_cores,
                 blocked,
                 constraint_result.pinned,
+                constraint_result.forbidden,
             )
             dropped = {
                 s: v for s, v in committed_splits.items() if user_splits.get(s, 1) < v
@@ -1527,6 +1534,7 @@ def _cost_model_matmul_planner(
     committed_splits: dict[Symbol, int],
     max_cores: int,
     input_tds: list[TensorDep],
+    forbidden: set[Symbol] | None = None,
 ) -> dict[Symbol, int]:
     """Override the default split for a matmul / bmm with the lowest-cost
     feasible (b, m, n, k) per _matmul_split_cost.
@@ -1541,6 +1549,7 @@ def _cost_model_matmul_planner(
         return splits
     if committed_splits:
         return splits
+    forbidden = forbidden or set()
 
     # Classify the output coord dims: the stickified one is N, the rest index
     # rows. Of those row dims, M is the one appearing in a single input (the
@@ -1593,13 +1602,20 @@ def _cost_model_matmul_planner(
     B_total = math.prod(batch_sizes)
 
     b_combos = (
-        list(itertools.product(*([int(d) for d in divisors(s)] for s in batch_sizes)))
+        list(
+            itertools.product(
+                *(
+                    [1] if bd in forbidden else [int(d) for d in divisors(size)]
+                    for bd, size in zip(batch_dims, batch_sizes)
+                )
+            )
+        )
         if batch_dims
         else [()]
     )
-    m_divs = [int(d) for d in divisors(M_e)]
-    n_divs = [int(d) for d in divisors(n_sticks)]
-    k_divs = [int(d) for d in divisors(k_sticks)]
+    m_divs = [1] if m_dim in forbidden else [int(d) for d in divisors(M_e)]
+    n_divs = [1] if n_dim in forbidden else [int(d) for d in divisors(n_sticks)]
+    k_divs = [1] if k_dim in forbidden else [int(d) for d in divisors(k_sticks)]
 
     # For batchmatmulfp8 with QFP8WT kernels, do not split K
     if has_qfp8wt_tensor(input_tds + [output_td]):
@@ -1896,6 +1912,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         committed_splits,
         max_cores,
         input_tds,
+        constraint_result.forbidden,
     )
     if splits == default_splits:
         return False

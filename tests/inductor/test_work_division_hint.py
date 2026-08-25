@@ -255,6 +255,20 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 pinned={m: 1},
             )
 
+    def test_apply_work_div_hint_rejects_hard_forbidden_split(self):
+        batch = Symbol("batch")
+        op = self._fake_op({batch: ["batch"]})
+
+        with self.assertRaisesRegex(Exception, "hard-forbidden dim"):
+            _wd._apply_user_hint(
+                op,
+                {batch: 2},
+                {batch: 4},
+                self._fake_output_td([batch]),
+                max_cores=32,
+                forbidden={batch},
+            )
+
     @config.patch({"sencores": 8})
     def test_pointwise_work_div_hint_applied(self):
         M, N = 128, 64

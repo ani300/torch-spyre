@@ -136,6 +136,19 @@ def collect_work_division_constraints(
         forbidden |= result.forbidden
         force_output |= result.force_output
 
+        committed_forbidden = {
+            sym: ctx.committed_splits[sym]
+            for sym in result.forbidden
+            if ctx.committed_splits.get(sym, 1) > 1
+        }
+        if committed_forbidden:
+            raise Unsupported(
+                f"{ctx.op.get_name()}: hard-forbidden split(s) "
+                f"{[(str(sym), split) for sym, split in committed_forbidden.items()]} "
+                f"from {constraint.__name__} conflict with an earlier "
+                f"work-division commitment."
+            )
+
         for sym, split in result.pinned.items():
             committed_split = ctx.committed_splits.get(sym)
             if committed_split is not None and committed_split != split:

@@ -23,10 +23,12 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.work_division import (
     TensorDep,
+    _cost_model_matmul_planner,
     _default_split,
     multi_dim_iteration_space_split,
     span_reduction_pass,
@@ -198,6 +200,66 @@ class TestCoordinateMaskBlockedVars(unittest.TestCase):
         )
         result = coordinate_mask_blocked_vars(ctx)
         self.assertEqual(result.blocked, set())
+
+
+class TestHardForbiddenSplits(unittest.TestCase):
+    _PLACEHOLDER_TD = _tensor_dep("placeholder", (4,), (_isym("_placeholder"),))
+
+    def test_committed_hard_forbidden_split_raises(self):
+        batch = _isym("batch")
+        op = _computed_buffer((4,), name="constrained_out")
+        ctx = _make_context(
+            op,
+            self._PLACEHOLDER_TD,
+            it_space={batch: 4},
+            committed_splits={batch: 2},
+        )
+
+        with patch(
+            "torch_spyre._inductor.work_division_constraints.indirect_access_constraints",
+            return_value=ConstraintResult(forbidden={batch}),
+        ):
+            with self.assertRaisesRegex(Unsupported, "hard-forbidden split"):
+                collect_work_division_constraints(ctx)
+
+    def test_cost_model_keeps_forbidden_batch_unsplit(self):
+        batch, m, n, k = (_isym(name) for name in ("batch", "m", "n", "k"))
+        op = _computed_buffer(
+            (4, 64, 256),
+            name="matmul_out",
+            reduction_type=BATCH_MATMUL_OP,
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("matmul_out", (4, 64, 256), (batch, m, n))
+        input_tds = [
+            _tensor_dep("lhs", (4, 64, 128), (batch, m, k)),
+            _tensor_dep("rhs", (4, 128, 256), (batch, k, n)),
+        ]
+        it_space_adjusted = {batch: 4, m: 64, n: 4, k: 2}
+        initial_splits = {sym: 1 for sym in it_space_adjusted}
+
+        def prefer_batch_split(batch_cost_arg, *_args, **_kwargs):
+            return 0 if batch_cost_arg[1] > 1 else 1
+
+        planner_args = (
+            op,
+            initial_splits,
+            it_space_adjusted,
+            output_td,
+            {n: 64, k: 64},
+            {},
+            32,
+            input_tds,
+        )
+        with patch(
+            "torch_spyre._inductor.work_division._matmul_split_cost",
+            side_effect=prefer_batch_split,
+        ):
+            unrestricted = _cost_model_matmul_planner(*planner_args)
+            restricted = _cost_model_matmul_planner(*planner_args, forbidden={batch})
+
+        self.assertGreater(unrestricted[batch], 1)
+        self.assertEqual(restricted[batch], 1)
 
 
 class TestConvSpatialBlockedVars(unittest.TestCase):
