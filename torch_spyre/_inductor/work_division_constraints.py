@@ -33,7 +33,11 @@ from sympy import Expr, Symbol
 from torch._inductor.ir import ComputedBuffer, Reduction
 from torch_spyre._C import ElementArrangement
 
-from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP
+from .constants import (
+    BATCH_MATMUL_OP,
+    BATCH_MATMUL_FP8_OP,
+    MATMUL_NO_BATCH_SPLIT_ATTR,
+)
 from .errors import Unsupported
 from .pass_utils import (
     concretize_expr,
@@ -82,7 +86,7 @@ class ConstraintResult:
     honour but span reduction may still override to satisfy the memory-span
     limit), a ``forbidden`` dim is filtered out of the span-reduction candidate
     set too, so it is never split under any circumstance. Used for shared
-    gather/scatter table data dims.
+    gather/scatter table data dims and layout-dependent matmul batch ownership.
 
     ``force_output`` dims are promoted to output-split priority even when they
     don't appear in the output coordinates (a scatter's index-entry dim, whose
@@ -120,6 +124,7 @@ def collect_work_division_constraints(
         topk_pinned_search_space_vars,
         topk_k_split_constraint,
         indirect_access_constraints,
+        matmul_ownership_forbidden_split_vars,
     ):
         result = constraint(ctx)
 
@@ -135,6 +140,19 @@ def collect_work_division_constraints(
         blocked |= result.blocked - forced
         forbidden |= result.forbidden
         force_output |= result.force_output
+
+        committed_forbidden = {
+            sym: ctx.committed_splits[sym]
+            for sym in result.forbidden
+            if ctx.committed_splits.get(sym, 1) > 1
+        }
+        if committed_forbidden:
+            raise Unsupported(
+                f"{ctx.op.get_name()}: hard-forbidden split(s) "
+                f"{[(str(sym), split) for sym, split in committed_forbidden.items()]} "
+                f"from {constraint.__name__} conflict with an earlier "
+                f"work-division commitment."
+            )
 
         for sym, split in result.pinned.items():
             committed_split = ctx.committed_splits.get(sym)
@@ -175,6 +193,27 @@ def coordinate_mask_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRes
         and concretize_expr(ctx.it_space[v]) % ctx.stick_vars[v] != 0
     }
     return ConstraintResult(blocked=blocked)
+
+
+def matmul_ownership_forbidden_split_vars(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Keep batch ownership compatible with zero-copy matmul input layouts.
+
+    Layout propagation may retain batch-after-outer-stick layouts when it can
+    avoid a copy by requiring the corresponding output batch dimensions to stay
+    unsplit. The symbols are stamped on the matmul op so this later phase can
+    enforce that cross-pass contract.
+    """
+    forbidden = set(getattr(ctx.op, MATMUL_NO_BATCH_SPLIT_ATTR, ()))
+    missing = forbidden - set(ctx.it_space_adjusted)
+    if missing:
+        raise Unsupported(
+            f"{ctx.op.get_name()}: matmul no-batch-split dim(s) "
+            f"{sorted(str(sym) for sym in missing)} are no longer present in "
+            f"the work-division iteration space."
+        )
+    return ConstraintResult(forbidden=forbidden)
 
 
 def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:

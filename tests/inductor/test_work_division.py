@@ -23,10 +23,12 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+from torch_spyre._inductor.constants import BATCH_MATMUL_OP, MATMUL_NO_BATCH_SPLIT_ATTR
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.work_division import (
     TensorDep,
+    _cost_model_matmul_planner,
     _default_split,
     multi_dim_iteration_space_split,
     span_reduction_pass,
@@ -38,6 +40,7 @@ from torch_spyre._inductor.work_division_constraints import (
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
     indirect_access_constraints,
+    matmul_ownership_forbidden_split_vars,
     qfp8wt_matmul_k_pinned,
     qfp8wt_pinned_vars,
 )
@@ -198,6 +201,91 @@ class TestCoordinateMaskBlockedVars(unittest.TestCase):
         )
         result = coordinate_mask_blocked_vars(ctx)
         self.assertEqual(result.blocked, set())
+
+
+class TestMatmulOwnershipForbiddenSplitVars(unittest.TestCase):
+    _PLACEHOLDER_TD = _tensor_dep("matmul_placeholder", (4,), (_isym("_placeholder"),))
+
+    def test_marked_batch_var_is_hard_forbidden(self):
+        batch = _isym("batch")
+        op = _computed_buffer((4,), name="matmul_out")
+        setattr(op, MATMUL_NO_BATCH_SPLIT_ATTR, frozenset({batch}))
+        ctx = _make_context(
+            op,
+            self._PLACEHOLDER_TD,
+            it_space={batch: 4},
+        )
+
+        result = matmul_ownership_forbidden_split_vars(ctx)
+
+        self.assertEqual(result.forbidden, {batch})
+
+    def test_missing_marked_batch_var_raises(self):
+        batch = _isym("batch")
+        other = _isym("other")
+        op = _computed_buffer((4,), name="matmul_out")
+        setattr(op, MATMUL_NO_BATCH_SPLIT_ATTR, frozenset({batch}))
+        ctx = _make_context(
+            op,
+            self._PLACEHOLDER_TD,
+            it_space={other: 4},
+        )
+
+        with self.assertRaisesRegex(Unsupported, "no longer present"):
+            matmul_ownership_forbidden_split_vars(ctx)
+
+    def test_committed_split_on_marked_batch_var_raises(self):
+        batch = _isym("batch")
+        op = _computed_buffer((4,), name="matmul_out")
+        setattr(op, MATMUL_NO_BATCH_SPLIT_ATTR, frozenset({batch}))
+        ctx = _make_context(
+            op,
+            self._PLACEHOLDER_TD,
+            it_space={batch: 4},
+            committed_splits={batch: 2},
+        )
+
+        with self.assertRaisesRegex(Unsupported, "hard-forbidden split"):
+            collect_work_division_constraints(ctx)
+
+    def test_cost_model_keeps_marked_batch_unsplit(self):
+        batch, m, n, k = (_isym(name) for name in ("batch", "m", "n", "k"))
+        op = _computed_buffer(
+            (4, 64, 256),
+            name="matmul_out",
+            reduction_type=BATCH_MATMUL_OP,
+            reduction_ranges=(128,),
+        )
+        output_td = _tensor_dep("matmul_out", (4, 64, 256), (batch, m, n))
+        input_tds = [
+            _tensor_dep("lhs", (4, 64, 128), (batch, m, k)),
+            _tensor_dep("rhs", (4, 128, 256), (batch, k, n)),
+        ]
+        it_space_adjusted = {batch: 4, m: 64, n: 4, k: 2}
+        initial_splits = {sym: 1 for sym in it_space_adjusted}
+
+        def prefer_batch_split(batch_cost_arg, *_args, **_kwargs):
+            return 0 if batch_cost_arg[1] > 1 else 1
+
+        planner_args = (
+            op,
+            initial_splits,
+            it_space_adjusted,
+            output_td,
+            {n: 64, k: 64},
+            {},
+            32,
+            input_tds,
+        )
+        with patch(
+            "torch_spyre._inductor.work_division._matmul_split_cost",
+            side_effect=prefer_batch_split,
+        ):
+            unrestricted = _cost_model_matmul_planner(*planner_args)
+            restricted = _cost_model_matmul_planner(*planner_args, forbidden={batch})
+
+        self.assertGreater(unrestricted[batch], 1)
+        self.assertEqual(restricted[batch], 1)
 
 
 class TestConvSpatialBlockedVars(unittest.TestCase):

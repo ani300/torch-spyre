@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING, Literal
 
 import sympy
 
+from .constants import MATMUL_NO_BATCH_SPLIT_ATTR
+
 if TYPE_CHECKING:
     from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import ComputedBuffer
@@ -304,6 +306,7 @@ _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
     "loop_info",
+    MATMUL_NO_BATCH_SPLIT_ATTR,
     "_restickify_plan",
     "_input_layout_overrides",
     "_emit_set_layout",

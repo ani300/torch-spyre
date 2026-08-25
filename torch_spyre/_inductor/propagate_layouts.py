@@ -60,6 +60,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
+    MATMUL_NO_BATCH_SPLIT_ATTR,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
 )
@@ -968,13 +969,14 @@ def _matmul_layouts(
         and x_outer_tiles != y_outer_tiles
     )
 
-    # Direct shared batch axes can keep a non-canonical order only when both
-    # operands agree on it and the output's M/N work can occupy every core.
-    # Decode GQA is the important counterexample: M/N alone cannot fill the
-    # machine, so heads participate in core ownership; if K_outer and N_outer
-    # have different cardinalities, placing heads after them maps the same head
-    # to different cores on the two inputs.  Canonicalize just those exposed or
-    # conflicting axes.
+    # Direct shared batch axes can keep a non-canonical order when both operands
+    # agree on it and either their outer-stick tile counts agree or work division
+    # keeps that batch axis unsplit. Decode GQA is the important counterexample:
+    # if K_outer and N_outer have different cardinalities, placing heads after
+    # them maps the same head to different cores once heads participate in core
+    # ownership. Canonicalize axes that may split now; otherwise record the
+    # no-split requirement for the later work-division passes.
+    no_batch_split_vars: set[sympy.Symbol] = set()
     for batch_var in all_batch_vars - batch_vars:
         orders = {
             order
@@ -984,9 +986,21 @@ def _matmul_layouts(
             )
             if order is not None
         }
-        exposed_unequal_tiles = batch_may_split and unequal_outer_tiles and 1 in orders
-        if 0 in orders or len(orders) > 1 or exposed_unequal_tiles:
+        exposed_unequal_tiles = unequal_outer_tiles and 1 in orders
+        if 0 in orders or len(orders) > 1:
             batch_vars.add(batch_var)
+        elif exposed_unequal_tiles:
+            if batch_may_split:
+                batch_vars.add(batch_var)
+            else:
+                no_batch_split_vars.add(batch_var)
+
+    if no_batch_split_vars:
+        setattr(
+            op,
+            MATMUL_NO_BATCH_SPLIT_ATTR,
+            frozenset(no_batch_split_vars),
+        )
 
     if batch_vars:
         x_req_stl = find_stick_compatible_input_layout(
