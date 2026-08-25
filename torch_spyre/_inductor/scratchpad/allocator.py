@@ -46,7 +46,11 @@ from torch_spyre._inductor.pass_utils import (
     _per_core_view_from_prep,
     op_short_name,
 )
-from torch_spyre._inductor.work_division import enumerate_work_division_candidates
+from torch_spyre._inductor.work_division import (
+    _first_non_indirect_read_index,
+    collect_op_work_division_constraints,
+    enumerate_work_division_candidates,
+)
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
@@ -1498,6 +1502,51 @@ def _enum_split_options(
     ]
 
 
+def _filter_forbidden_split_options(
+    op: Operation,
+    options: list[tuple[dict, dict]],
+) -> list[tuple[dict, dict]]:
+    """Remove pruned candidates that split a hard-forbidden iteration symbol.
+
+    The pruned co-optimizer synthesizes alternatives after the normal work-
+    division passes have run. Reuse their constraint collector here so a later
+    optimization cannot violate an earlier correctness contract, including
+    matmul batch ownership and indirect-access table addressing.
+    """
+    if not isinstance(op, ComputedBuffer) or not isinstance(
+        op.data, (Pointwise, Reduction)
+    ):
+        return options
+
+    forbidden = collect_op_work_division_constraints(op).forbidden
+    if not forbidden:
+        return options
+
+    rw = op_read_writes(op)
+    write_index = next(iter(rw.writes)).index
+    read_index = _first_non_indirect_read_index(rw, write_index)
+    iter_space = iteration_space_from_op(op)
+
+    valid: list[tuple[dict, dict]] = []
+    rejected: set[sympy.Symbol] = set()
+    for option in options:
+        per_sym = apply_splits_from_index_coeff(
+            option, write_index, read_index, iter_space
+        )
+        violations = {sym for sym in forbidden if per_sym.get(sym, 1) > 1}
+        if violations:
+            rejected |= violations
+        else:
+            valid.append(option)
+
+    if not valid:
+        raise Unsupported(
+            f"{op.get_name()}: every scratchpad core-division candidate splits "
+            f"hard-forbidden dim(s) {sorted(str(sym) for sym in rejected)}."
+        )
+    return valid
+
+
 def _canonical_key(splits: tuple[dict, dict]) -> tuple:
     """Hashable key for a (output_splits, reduction_splits) pair."""
     out, red = splits
@@ -1602,9 +1651,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if op.name in fixed_division_ops:
                 divs = [_fixed_core_division(op)]
             elif self.prune:
+                options = _filter_forbidden_split_options(
+                    op,
+                    _enum_split_options(op, matmul_bases, matmul_roles),
+                )
                 divs = [
                     CoreDivision(output_splits=dict(out), reduction_splits=dict(red))
-                    for out, red in _enum_split_options(op, matmul_bases, matmul_roles)
+                    for out, red in options
                 ]
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
@@ -1683,6 +1736,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if op is None or buf.chosen_division is None:
                 continue
             cd = buf.core_divisions[buf.chosen_division]
+            _filter_forbidden_split_options(
+                op,
+                [(cd.output_splits, cd.reduction_splits)],
+            )
             op.op_it_space_splits = (
                 dict(cd.output_splits),
                 dict(cd.reduction_splits),
