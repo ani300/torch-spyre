@@ -65,6 +65,7 @@ from .pass_utils import (
 )
 from .propagate_hints import get_op_hints
 from .work_division_constraints import (
+    ConstraintResult,
     WorkDivConstraintContext,
     collect_work_division_constraints,
     has_qfp8wt_tensor,
@@ -761,6 +762,51 @@ def apply_splits(
     op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
 
+def _work_division_constraint_context(
+    op: ComputedBuffer,
+    committed_splits: dict[Symbol, int] | None = None,
+) -> tuple[WorkDivConstraintContext, SymbolMeta]:
+    """Build the canonical constraint context for an op.
+
+    Work division and later phases that may replace its decision must derive
+    constraints from the same tensor dependencies and stick-adjusted iteration
+    space. Keeping that setup here prevents the scratchpad co-optimizer from
+    accidentally using a weaker interpretation.
+    """
+    it_space = iteration_space_from_op(op)
+    input_tds, output_td = collect_tensor_deps(
+        op, get_mem_deps_from_rw(op_read_writes(op))
+    )
+    all_tds = input_tds + [output_td]
+    symbol_meta = _collect_symbol_metadata(it_space)
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+        it_space, all_tds, symbol_meta
+    )
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+    return (
+        WorkDivConstraintContext(
+            op=op,
+            it_space=it_space,
+            it_space_adjusted=it_space_adjusted,
+            output_td=output_td,
+            input_tds=input_tds,
+            stick_vars=stick_vars,
+            reduction_vars=reduction_vars,
+            committed_splits=committed_splits or {},
+        ),
+        symbol_meta,
+    )
+
+
+def collect_op_work_division_constraints(
+    op: ComputedBuffer,
+) -> ConstraintResult:
+    """Collect constraints for a later phase that may replace work division."""
+    ctx, _ = _work_division_constraint_context(op)
+    return collect_work_division_constraints(ctx)
+
+
 def enumerate_work_division_candidates(
     op: ComputedBuffer,
     max_cores: int,
@@ -781,41 +827,22 @@ def enumerate_work_division_candidates(
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
 
-    it_space = iteration_space_from_op(op)
-    op_is_topk = is_topk(op)
-
-    input_tds, output_td = collect_tensor_deps(
-        op, get_mem_deps_from_rw(op_read_writes(op))
-    )
+    constraint_ctx, symbol_meta = _work_division_constraint_context(op)
+    it_space = constraint_ctx.it_space
+    it_space_adjusted = constraint_ctx.it_space_adjusted
+    input_tds = constraint_ctx.input_tds
+    output_td = constraint_ctx.output_td
+    stick_vars = constraint_ctx.stick_vars
+    reduction_vars = constraint_ctx.reduction_vars
     all_tds = input_tds + [output_td]
-
-    symbol_meta = _collect_symbol_metadata(it_space)
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
-    )
-
-    # Reduction (K) dims are the iteration vars absent from the output tensor's
-    # device coordinates (mirrors prioritize_dimensions / splits_by_index_coeff).
-    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+    op_is_topk = is_topk(op)
 
     topk_k_sym = None
     if op_is_topk:
         output_dims, _ = prioritize_dimensions(output_td, it_space_adjusted)
         topk_k_sym = _find_topk_k_symbol(output_dims, input_tds)
 
-    constraint_result = collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=reduction_vars,
-            committed_splits={},
-        )
-    )
+    constraint_result = collect_work_division_constraints(constraint_ctx)
     blocked = constraint_result.blocked
     pinned = constraint_result.pinned
     forbidden = constraint_result.forbidden
@@ -851,7 +878,7 @@ def enumerate_work_division_candidates(
             splits[v] > 1 for v in blocked
         ):
             return False
-        if any(  # a shared-table data dim must never be split (hard-forbidden)
+        if any(  # a hard-forbidden dim must never be split
             splits[v] > 1 for v in forbidden
         ):
             return False

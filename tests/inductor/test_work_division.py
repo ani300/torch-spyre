@@ -288,6 +288,137 @@ class TestMatmulOwnershipForbiddenSplitVars(unittest.TestCase):
         self.assertEqual(restricted[batch], 1)
 
 
+class TestPrunedScratchpadWorkDivisionConstraints(unittest.TestCase):
+    _ALLOCATOR_TARGET = "torch_spyre._inductor.scratchpad.allocator"
+
+    def _case(self):
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        batch, m = _isym("batch"), _isym("m")
+        op = _computed_buffer(
+            (4, 64),
+            name="matmul_out",
+            reduction_type=BATCH_MATMUL_OP,
+            reduction_ranges=(128,),
+        )
+        setattr(op, MATMUL_NO_BATCH_SPLIT_ATTR, frozenset({batch}))
+
+        # write = 64 * batch + m. The safe seed splits only M; the synthesized
+        # alternative uses the same M split and additionally splits batch.
+        safe = ({1: 8}, {})
+        unsafe = ({64: 4, 1: 8}, {})
+        op.op_it_space_splits = safe
+        rw = MagicMock()
+        rw.writes = [MagicMock(index=64 * batch + m)]
+        rw.reads = []
+
+        graph = MagicMock()
+        graph.operations = [op]
+        allocator = CoOptimizingAllocator(
+            layout_planning=MagicMock(),
+            size=1 << 20,
+            prune=True,
+        )
+        return allocator, graph, op, rw, batch, m, safe, unsafe
+
+    def _patch_candidate_context(self, op, rw, batch, m, unsafe):
+        def constraints(candidate_op):
+            self.assertIs(candidate_op, op)
+            self.assertEqual(
+                getattr(candidate_op, MATMUL_NO_BATCH_SPLIT_ATTR),
+                frozenset({batch}),
+            )
+            return ConstraintResult(forbidden={batch})
+
+        return (
+            patch(
+                f"{self._ALLOCATOR_TARGET}.ops_in_offset_mutation_component",
+                return_value=set(),
+            ),
+            patch(
+                f"{self._ALLOCATOR_TARGET}._find_distinct_matmul_splits",
+                return_value=((), ()),
+            ),
+            patch(
+                f"{self._ALLOCATOR_TARGET}._enum_split_options",
+                return_value=[op.op_it_space_splits, unsafe],
+            ),
+            patch(
+                f"{self._ALLOCATOR_TARGET}.collect_op_work_division_constraints",
+                side_effect=constraints,
+            ),
+            patch(
+                f"{self._ALLOCATOR_TARGET}.op_read_writes",
+                return_value=rw,
+            ),
+            patch(
+                f"{self._ALLOCATOR_TARGET}.iteration_space_from_op",
+                return_value={batch: 4, m: 64},
+            ),
+        )
+
+    def test_pruned_candidates_and_commit_keep_marked_batch_unsplit(self):
+        from torch_spyre._inductor.pass_utils import apply_splits_from_index_coeff
+        from torch_spyre._inductor.scratchpad.plan_solver import CoreDivisionBuffer
+
+        allocator, graph, op, rw, batch, m, safe, unsafe = self._case()
+        with ExitStack() as stack:
+            for ctx in self._patch_candidate_context(op, rw, batch, m, unsafe):
+                stack.enter_context(ctx)
+
+            divisions = allocator._division_map(graph)[op.name]
+            self.assertEqual(
+                [(cd.output_splits, cd.reduction_splits) for cd in divisions],
+                [safe],
+            )
+
+            allocation = [
+                CoreDivisionBuffer(
+                    name=op.name,
+                    size=128,
+                    uses=[0],
+                    core_divisions=divisions,
+                    chosen_division=0,
+                )
+            ]
+            allocator._commit_divisions(graph, allocation)
+
+        per_sym = apply_splits_from_index_coeff(
+            op.op_it_space_splits,
+            rw.writes[0].index,
+            rw.writes[0].index,
+            {batch: 4, m: 64},
+        )
+        self.assertEqual(per_sym[batch], 1)
+
+    def test_commit_rejects_hard_forbidden_split_as_backstop(self):
+        from torch_spyre._inductor.scratchpad.plan_solver import (
+            CoreDivision,
+            CoreDivisionBuffer,
+        )
+
+        allocator, graph, op, rw, batch, m, _, unsafe = self._case()
+        allocation = [
+            CoreDivisionBuffer(
+                name=op.name,
+                size=128,
+                uses=[0],
+                core_divisions=[
+                    CoreDivision(
+                        output_splits=dict(unsafe[0]),
+                        reduction_splits=dict(unsafe[1]),
+                    )
+                ],
+                chosen_division=0,
+            )
+        ]
+        with ExitStack() as stack:
+            for ctx in self._patch_candidate_context(op, rw, batch, m, unsafe):
+                stack.enter_context(ctx)
+            with self.assertRaisesRegex(Unsupported, "hard-forbidden dim"):
+                allocator._commit_divisions(graph, allocation)
+
+
 class TestConvSpatialBlockedVars(unittest.TestCase):
     _PATCH_TARGET = "torch_spyre._inductor.work_division_constraints.op_read_writes"
     _PLACEHOLDER_TD = _tensor_dep("conv_placeholder", (128,), (_isym("_conv"),))
