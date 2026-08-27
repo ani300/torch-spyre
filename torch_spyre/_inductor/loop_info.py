@@ -103,6 +103,11 @@ class PropagationPlan:
         (or is a graph output) and needs a full-sized buffer + copy op.
         ``"reduction"``: the op is a Reduction tiled over a reduction dim;
         see ``reduction`` for the accumulator/fill/combine shape decisions.
+        ``"mutation_write_back"``: the op already carries
+        ``MutationLayoutSHOULDREMOVE`` targeting a graph-output buffer; it
+        IS the cross-tile write-back, so no separate copy op is inserted —
+        only ``output_tiled_dims`` is set so the hardware advances its write
+        pointer per tile.
     full_ranges:
         Full (pre-division) iteration ranges for the copy-out's full buffer.
         Only set when ``kind == "copy_out"``.
@@ -118,15 +123,26 @@ class PropagationPlan:
         the module docstring on name stability) of ComputedBuffers outside
         this op's own outermost loop group that read this op's result.
     is_graph_output:
-        True if this op's buffer name appears in the graph's output names.
+        True if this op's buffer name appears in the graph's output names,
+        OR if this op is a ``MutationLayoutSHOULDREMOVE`` write into a
+        locally-created buffer that itself is the graph output (see
+        ``graph_output_name``).
+    graph_output_name:
+        Only set (and only differs from the op's own name) when this op is
+        a ``MutationLayoutSHOULDREMOVE`` write whose mutation *target* --
+        not the op's own buffer -- is the graph output (e.g.
+        ``copy_forced(src, c)`` where ``c`` is a locally-created buffer that is
+        also the function's return value). ``None`` otherwise, meaning the
+        op's own name should be used to patch ``V.graph.graph_outputs``.
     """
 
-    kind: Literal["loop_internal", "copy_out", "reduction"]
+    kind: Literal["loop_internal", "copy_out", "reduction", "mutation_write_back"]
     full_ranges: list[sympy.Expr] | None = None
     full_strides: tuple[sympy.Expr, ...] | None = None
     reduction: ReductionPlan | None = None
     outside_consumer_names: tuple[str, ...] = ()
     is_graph_output: bool = False
+    graph_output_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -149,16 +165,28 @@ class ReadCopyEntry:
         get_operation_name() of the op supplying tiled_op.loop_info for
         the copy's own read/write-level-extent computation (the first
         consuming op, per the sizing-invariant in the design doc).
+    sizing_read_index:
+        Position of ``dep`` in the sizing op's original MemoryDep list.
+        Recorded before copy insertion rewrites any of those reads.
     consumer_op_names:
         Names of every op in the group that must have this dep's buffer
         name patched (via _NameSwapHandler) to load from copy_name instead.
+    predivision_unit_steps:
+        Per-loop-level ``(op_dim_index, host_stride, tile_extent)`` facts
+        captured before division squeezes a size-one tiled dimension away.
+        ``_plan_read_copies`` attaches the selected sizing read's facts here;
+        this entry is their authority during copy construction.
     """
 
     copy_name: str
     dep: "MemoryDep"
     insert_before_op_name: str
     sizing_op_name: str
+    sizing_read_index: int
     consumer_op_names: tuple[str, ...]
+    predivision_unit_steps: tuple[
+        tuple[tuple[int, sympy.Expr, sympy.Expr], ...], ...
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -223,6 +251,40 @@ class CoarseTileInfo:
     output_tiled_dims:
         The analogous per-level ``(op_dim_index, extent)`` list for this
         op's own write dependency. Defaults to ``[]`` (no levels tiled).
+    squeezed_advance_per_read:
+        One entry per read dependency, parallel to ``tiled_dims_per_read``.
+        Each entry is a list of per-nesting-level ``(host_stride, extent)``
+        pairs for dims tiled down to extent 1 in this dep's own iteration
+        space -- Inductor's ``SqueezeView.squeezer`` unconditionally drops
+        any such dim from ``dep.index`` (called via
+        ``ComputedBuffer.get_read_writes()`` -> ``extract_read_writes`` ->
+        ``index_vars_squeeze``), so no ``d{i}`` symbol survives for
+        ``_host_dim_to_index_symbol`` to substitute into -- unlike a dim
+        merely absent from one read among several (genuine broadcast),
+        which ``tiled_dims_per_read`` already handles correctly via
+        substitution. ``host_stride`` is the dim's canonical index
+        coefficient in the *squeezed* iteration space of the op whose
+        ``data.ranges`` sizes this dim (product of that op's own
+        ``data.ranges`` sizes strictly to the dim's right) -- the same units
+        every surviving ``d{i}`` symbol in ``dep.index`` already carries,
+        since Inductor mints those coefficients over the unsqueezed
+        ``data.ranges`` and squeeze only renumbers/drops symbols, never
+        rescales them. This is deliberately NOT the buffer's real PyTorch
+        memory stride (``full_buf.layout.stride``) -- that is a different
+        unit system that ``tiling_expr_to_device_expr``'s ``stride_map``-
+        based dimension selection cannot be compared against, and picking
+        the wrong device axis when the two happen to diverge silently
+        advances the wrong dimension (see issue surfaced by
+        ``test_flash_tile_B``). Independent of ``dep.index`` entirely, so
+        ``SpyreKernel._general_tile_advance`` can add its device-address
+        contribution as an extra term via ``tiling_expr_to_device_expr``
+        rather than by substitution. Empty list means no such dims for this
+        read (the common case).
+    squeezed_advance_output:
+        The analogous per-level ``(host_stride, extent)`` list for this op's
+        own write dependency, parallel to ``output_tiled_dims`` the same way
+        ``squeezed_advance_per_read`` is parallel to ``tiled_dims_per_read``.
+        Defaults to ``[]`` (no levels tiled).
     propagation:
         Planned decision for how this op's result crosses its loop
         boundary, computed by ``_plan_tiling_propagation``. ``None`` until
@@ -237,6 +299,12 @@ class CoarseTileInfo:
         default_factory=list
     )
     output_tiled_dims: list[list[tuple[int, sympy.Expr]]] = field(default_factory=list)
+    squeezed_advance_per_read: list[list[list[tuple[sympy.Expr, sympy.Expr]]]] = field(
+        default_factory=list
+    )
+    squeezed_advance_output: list[list[tuple[sympy.Expr, sympy.Expr]]] = field(
+        default_factory=list
+    )
     propagation: "PropagationPlan | None" = None
 
 
@@ -247,13 +315,14 @@ class CoarseTileInfo:
 _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
+    "iteration_space_ownership",
     "loop_info",
     "_restickify_plan",
     "_input_layout_overrides",
     "_emit_set_layout",
     # Links a tiled reduction op to its accumulation buffer; set by
     # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
-    # insert_restickify.py to overwrite accum_full's generic layout.
+    # insert_restickify.py to promote accum_full to FixedTiledLayout when needed.
     "_tiled_reduction_accum_name",
 )
 

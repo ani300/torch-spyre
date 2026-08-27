@@ -20,6 +20,7 @@ from sympy import Expr, Integer, Symbol, divisors
 from .ir import (
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    AllGatherAsyncFallback,
     AllReduceAsyncFallback,
     BroadcastAsyncFallback,
     WaitWorkFallback,
@@ -38,11 +39,13 @@ from torch._inductor.ir import (
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
+from torch._inductor.virtualized import V
 from torch_spyre._C import ElementArrangement
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, DEVICE_NAME, TOPK_OPS, BATCH_MATMUL_FP8_OP
+from .constants import BATCH_MATMUL_OP, DEVICE_NAME, BATCH_MATMUL_FP8_OP
 from .ir import FixedTiledLayout
+from .op_spec import IndirectAccess
 from .pass_utils import (
     SchedNodeArg,
     finite_upper_or_none,
@@ -52,8 +55,12 @@ from .pass_utils import (
     get_mem_deps_from_rw,
     device_coordinates,
     iteration_space_from_op,
-    splits_by_index_coeff,
-    apply_splits_from_index_coeff,
+    is_topk,
+    is_keep_by_index,
+    commit_iteration_space_ownership,
+    indirect_access_subs_from_op,
+    indirect_sizes_from_op,
+    _fixed_read_layout,
     op_read_writes,
 )
 from .propagate_hints import get_op_hints
@@ -369,6 +376,16 @@ def adjust_it_space_for_sticks(
     return adjusted_space, max_elems
 
 
+def _is_indirectly_accessed(td: TensorDep) -> bool:
+    """True if any of ``td``'s device coordinates carries an IndirectAccess marker.
+
+    Such a tensor is a gather value table or scatter destination: every core
+    addresses it at a runtime-chosen row, so it is never split and none of its
+    dims should be treated as a normal iteration-space axis.
+    """
+    return any(coord.has(IndirectAccess) for coord in td.device_coords[:-1])
+
+
 def get_per_core_span(
     td: TensorDep,
     splits: dict[Symbol, int],
@@ -394,6 +411,17 @@ def get_per_core_span(
     device_size = td.layout.device_layout.device_size
     itemsize = td.layout.dtype.itemsize
     for d, coord in enumerate(td.device_coords[:-1]):
+        if coord.has(IndirectAccess):
+            # Data-dependent gather axis: any core may address any row, so the
+            # whole device extent counts toward the span and this axis is never
+            # split. Returning the full extent here also avoids looking up the
+            # index-tensor name symbol (IndirectAccess's argument), which is not an
+            # iteration variable and is absent from it_space_orig.
+            per_core_size = device_size[d]
+            if per_core_size > 1:
+                stride_elems = math.prod(device_size[d + 1 :])
+                return per_core_size * stride_elems * itemsize
+            continue
         if not coord.free_symbols:
             continue
         per_core_max = 0
@@ -420,8 +448,13 @@ def raise_if_per_core_overflow(
     op_name: str,
     symbol_meta: SymbolMeta,
 ) -> None:
-    """Raise Unsupported if any tensor's per-core memory span exceeds MAX_SPAN_BYTES."""
+    """Raise Unsupported if any tensor's per-core memory span exceeds MAX_SPAN_BYTES.
+
+    Indirectly-accessed tensors (shared gather/scatter tables) are skipped.
+    """
     for td in tensor_deps:
+        if _is_indirectly_accessed(td):
+            continue
         per_core_span = get_per_core_span(td, splits, it_space_orig, symbol_meta)
         if per_core_span > MAX_SPAN_BYTES:
             dl = td.layout.device_layout
@@ -441,6 +474,7 @@ def must_split_vars(
     stick_vars: dict[Symbol, int],
     max_cores: int,
     symbol_meta: SymbolMeta,
+    forbidden_split_syms: "set[Symbol] | None" = None,
 ) -> dict[Symbol, int]:
     """Return the minimum splits per iteration variable to keep each tensor's
     memory span within MAX_SPAN_BYTES.
@@ -491,6 +525,7 @@ def must_split_vars(
                 v
                 for v in coord.free_symbols
                 if _effective_size(v, it_space_orig, symbol_meta) > 1
+                and (forbidden_split_syms is None or v not in forbidden_split_syms)
             ]
             if not split_vars:
                 continue
@@ -663,24 +698,39 @@ def collect_tensor_deps(
     return input_tds, output_td
 
 
-def apply_splits(
-    op: ComputedBuffer,
-    splits: dict,
-    output_td: TensorDep,
-) -> None:
-    """Commit splits to op.
+def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
+    """Collect tensor dependencies for gather's value tables.
 
-    Does nothing when the product of splits is 1 (no parallelism).
+    Gather value tables are filtered out of the normal argument list, but we
+    still need to check if they fit in per-core memory. This function brings
+    them back in with proper IndirectAccess markers. The value table is never
+    split across cores - these dependencies are only used for memory size checks.
     """
-    cores_used = math.prod(splits.values())
-    if cores_used <= 1:
-        return
+    subs = indirect_access_subs_from_op(op)
+    if not subs:
+        return []
+    # device_coordinates needs the *integer* index range for each indirect
+    # symbol (indirect_sizes), not the IndirectAccess marker map. Compute the
+    # coordinates with the raw indirect symbol treated as a normal loop var,
+    # then xreplace subs to mark the runtime-chosen row dimension — mirroring
+    # the align_tensors -> IndirectAccess-substitution order in simplify_op_spec.
+    ind_sizes = indirect_sizes_from_op(op)
+    tds: list[TensorDep] = []
+    for d in op.get_read_writes().reads:
+        if isinstance(d, MemoryDep) and d.is_indirect():
+            layout = _fixed_read_layout(V.graph.get_buffer(d.name))
+            td = TensorDep.__new__(TensorDep)
+            td.dep = d
+            td.layout = layout
+            coords = device_coordinates(layout.device_layout, d, ind_sizes)
+            td.device_coords = [c.xreplace(subs) for c in coords]
+            tds.append(td)
+    return tds
 
-    rw = op_read_writes(op)
-    write_index = output_td.dep.index
-    first_read = next(iter(rw.reads), None)
-    read_index = first_read.index if first_read is not None else write_index
-    op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
+
+def apply_splits(op: ComputedBuffer, splits: dict) -> None:
+    """Commit symbol-keyed work division; scheduler transport is finalized later."""
+    commit_iteration_space_ownership(op, splits)
 
 
 def enumerate_work_division_candidates(
@@ -696,18 +746,15 @@ def enumerate_work_division_candidates(
     of ``1`` means the dim is unsplit; the all-ones single-core split is
     included when it is itself permissible.
 
-    Only ``Pointwise`` / ``Reduction`` ops have a divisible iteration space;
-    ``TOPK`` reductions run single-core, so they yield only the unsplit split.
+    For ``TOPK`` reductions, k's factors are restricted to divisors ``d``
+    with ``k / d <= _TOPK_MAX_K_PER_CORE``, and the search-space dim is
+    pinned to 1 via the ``topk_pinned_search_space_vars`` constraint.
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
 
     it_space = iteration_space_from_op(op)
-
-    # TOPK reductions run single-core (see divide_reduction_op): the only
-    # permissible "division" is the unsplit one.
-    if isinstance(op.data, Reduction) and op.data.reduction_type in TOPK_OPS:
-        return [{v: 1 for v in it_space}]
+    op_is_topk = is_topk(op)
 
     input_tds, output_td = collect_tensor_deps(
         op, get_mem_deps_from_rw(op_read_writes(op))
@@ -723,6 +770,12 @@ def enumerate_work_division_candidates(
     # device coordinates (mirrors prioritize_dimensions / splits_by_index_coeff).
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+
+    topk_k_sym = None
+    if op_is_topk:
+        output_dims, _ = prioritize_dimensions(output_td, it_space_adjusted)
+        topk_k_sym = _find_topk_k_symbol(output_dims, input_tds)
+
     constraint_result = collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
@@ -737,10 +790,14 @@ def enumerate_work_division_candidates(
     )
     blocked = constraint_result.blocked
     pinned = constraint_result.pinned
+    forbidden = constraint_result.forbidden
 
     # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
     # no ``>= current_min`` floor (we want the full set, including 1).
     def factors(v: Symbol) -> list[int]:
+        if op_is_topk and v == topk_k_sym:
+            k_val = concretize_expr(it_space[v])
+            return _topk_valid_k_splits(k_val, max_cores) or [1]
         if v in symbol_meta:
             basis = symbol_meta[v][1]  # granularity
         elif v in stick_vars:
@@ -764,6 +821,10 @@ def enumerate_work_division_candidates(
             return False
         if any(  # a coordinate-masked dim cannot be split across cores
             splits[v] > 1 for v in blocked
+        ):
+            return False
+        if any(  # a shared-table data dim must never be split (hard-forbidden)
+            splits[v] > 1 for v in forbidden
         ):
             return False
         if any(  # a pinned dim's split must equal exactly its pinned value
@@ -904,16 +965,8 @@ def _apply_user_hint(
     return splits
 
 
-def _commit_user_splits(
-    op: ComputedBuffer,
-    splits: dict[Symbol, int],
-    output_td: TensorDep,
-) -> None:
-    if math.prod(splits.values()) <= 1:
-        if hasattr(op, "op_it_space_splits"):
-            delattr(op, "op_it_space_splits")
-        return
-    apply_splits(op, splits, output_td)
+def _commit_user_splits(op: ComputedBuffer, splits: dict[Symbol, int]) -> None:
+    apply_splits(op, splits)
 
 
 def span_reduction_pass(
@@ -923,8 +976,16 @@ def span_reduction_pass(
 ) -> None:
     """Mandatory per-op pass: compute minimum splits to satisfy the MAX_SPAN_BYTES.
 
-    Writes results to op.op_it_space_splits. If no span violation exists,
-    op.op_it_space_splits is left unset (apply_splits is a no-op for splits <= 1).
+    Writes symbol-keyed ownership. Unity splits are retained so later passes
+    have a complete operation iteration-space ownership record.
+
+    For indirect-access ops (gather / scatter), shared-table data dimensions
+    (K, N of the value table or the scatter destination) are excluded from the
+    split candidate set via `forbidden_split_syms`. Splitting those dims would
+    give every core a different base address into the shared table, producing
+    wrong results. If reducing the span requires splitting a forbidden dim the
+    pass proceeds with the best available split on the remaining dims;
+    work_distribution_pass may then place fewer cores to compensate.
     """
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
@@ -938,12 +999,39 @@ def span_reduction_pass(
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
         it_space, all_tds, symbol_meta
     )
-    min_splits = must_split_vars(
-        all_tds, it_space, it_space_adjusted, stick_vars, max_cores, symbol_meta
-    )
-
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+
+    # The two constraint kinds are needed at different points, so collect twice.
+    # `forbidden` (e.g. shared gather/scatter table data dims) must gate
+    # must_split_vars' candidate selection so span reduction never commits a
+    # split that would break shared-table addressing — read it up front
+    # (structural; no committed splits exist yet).
+    forbidden = (
+        collect_work_division_constraints(
+            WorkDivConstraintContext(
+                op=op,
+                it_space=it_space,
+                it_space_adjusted=it_space_adjusted,
+                output_td=output_td,
+                input_tds=input_tds,
+                stick_vars=stick_vars,
+                reduction_vars=reduction_vars,
+                committed_splits={},
+            )
+        ).forbidden
+        or None
+    )
+    min_splits = must_split_vars(
+        all_tds,
+        it_space,
+        it_space_adjusted,
+        stick_vars,
+        max_cores,
+        symbol_meta,
+        forbidden_split_syms=forbidden,
+    )
+
     constraint_result = collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
@@ -972,7 +1060,7 @@ def span_reduction_pass(
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
 
-    apply_splits(op, min_splits, output_td)
+    apply_splits(op, min_splits)
 
     if symbol_meta and math.prod(min_splits.values()) > 1:
         logger.info(
@@ -984,9 +1072,7 @@ def span_reduction_pass(
         logger.debug(
             f"span_reduction work_division {op.get_name()}: cores={math.prod(min_splits.values())}, "
             f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-            f"symbol_meta={symbol_meta}, "
-            f"priorities=[], min_splits={min_splits}, "
-            f"op_it_space_splits={op.op_it_space_splits}"
+            f"symbol_meta={symbol_meta}, priorities=[], min_splits={min_splits}"
         )
 
 
@@ -997,8 +1083,22 @@ def _default_split(
     max_cores: int,
     symbol_meta: SymbolMeta,
     blocked: set[Symbol],
+    forbidden_split_syms: set[Symbol] | None = None,
+    force_output_syms: set[Symbol] | None = None,
+    op: Operation | None = None,
 ) -> tuple[dict[Symbol, int], list[Symbol], list[Symbol]]:
     """Distribute max_cores by priority on top of span_reduction's commits.
+
+    Takes the splits already committed by span reduction and fills in the rest
+    by splitting output dimensions first, then reduction dimensions. Returns the
+    final split decisions and priority lists for logging.
+
+    forbidden_split_syms: Dimensions that must stay unsplit (like data dimensions
+    of shared indirect tables). These are removed from consideration entirely.
+
+    force_output_syms: Dimensions to treat as high-priority output dimensions
+    even if they don't appear directly in the output coordinates (like a scatter's
+    index-entry dimension). These get promoted to the front of the output list.
 
     Returns the chosen splits and the (output, reduction) priority dims the
     caller logs. Shared by work_distribution_pass and cost_model_matmul_division.
@@ -1016,10 +1116,30 @@ def _default_split(
         output_td, it_space_remaining, symbol_meta
     )
 
+    if force_output_syms:
+        # For scatter, the index-entry dimension doesn't show up in the
+        # destination coordinates (row is runtime-chosen), so it gets classified
+        # as a reduction dimension. Move it to output priority so we actually
+        # split it for parallelism.
+        promoted = [d for d in reduction_dims if d in force_output_syms]
+        reduction_dims = [d for d in reduction_dims if d not in force_output_syms]
+        output_dims = promoted + output_dims
+
+    if forbidden_split_syms:
+        output_dims = [d for d in output_dims if d not in forbidden_split_syms]
+        reduction_dims = [d for d in reduction_dims if d not in forbidden_split_syms]
+
     # If span_reduction_pass already committed a reduction split, suppress further
     # reduction splitting so the final result never exceeds one reduction dim split.
+    # Exception: keep_by_index has constraint-based reduction splits that must be
+    # honored, so don't suppress for that op.
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-    if any(v not in coord_vars for v in committed_splits):
+    # Note: span_reduction_pass merges both must_split_vars AND constraints into
+    # committed_splits, so we can't distinguish them here. Only suppress for
+    # ops where we know the reduction split came from span_reduction, not constraints.
+    has_reduction_split = any(v not in coord_vars for v in committed_splits)
+    is_kbi = is_keep_by_index(op) if op else False
+    if has_reduction_split and not is_kbi:
         reduction_dims = []
 
     # Drop blocked dims before the greedy distributor commits them. Coordinate
@@ -1048,34 +1168,30 @@ def work_distribution_pass(
 ) -> None:
     """Optional per-op pass: distribute remaining cores to maximize parallelism.
 
-    Reads op.op_it_space_splits written by span_reduction_pass (if any) to
-    recover the already-committed splits, then fills remaining cores by priority.
+    Reads any splits already committed by span reduction, then allocates the
+    remaining cores by splitting output dimensions first, then reduction
+    dimensions.
     """
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
-    all_tds = input_tds + [output_td]
+    # Gather value tables are filtered out of args, so add them back for memory
+    # checks. (Scatter destinations are already in output_td.) Shared tables are
+    # never split across cores.
+    value_tds = collect_indirect_value_tds(op)
+    all_tds = input_tds + [output_td] + value_tds
 
     symbol_meta = _collect_symbol_metadata(it_space)
 
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
+        it_space, input_tds + [output_td], symbol_meta
     )
 
-    # Recover splits committed by span_reduction_pass using the same
-    # coeff-keyed encoding that codegen uses — stable across passes.
-    if hasattr(op, "op_it_space_splits"):
-        rw = op_read_writes(op)
-        write_index = next(iter(rw.writes)).index
-        read_index = next((d.index for d in rw.reads), write_index)
-        min_splits = apply_splits_from_index_coeff(
-            op.op_it_space_splits, write_index, read_index, it_space
-        )
-    else:
-        min_splits = {}
-
-    # apply_splits_from_index_coeff returns 1 for every unsplit dim; keep only
-    # dims with actual committed splits so they don't overlap with priorities.
-    committed_splits = {s: v for s, v in min_splits.items() if v > 1}
+    ownership = getattr(op, "iteration_space_ownership", None)
+    committed_splits = (
+        {s: v for s, v in ownership.work_slices.items() if v > 1}
+        if ownership is not None
+        else {}
+    )
 
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
@@ -1116,18 +1232,14 @@ def work_distribution_pass(
                     f"Applying strict user hint; this may violate the hardware "
                     f"{MAX_SPAN_BYTES / (1024**2):.3f} MB span limit."
                 )
-            _commit_user_splits(op, user_splits, output_td)
+            _commit_user_splits(op, user_splits)
 
             if logger.isEnabledFor(logging.DEBUG):
-                op_splits: tuple[dict, dict] = getattr(
-                    op, "op_it_space_splits", ({}, {})
-                )
                 logger.debug(
                     f"work_distribution(user-hint) work_division {op.get_name()}: "
                     f"cores={math.prod(user_splits.values())}, "
                     f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-                    f"min_splits={committed_splits}, user_splits={user_splits}, "
-                    f"op_it_space_splits={op_splits}"
+                    f"min_splits={committed_splits}, user_splits={user_splits}"
                 )
             raise_if_per_core_overflow(
                 all_tds, it_space, user_splits, op.get_name(), symbol_meta
@@ -1135,10 +1247,18 @@ def work_distribution_pass(
             return
 
     splits, output_dims, reduction_dims = _default_split(
-        it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta, blocked
+        it_space_adjusted,
+        output_td,
+        committed_splits,
+        max_cores,
+        symbol_meta,
+        blocked,
+        forbidden_split_syms=constraint_result.forbidden,
+        force_output_syms=constraint_result.force_output,
+        op=op,
     )
 
-    apply_splits(op, splits, output_td)
+    apply_splits(op, splits)
 
     if symbol_meta and math.prod(splits.values()) > 1:
         logger.info(
@@ -1152,8 +1272,7 @@ def work_distribution_pass(
             f"work_distribution work_division {op.get_name()}: cores={math.prod(splits.values())}, "
             f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
             f"symbol_meta={symbol_meta}, "
-            f"priorities={output_dims + reduction_dims}, min_splits={committed_splits}, "
-            f"op_it_space_splits={op.op_it_space_splits}"
+            f"priorities={output_dims + reduction_dims}, min_splits={committed_splits}"
         )
 
     raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
@@ -1500,24 +1619,50 @@ def divide_pointwise_op(
     pass_fn(op, args, max_cores)
 
 
+# Maximum k rows that the topk hardware op can process per core.
+_TOPK_MAX_K_PER_CORE = 4
+
+
+def _find_topk_k_symbol(
+    output_dims: list[Symbol], input_tds: list[TensorDep]
+) -> Symbol | None:
+    """Return the output symbol absent from every input's device coords.
+
+    ``_topk_reduction_kwargs`` (lowering.py) substitutes the reduction loop
+    var for k in every input load, so k's symbol never appears in an input's
+    device coords -- unlike batch/other output dims, which pass through
+    unchanged. This distinguishes k independent of size.
+
+    Returns None if no such symbol exists, or more than one does (should not
+    happen for a well-formed topk op).
+    """
+    input_syms = {
+        s for td in input_tds for e in td.device_coords[:-1] for s in e.free_symbols
+    }
+    candidates = [d for d in output_dims if d not in input_syms]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _topk_valid_k_splits(k_val: int, max_cores: int) -> list[int]:
+    """Return every divisor of k_val that is a legal per-core k-split.
+
+    A divisor ``d`` is legal iff ``d <= max_cores`` and
+    ``k_val // d <= _TOPK_MAX_K_PER_CORE``. ``d=1`` is included iff
+    ``k_val <= _TOPK_MAX_K_PER_CORE``. Results are sorted ascending.
+    """
+    return [
+        d
+        for d in sorted(divisors(k_val))
+        if d <= max_cores and k_val // d <= _TOPK_MAX_K_PER_CORE
+    ]
+
+
 def divide_reduction_op(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
     max_cores: int,
     pass_fn: Callable,
 ) -> None:
-    red: Reduction = op.data
-
-    # Currently we support Topk for k<=4, which can be handled efficiently on single core
-    # TODO: Modification will be required to enable Topk for k>4
-    if red.reduction_type in TOPK_OPS:
-        if not config.ignore_work_division_hints and _has_work_div_hint(op):
-            logger.warning(
-                f"work_division_hint: {op.get_name()} ignores work_div hint "
-                f"because TOPK reductions run single-core."
-            )
-        return
-
     pass_fn(op, args, max_cores)
 
 
@@ -1556,10 +1701,10 @@ def _iter_computed_buffers(operations: list[Operation]):
                 (
                     BroadcastAsyncFallback,
                     WaitWorkFallback,
+                    AllGatherAsyncFallback,
                     AllReduceAsyncFallback,
                 ),
             ):
-                # Work division not supported on collective kernels
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")
@@ -1622,8 +1767,8 @@ def work_distribution(
 def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     """Re-price one matmul's split with the analytic cost model.
 
-    Runs between span_reduction and work_distribution, so op.op_it_space_splits
-    still holds only span_reduction's commits. Computes the split
+    Runs between span_reduction and work_distribution, so
+    iteration_space_ownership still holds only span-reduction's commits. Computes the split
     work_distribution would pick, hands it to the cost model, and commits the
     cost model's choice when it differs — returning True so the caller excludes
     the op from work_distribution (every op is divided by exactly one pass).
@@ -1660,18 +1805,12 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
 
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
 
-    # op.op_it_space_splits holds span_reduction's commits here: span_reduction
-    # runs before this pass, and work_distribution — which would overwrite it —
-    # runs after and skips the ops this pass claims.
-    if hasattr(op, "op_it_space_splits"):
-        write_index = next(iter(rw.writes)).index
-        read_index = next((d.index for d in rw.reads), write_index)
-        span_splits = apply_splits_from_index_coeff(
-            op.op_it_space_splits, write_index, read_index, it_space
-        )
-        committed_splits = {s: v for s, v in span_splits.items() if v > 1}
-    else:
-        committed_splits = {}
+    ownership = getattr(op, "iteration_space_ownership", None)
+    committed_splits = (
+        {s: v for s, v in ownership.work_slices.items() if v > 1}
+        if ownership is not None
+        else {}
+    )
 
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
@@ -1690,7 +1829,14 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     blocked = constraint_result.blocked
     committed_splits.update(constraint_result.pinned)
     default_splits, _, _ = _default_split(
-        it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta, blocked
+        it_space_adjusted,
+        output_td,
+        committed_splits,
+        max_cores,
+        symbol_meta,
+        blocked,
+        forbidden_split_syms=constraint_result.forbidden,
+        force_output_syms=constraint_result.force_output,
     )
     splits = _cost_model_matmul_planner(
         op,
@@ -1705,7 +1851,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     if splits == default_splits:
         return False
 
-    apply_splits(op, splits, output_td)
+    apply_splits(op, splits)
     raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
     if logger.isEnabledFor(logging.DEBUG):
@@ -1713,8 +1859,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
             f"cost_model_matmul_division work_division {op.get_name()}: "
             f"cores={math.prod(splits.values())}, "
             f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-            f"min_splits={committed_splits}, "
-            f"op_it_space_splits={op.op_it_space_splits}"
+            f"min_splits={committed_splits}"
         )
     return True
 

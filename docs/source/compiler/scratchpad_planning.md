@@ -157,9 +157,10 @@ _maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planni
 
 Two ordering constraints fix this slot:
 
-- **Work division must run first.** Scratchpad planning needs
-  `op_it_space_splits` to compute per-core buffer sizes. Work division
-  also decides whether adjacent ops have compatible core splits.
+- **Work division must run first.** Scratchpad planning reads the
+  symbol-keyed `iteration_space_ownership` committed by work division to
+  compute per-core buffer sizes. Work division also decides whether adjacent
+  ops have compatible core splits.
   Incompatible splits trigger `core_div_mismatch` and disqualify shared
   buffers from LX (see [Current limitations](#current-limitations)).
 - **Stickification must run first.** All buffers need `FixedTiledLayout`
@@ -254,7 +255,7 @@ Scratchpad planning has three layers with separate concerns:
 
 `ScratchpadAllocator` runs pre-passes (clone insertion), gathers
 `LifetimeBoundBuffer`s, hands them to a pluggable solver, then writes the
-chosen LX addresses onto buffer layouts. `StrategyBCoOptimizingAllocator`
+chosen LX addresses onto buffer layouts. `CoOptimizingAllocator`
 extends this flow with a split-search step before the solver runs.
 :::
 
@@ -272,7 +273,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `permutation_layout.py` | `PermutationBasedLayoutSolver` |
 | `contact_profile.py` | `Profile`, buffer-contact profiling |
 | `graph_editor.py` | `GraphEditor`, the clone/rewrite helper used by input- and output-boundary cloning |
-| `allocator.py` | `ScratchpadAllocator`, `StrategyBCoOptimizingAllocator`, and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
+| `allocator.py` | `ScratchpadAllocator`, `CoOptimizingAllocator`, and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
 | `utils.py` | liveness, mem usage, op-name/eligibility helpers |
 
 ### Entry point
@@ -331,7 +332,7 @@ The checks, in evaluation order (the first failure is the reason reported):
 
 | Reason | Why |
 |---|---|
-| `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name outside `OP_OUTPUT_GOOD_FOR_LX_REUSE` (the debug flag `config.allow_all_ops_in_lx_planning` bypasses the op-name gate) |
+| `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name inside `OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE` (the debug flag `config.allow_all_ops_in_lx_planning` bypasses the op-name gate) |
 | `unsized (no device layout)` | no computable footprint (e.g. a `MultiOutputLayout` tuple op) |
 | `mutation target` | filled by offset writes, so one LX base mis-addresses it |
 | `tiled (advancing)` | LX addresses cannot be `affine.apply` symbols; the advancing-tile check reads `loop_info` (the sole source of truth for per-tile geometry) |
@@ -467,6 +468,11 @@ single-pass solvers. See
 [Simulated Annealing Layout Planner](simulated_annealing_layout.md) for the
 algorithm and the tunable schedule parameters.
 
+Note this is placement-only. With `co_optimizing_lx_planning` the same config
+value instead selects `SaCoOptimizingSolver`, a *different* class that anneals
+the core divisions and the placement jointly — see
+[Joint core-division + LX placement](sa_co_optimization.md).
+
 ## Co-optimization with work-distribution
 
 Work division optimizes each op independently for parallelism. Adjacent
@@ -474,7 +480,7 @@ ops sharing a buffer can get different splits (different shapes mean
 different optimal decompositions), which triggers `core_div_mismatch`
 and disqualifies the shared buffer from LX even when it would have fit.
 
-`StrategyBCoOptimizingAllocator` (gated by
+`CoOptimizingAllocator` (gated by
 `config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING=1`)
 treats split choices and LX placement jointly:
 
@@ -561,6 +567,14 @@ which chooses the core divisions and LX placements jointly in one
 constraint model. It falls back to the greedy allocator when `ortools`
 is unavailable.
 
+### Joint SA co-optimization
+
+Setting `layout_solver = "simulated_annealing"` together with
+`co_optimizing_lx_planning` routes through the same `CoOptimizingAllocator`,
+driven by `SaCoOptimizingSolver`, which anneals the division vector and the
+layout permutation as one joint state and scores it with the cost model. See
+[Joint core-division + LX placement](sa_co_optimization.md).
+
 ## Current limitations
 
 ### Greedy single-pass, no lookahead (default solver)
@@ -576,7 +590,7 @@ compact the address space. Allocate/deallocate cycles fragment LX.
 
 ### Co-optimization is still limited
 
-`StrategyBCoOptimizingAllocator` implements the joint
+`CoOptimizingAllocator` implements the joint
 work-division + LX planning idea. It searches pointwise dim-flips, the
 matmuls' tilings offered to neighbours, cross-matmul split transfer, and a
 shared batch-major `B/M` split for matmuls and reductions. It still never

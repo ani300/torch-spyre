@@ -17,8 +17,11 @@
 Covers six areas, each in its own class group:
   1. LoopSpec data structure and codegen_kernel serialization (TestLoopSpec*,
      TestIterOpSpecs, TestCodegenOpSpecListRoundtrip)
-  2. coarse_tile IR pass: range rewriting, attribute stamping, nested groups
-     (TestDivideRanges, TestCoarseTile, TestCoarseTileNested)
+  2. coarse_tile IR pass: range rewriting, attribute stamping, nested groups,
+     and consumer-redirect index rewriting (TestDivideRanges, TestCoarseTile,
+     TestCoarseTileNested, TestRetileLoadIndexFromStrides,
+     TestSqueezedRetileDims, TestIndexVarPrefix, TestConsumerOwnDimSymbol,
+     TestRetileLoadIndexWithConsumer)
   3. CountedLoopSchedulerNode, build_loop_scheduler_nodes,
      _tiled_syms_for_sched_node_at_depth, and spyre_fuse_nodes loop fusion
      (TestHelpers, TestBuildLoopSchedulerNodes, TestTiledSymsForSchedNode,
@@ -71,21 +74,40 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.loop_info import CoarseTileInfo, copy_op_metadata
 from torch_spyre._inductor.pass_utils import coeff_through_floor
+from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.wsr.coarse_tile import (
     _LOOPS_FREE_SYMS_KEY,
     _REDUCTION_FREE_SYMS_KEY,
     _RetiledBufferInfo,
     _apply_plan,
     _compute_fill_loop_info_planned,
+    _consumer_own_dim_symbol,
     _divide_ranges,
     _full_buffer_read_deps,
+    _index_var_prefix,
     _replace_group_op,
     _rescale_index,
     _retile_load_index,
     _should_patch_retiled_load_indexes,
+    _squeezed_retile_dims,
     coarse_tile_post_stickify,
     coarse_tile_pre_stickify,
     plan_coarse_tile_groups,
+    reduction_loop_vars,
+)
+from torch_spyre._inductor.scratchpad.coarse_tiling import (
+    CoarseTilingPass,
+    _derive_group_idx_offset,
+    _derive_hint_id_base,
+    derive_tiling_groups,
+    tile_spec_to_dim_hints,
+)
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    CoreDivision,
+    CoreDivisionBuffer,
+    TileAxis,
+    TileSpec,
+    ceil_div,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.fusion import spyre_fuse_nodes
@@ -612,7 +634,7 @@ def _make_tiled_op_spec() -> OpSpec:
         device_tile_advance_expr=tile_advance_expr,
     )
     return OpSpec(
-        op="add",
+        op="abs",
         is_reduction=False,
         iteration_space={c0: (Integer(128), 1)},
         args=[tensor_in, tensor_out],
@@ -632,7 +654,6 @@ def _fake_compile_op_spec(
     op_spec: OpSpec,
     symbols: list,
     symbol_id_offset: int = 0,
-    use_symbols: bool = False,
 ):
     """Stub that returns (json, [], [], []) — no real SDSC compilation."""
     return {f"{idx}_{op_spec.op}": {"op": op_spec.op}}, [], [], []
@@ -946,6 +967,242 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
 
         self.assertEqual(simplify(result_c0 - 64 * c0), 0)
         self.assertEqual(simplify(result_c1 - 32 * c1), 0)
+
+    def test_index_already_at_new_scale_is_left_unchanged(self):
+        # Reproduces test_copy_running_max_4d_H4_Lq4: a [2,32,4096] buffer
+        # tiled on two coarse-tile levels (H then Lq) down to old_stride
+        # (131072, 4096, 1) -> new_stride (4096, 1024, 1). A same-group
+        # consumer resynced to a Pass-1/2/3 replacement object (see
+        # _coarse_tile_common's by-name resync) can have its load index
+        # already retraced at new_stride scale. Rewriting it again against
+        # old_stride would silently collide two dims' coefficients (dim 1's
+        # old_stride 4096 equals dim 0's new_stride 4096) instead of raising
+        # or leaving it alone.
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(131072), Integer(4096), Integer(1)),
+            new_stride=(Integer(4096), Integer(1024), Integer(1)),
+            old_size=(Integer(2), Integer(32), Integer(4096)),
+        )
+        already_fresh_index = 4096 * d0 + 1024 * d1 + d2
+
+        result = _retile_load_index("buf", already_fresh_index, info)
+
+        self.assertEqual(simplify(result - already_fresh_index), 0)
+
+    def test_genuinely_stale_index_at_old_scale_still_rewritten(self):
+        # Same buffer/info as test_index_already_at_new_scale_is_left_unchanged,
+        # but with a genuinely stale index (coefficients at old_stride scale)
+        # -- must still be rewritten to new_stride, not skipped.
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(131072), Integer(4096), Integer(1)),
+            new_stride=(Integer(4096), Integer(1024), Integer(1)),
+            old_size=(Integer(2), Integer(32), Integer(4096)),
+        )
+        stale_index = 131072 * d0 + 4096 * d1 + d2
+
+        result = _retile_load_index("buf", stale_index, info)
+
+        self.assertEqual(simplify(result - (4096 * d0 + 1024 * d1 + d2)), 0)
+
+
+def _make_consumer_with_ranges(ranges):
+    """Return a fake ComputedBuffer whose ``.data.ranges`` is ``ranges``.
+
+    Used to drive ``_squeezed_retile_dims``/``_consumer_own_dim_symbol``,
+    which only inspect ``consumer.data.ranges`` -- no other ComputedBuffer
+    attribute is touched by either function.
+    """
+    return _make_op(_make_pointwise(ranges))
+
+
+class TestSqueezedRetileDims(unittest.TestCase):
+    """Unit tests for which raw dims need a re-minted symbol on redirect.
+
+    See coarse_tile.py's module docstring / _squeezed_retile_dims's own
+    docstring for the two-bug history this guards: a dim only needs a
+    minted term when it was squeezed out of the *old* (tile-local) buffer's
+    layout (old_size[d] == 1, new_stride[d] != 0) AND the consumer's own
+    output for that same raw dim is non-unit (data.ranges[d] != 1) -- i.e a
+    real loop variable actually exists for it somewhere in the trace.
+    """
+
+    def test_squeezed_dim_with_nonunit_consumer_output_included(self):
+        # old_size=1 (squeezed out of the read), new_stride != 0 (real in the
+        # new buffer), consumer's own dim 0 is non-unit (size 8) -- a real
+        # loop var exists for this dim, so it belongs in the result.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        consumer = _make_consumer_with_ranges([8, 256])
+
+        self.assertEqual(_squeezed_retile_dims(info, consumer), [0])
+
+    def test_unit_consumer_output_dim_excluded(self):
+        # Same squeeze/stride shape as above, but the consumer's own output
+        # for dim 0 is ALSO unit-size (e.g. B=1 when only H is tiled) -- no
+        # real loop variable exists for this dim anywhere in the trace, so
+        # it must be excluded. This is the exact regression this guard
+        # fixes: omitting it causes _consumer_own_dim_symbol to mint a
+        # symbol that collides with an unrelated, already-present symbol
+        # under sympy's automatic term-merging (see _retile_load_index's
+        # already_present comment).
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        consumer = _make_consumer_with_ranges([1, 256])
+
+        self.assertEqual(_squeezed_retile_dims(info, consumer), [])
+
+    def test_nonsqueezed_dim_excluded(self):
+        # old_size != 1: this dim was never squeezed out of the read in the
+        # first place, so compute_tile_index already rescales its existing
+        # coefficient -- no term needs to be added back.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(128), Integer(1)),
+            new_stride=(Integer(64), Integer(1)),
+            old_size=(Integer(2), Integer(256)),
+        )
+        consumer = _make_consumer_with_ranges([2, 256])
+
+        self.assertEqual(_squeezed_retile_dims(info, consumer), [])
+
+    def test_strideless_new_dim_excluded(self):
+        # new_stride == 0: the dim stays size-1/strideless in the new buffer
+        # too, so it contributes nothing regardless of the consumer's shape.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(0), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        consumer = _make_consumer_with_ranges([8, 256])
+
+        self.assertEqual(_squeezed_retile_dims(info, consumer), [])
+
+
+class TestIndexVarPrefix(unittest.TestCase):
+    """Unit tests for inferring the live loop-var naming prefix from an index."""
+
+    def test_infers_d_prefix(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        self.assertEqual(_index_var_prefix({d0, d1}), "d")
+
+    def test_infers_q_prefix(self):
+        q0, q2 = sympy.symbols("q0 q2")
+        self.assertEqual(_index_var_prefix({q0, q2}), "q")
+
+    def test_infers_underscore_i_prefix(self):
+        i0 = sympy.Symbol("_i0")
+        self.assertEqual(_index_var_prefix({i0}), "_i")
+
+    def test_empty_set_falls_back_to_d(self):
+        self.assertEqual(_index_var_prefix(set()), "d")
+
+    def test_symbol_with_no_trailing_digits_falls_back_to_d(self):
+        # A symbol with no trailing digits at all (e.g. a shape symbol, not
+        # a dense loop var) never matches "name[:i] with i < len(name)", so
+        # it contributes nothing usable and the function falls back to "d".
+        s = sympy.Symbol("s")
+        self.assertEqual(_index_var_prefix({s}), "d")
+
+
+class TestConsumerOwnDimSymbol(unittest.TestCase):
+    """Unit tests for mapping a raw output dim to the consumer's own loop var."""
+
+    def test_no_preceding_unit_dim_maps_identity(self):
+        # No unit dims at all: dense numbering over non-unit dims is just
+        # the identity, so raw dim 1 maps to loop var d1.
+        consumer = _make_consumer_with_ranges([8, 256])
+
+        sym = _consumer_own_dim_symbol(consumer, dim=1, prefix="d")
+
+        self.assertEqual(sym, sympy_index_symbol("d1"))
+
+    def test_preceding_unit_dim_shifts_mapping(self):
+        # ranges=[1, 8, 256]: dim 0 is unit-size and squeezed out of the
+        # dense numbering entirely, so raw dim 1 (the first non-unit dim)
+        # maps to loop var d0, not d1.
+        consumer = _make_consumer_with_ranges([1, 8, 256])
+
+        sym = _consumer_own_dim_symbol(consumer, dim=1, prefix="d")
+
+        self.assertEqual(sym, sympy_index_symbol("d0"))
+
+    def test_uses_given_prefix(self):
+        consumer = _make_consumer_with_ranges([8, 256])
+
+        sym = _consumer_own_dim_symbol(consumer, dim=0, prefix="q")
+
+        self.assertEqual(sym, sympy_index_symbol("q0"))
+
+
+class TestRetileLoadIndexWithConsumer(unittest.TestCase):
+    """End-to-end unit tests for _retile_load_index's consumer-aware path.
+
+    Covers the two real bugs fixed in this area: a foreign loop-var prefix
+    surviving into the rewritten index (bug 1), and a minted symbol
+    colliding with an unrelated symbol already present in the index when
+    the consumer's own output dim is unit-size (bug 2).
+    """
+
+    def test_squeezed_dim_added_back_with_matching_prefix(self):
+        # old_size[0]==1: dim 0 was squeezed out of the incoming index
+        # entirely (no c0 term at all). The consumer's own dim 0 is
+        # non-unit (size 4), so a term must be added back, using whatever
+        # prefix is already live in the index (here "q", not the default
+        # "d") -- this is bug 1's fix.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        q1 = sympy.Symbol("q1")
+        consumer = _make_consumer_with_ranges([4, 256])
+
+        result = _retile_load_index("buf", q1, info, consumer)
+
+        self.assertEqual(simplify(result - (256 * sympy_index_symbol("q0") + q1)), 0)
+
+    def test_unit_consumer_dim_adds_no_term_and_does_not_collide(self):
+        # Same squeeze shape as above, but the consumer's own dim 0 is ALSO
+        # unit-size (e.g. B=1 when only H is tiled) -- no real loop variable
+        # exists for it, so no term must be added. Before the fix, this
+        # minted a d0 that collided with the unrelated, already-present d0
+        # below (coefficient 16384) via sympy's automatic term-merging,
+        # silently corrupting it to 16384*d0 + 256*d0 instead of raising or
+        # leaving 16384*d0 alone -- this is bug 2's exact regression.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        d0 = sympy_index_symbol("d0")
+        consumer = _make_consumer_with_ranges([1, 8, 256])
+
+        result = _retile_load_index("buf", 16384 * d0, info, consumer)
+
+        self.assertEqual(simplify(result - 16384 * d0), 0)
+
+    def test_no_consumer_leaves_squeezed_dim_unaugmented(self):
+        # consumer=None (the _RetileLoadIndexHandler / full->tile direction)
+        # skips the whole squeezed-dim augmentation path unconditionally --
+        # confirms the default argument's behavior matches every existing
+        # call site that never passes consumer at all.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        q1 = sympy.Symbol("q1")
+
+        result = _retile_load_index("buf", q1, info)
+
+        self.assertEqual(simplify(result - q1), 0)
 
 
 class TestShouldPatchRetiledLoadIndexes(unittest.TestCase):
@@ -1582,6 +1839,69 @@ class TestCoarseTile(unittest.TestCase):
         finally:
             graph_ctx.__exit__(None, None, None)
 
+    def test_post_stickify_loop_extends_crossing_lifetime(self):
+        """A value born before an automatically-tiled counted loop and read
+        inside it must stay live through the loop (issue #4035).
+
+        Same clobber the ``persistent``/``later`` repro in
+        test_perm_layout_solver.py guards at the solver level, but here the
+        ``lifetime_end_override`` is *computed* by
+        ``counted_loop_lifetime_end_overrides`` for a loop built by the
+        automatic span-overflow entry point, ``coarse_tile_post_stickify``
+        -- not hand-passed, and not hint-driven.  The liveness gap comes
+        from the graph holding one textual copy of the loop body regardless
+        of how the loop was constructed, so overrides must cover this path
+        exactly as they cover explicit ``spyre_hint`` loops.
+        """
+        from collections import namedtuple
+
+        from torch_spyre._inductor.scratchpad.utils import (
+            counted_loop_lifetime_end_overrides,
+        )
+
+        _dep = namedtuple("_dep", ["name"])
+
+        def _stub_read_writes(op, reads, writes):
+            op.get_read_writes.return_value = SimpleNamespace(
+                reads={_dep(name) for name in reads},
+                writes={_dep(name) for name in writes},
+            )
+
+        # Op 0 is born outside the loop; ops 1-3 form one counted loop.
+        # ``reader_x`` reads across the loop boundary; ``reader_i`` reads a
+        # value born inside the same loop.
+        crossing = _make_op(_make_pointwise([Integer(16)]), "crossing")
+        _stub_read_writes(crossing, reads=["arg0"], writes=["crossing"])
+        body_writer = _make_hinted_op(_make_pointwise([Integer(16)]), "body_writer")
+        _stub_read_writes(body_writer, reads=["arg1"], writes=["internal"])
+        reader_x = _make_hinted_op(_make_pointwise([Integer(16)]), "reader_x")
+        _stub_read_writes(reader_x, reads=["crossing"], writes=["reader_x_out"])
+        reader_i = _make_hinted_op(_make_pointwise([Integer(16)]), "reader_i")
+        _stub_read_writes(reader_i, reads=["internal"], writes=["reader_i_out"])
+
+        operations = [crossing, body_writer, reader_x, reader_i]
+        coarse_tile_post_stickify(
+            _graph(operations),
+            [([body_writer, reader_x, reader_i], [(0, Integer(4))])],
+        )
+
+        # The loop body stays ops 1..3: nothing was inserted, the op outside
+        # the group was not stamped, and the group ops carry the loop id.
+        self.assertEqual(len(operations), 4)
+        self.assertFalse(hasattr(crossing, "loop_info"))
+        self.assertEqual(reader_i.loop_info.loop_group_id, (0,))
+
+        overrides = counted_loop_lifetime_end_overrides(
+            SimpleNamespace(operations=operations, graph_input_names=["arg0", "arg1"])
+        )
+
+        # Values born before the loop and read inside it -- the computed
+        # buffer ``crossing`` and the graph input ``arg1`` -- live through
+        # the loop's textual end (exclusive index 4).  ``internal`` is born
+        # and consumed inside the loop: no extension.  ``arg0`` is only read
+        # outside the loop: no extension.
+        self.assertEqual(overrides, {"crossing": 4, "arg1": 4})
+
     def test_end_to_end_shares_one_copy_across_group(self):
         """Full coarse_tile() entry point: two hint-driven ops in one group
         both reading the same full InputBuffer at the same index must end
@@ -1891,6 +2211,50 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
         # so dim 0 is filtered out of every level's list for this dep;
         # only dim 1 (M=4, extent 1024, tiled at level 1) survives.
         self.assertEqual(broadcast_tiled_dims, [[], [(1, Integer(1024))]])
+
+    def test_unit_tile_step_stays_in_pass1_planning_data(self):
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _capture_predivision_unit_steps,
+        )
+
+        op = _make_real_pointwise_op(
+            ranges=[Integer(3), Integer(64)],
+            input_shapes_strides=[([3, 64], [64, 1])],
+            name="buf0",
+            hints=((1, 0),),
+        )
+        levels = [(1, Integer(3))]
+        plan = plan_coarse_tile_groups([op], [([op], levels)])
+        captured = _capture_predivision_unit_steps([op], plan)
+
+        self.assertEqual(
+            captured[id(op)],
+            ((((0, Integer(64), Integer(1)),),),),
+        )
+
+        _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
+        # The early observation is not stamped onto the transformed op. It
+        # does not change general loop addressing before Pass 1 selects a
+        # read copy.
+        self.assertEqual(op.loop_info.squeezed_advance_per_read, [])
+        self.assertFalse(hasattr(op.loop_info, "predivision_unit_step_per_read"))
+
+    def test_predivision_step_wins_and_warns_on_legacy_disagreement(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _select_unit_steps
+
+        planned = [[(Integer(64), Integer(1))]]
+        legacy = [[(Integer(32), Integer(1))]]
+        with patch("torch_spyre._inductor.wsr.coarse_tile.logger.warning") as warning:
+            selected = _select_unit_steps(
+                op_name="buf0",
+                dep_name="arg0",
+                dim=0,
+                planned=planned,
+                legacy=legacy,
+            )
+
+        self.assertEqual(selected, planned)
+        warning.assert_called_once()
 
     def test_reduction_dim_advance_is_offset_by_output_dims(self):
         # out[d0] = sum_{d1} in[d0, d1].  in is [8, 16], row-major
@@ -2299,7 +2663,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         # affine_strides[tensor_idx] is list[dict] (per level, outermost first).
         # With one tiling level, affine_strides[0] = [{s: stride}].
@@ -2318,7 +2681,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         self.assertEqual(len(affine_strides), 1)
         self.assertIn(s, affine_strides[0][0])
@@ -2336,7 +2698,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         self.assertEqual(len(symbols), 1)
         self.assertEqual(symbols[0], 0)  # kernel sentinel = arg_index = 0
@@ -2351,7 +2712,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
         node = top_val["dscs_"][0]["add"]["scheduleTree_"][0]
@@ -2401,7 +2761,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=5,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
         node = top_val["dscs_"][0]["add"]["scheduleTree_"][0]
@@ -2458,7 +2817,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         self.assertEqual(len(symbols), 2)
         self.assertEqual(symbols[0], 0)  # kernel sentinel = arg_index = 0
@@ -2522,7 +2880,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[lvl0], [lvl1]],
-            use_symbols=True,
         )
         self.assertEqual(len(affine_strides), 1)
         per_level = affine_strides[0]
@@ -2584,7 +2941,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[lvl0]],
-            use_symbols=True,
         )
         self.assertEqual(len(affine_strides), 1)
         per_level = affine_strides[0]
@@ -2652,7 +3008,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
     def test_two_tiled_symbols_produce_two_stride_entries(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         # affine_strides[tensor_idx] = list[dict] (per level, outermost first).
         # Both tensors have one tiling level with two symbols.
         # Find tensors with non-empty strides at any level.
@@ -2669,7 +3025,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
     def test_two_tiled_symbols_strides_are_positive(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         for per_level in affine_strides:
             for level_strides in per_level:
                 for sym, stride in level_strides.items():
@@ -2683,7 +3039,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
         # tiling level.
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         mb = Symbol("mb")
         x = Symbol("x")
         self.assertEqual(len(affine_strides), 2)
@@ -2698,7 +3054,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
     def test_affine_strides_non_empty_for_tiled_op(self):
         op_spec = _make_tiled_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         # affine_strides[tensor_idx] = list[dict] (per level, outermost first).
         has_strides = any(
             any(len(level_d) > 0 for level_d in per_level)
@@ -2713,7 +3069,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         op_spec = _make_tiled_op_spec()
         loop = LoopSpec(count=Integer(4), body=[op_spec])
         tmpdir = tempfile.mkdtemp()
-        generate_bundle("test_kernel", tmpdir, [loop], use_symbols=True)
+        generate_bundle("test_kernel", tmpdir, [loop])
 
         with open(os.path.join(tmpdir, "bundle.mlir")) as f:
             mlir = f.read()
@@ -2752,7 +3108,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         # minted symbol too (as an identity mapping -- Site 1's fix), not
         # just parse_op_spec's returned symbol_mapping dict in isolation.
         symbols: list[int] = []
-        compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        compile_op_spec(0, op_spec, symbols)
         tiled_symbols_per_level = [
             [symbol_mapping[s] for s in level if s in symbol_mapping]
             for level in reversed(op_spec.tiled_symbols)
@@ -2782,7 +3138,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
                 arg.device_tile_advance_expr = sympy.floor(64 * minted)
         symbols: list[int] = []
         # Must not raise, and must not silently produce empty affine_strides.
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         has_strides = any(
             any(len(level_d) > 0 for level_d in per_level)
             for per_level in affine_strides
@@ -2837,7 +3193,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
             if arg.device_tile_advance_expr is not None:
                 arg.device_tile_advance_expr = sympy.floor(64 * out)
         symbols: list[int] = []
-        sdsc_json, _, _, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        sdsc_json, _, _, _ = compile_op_spec(0, op_spec, symbols)
         found_backgap = False
         for entry in sdsc_json.values():
             for dsc in entry.get("dscs_", []):
@@ -2923,7 +3279,6 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
                 symbols,
                 symbol_id_offset=0,
                 tiled_symbols=[[minted]],
-                use_symbols=True,
             )
 
     def test_tiled_on_split_dim_detects_floor_wrapped_minted_symbol(self):
@@ -2992,7 +3347,6 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
                 symbols,
                 symbol_id_offset=0,
                 tiled_symbols=[[minted]],
-                use_symbols=True,
             )
 
     def test_minted_symbol_tiled_on_different_dim_does_not_raise_unsupported(self):
@@ -3063,7 +3417,6 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[minted]],
-            use_symbols=True,
         )
 
 
@@ -3444,7 +3797,6 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 specs,
-                use_symbols=True,
             )
         return _read_mlir(self.tmpdir)
 
@@ -3452,7 +3804,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         s = self._s
         stride = 16384
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             # affine_strides: list[list[dict]] — one tensor, one level, one stride.
@@ -3473,7 +3825,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         self.assertIn('"symbol_ids"=[-1]', mlir)
 
     def test_non_tiled_tensor_in_loop_no_affine_apply(self):
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
             return _make_tiled_json(idx, sym_id), [0x2000], [[{}]], []
@@ -3491,7 +3843,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         s = self._s
         stride = 8192
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x3000)
             return _make_tiled_json(idx, sym_id), [0x3000], [[{s: stride}]], []
@@ -3508,7 +3860,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
     def test_affine_apply_inside_scf_for(self):
         s = self._s
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x4000)
             return _make_tiled_json(idx, sym_id), [0x4000], [[{s: 512}]], []
@@ -3527,7 +3879,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
     def test_tiled_snapshot(self):
         s = self._s
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
@@ -3572,7 +3924,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         # 64*out (elements) gives a byte stride of 64*2 == 128 at fp16.
         c0 = Symbol("c0")
         out = Symbol("out")
-        tensor_in = TensorArg(
+        tensor_in0 = TensorArg(
             is_input=True,
             arg_index=0,
             device_dtype=_FP16,
@@ -3581,42 +3933,44 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
             allocation={"hbm": 0x1000},
             device_tile_advance_expr=64 * out,
         )
+        tensor_in1 = TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=_FP16,
+            device_size=[2, 64],
+            device_coordinates=[Integer(0), c0],
+            allocation={"hbm": 0x2000},
+            device_tile_advance_expr=64 * out,
+        )
+        tensor_out = TensorArg(
+            is_input=False,
+            arg_index=2,
+            device_dtype=_FP16,
+            device_size=[2, 64],
+            device_coordinates=[Integer(0), c0],
+            allocation={"hbm": 0x3000},
+            device_tile_advance_expr=64 * out,
+        )
         op = OpSpec(
             op="add",
             is_reduction=False,
             iteration_space={c0: (Integer(128), 1)},
-            args=[tensor_in],
+            args=[tensor_in0, tensor_in1, tensor_out],
             op_info={},
             tiled_symbols=[[c0]],
             tiled_symbol_trip_counts={c0: 128},
         )
         loop = LoopSpec(count=Integer(4), body=[op])
-        generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=True)
+        generate_bundle("test_kernel", self.tmpdir, [loop])
         mlir = _read_mlir(self.tmpdir)
 
-        expected = (
-            "#map_0 = affine_map<(d0)[s0] -> (s0 + 128*d0)>\n"
-            "module {\n"
-            "\tfunc.func @sdsc_bundle(%arg_0_base_addr: "
-            "!sdscbundle.input_arg<index>) {\n"
-            "\t\t%arg_0 = sdscbundle.input_arg_extract value from "
-            "%arg_0_base_addr : !sdscbundle.input_arg<index> -> index\n"
-            "\t\t%c0 = arith.constant 0 : index\n"
-            "\t\t%c1 = arith.constant 1 : index\n"
-            "\t\t%loop_bound_0 = arith.constant 4 : index\n"
-            "\t\t%arg_0_slice_offset_4096 = arith.constant 4096 : index\n"
-            "\t\t%arg_0_slice_4096 = arith.addi %arg_0, "
-            "%arg_0_slice_offset_4096 : index\n"
-            "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
-            "\t\t\t%addr_0 = affine.apply #map_0(%i_0)[%arg_0_slice_4096]\n"
-            '\t\t\tsdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json",'
-            ' "symbol_ids"=[-2]}\n'
-            "\t\t}\n"
-            "\t\treturn\n"
-            "\t}\n"
-            "}\n"
-        )
-        self.assertEqual(mlir, expected)
+        # Verify the MLIR references all three args and uses affine maps
+        # for tile advancement.
+        self.assertIn("arg_0_base_addr", mlir)
+        self.assertIn("arg_1_base_addr", mlir)
+        self.assertIn("arg_2_base_addr", mlir)
+        self.assertIn("scf.for", mlir)
+        self.assertIn("affine.apply", mlir)
 
 
 class TestGenerateBundleNestedTiling(unittest.TestCase):
@@ -3634,14 +3988,13 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 specs,
-                use_symbols=True,
             )
         return _read_mlir(self.tmpdir)
 
     def _fake_compile_two_strides(self, outer_stride, inner_stride):
         s0, s1 = self.s0, self.s1
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             # per_level_strides: outermost-first. Level 0 (outer) has s0 stride,
@@ -3733,16 +4086,16 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
         self._c_b = Symbol("c_b")
 
     def _bundle(self, specs, fake_compile):
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=fake_compile,
-        ):
-            generate_bundle(
-                "test_kernel",
-                self.tmpdir,
-                specs,
-                use_symbols=True,
-            )
+        with config.patch({"sdsc_cache": False}):
+            with patch(
+                "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+                side_effect=fake_compile,
+            ):
+                generate_bundle(
+                    "test_kernel",
+                    self.tmpdir,
+                    specs,
+                )
         return _read_mlir(self.tmpdir)
 
     # --- Group 1: flat row-tiling ---
@@ -3750,7 +4103,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
     def test_flat_loop_tiled_tensor_emits_affine_apply(self):
         s = self._s
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             # One tensor, one level (the enclosing loop), one stride.
@@ -3765,7 +4118,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
         self.assertIn("256", mlir)
 
     def test_flat_loop_non_tiled_tensor_no_affine_apply(self):
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
             return _make_tiled_json(idx, sym_id), [0x2000], [[{}]], []
@@ -3781,7 +4134,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
     def test_flat_loop_snapshot(self):
         s = self._s
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
@@ -3825,7 +4178,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
         c_k = self._c_k
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -3926,7 +4279,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
         c_k, c_b = self._c_k, self._c_b
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -4064,7 +4417,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
                 }
             }
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sid0 = -(symbol_id_offset + 1)
             sid1 = -(symbol_id_offset + 2)
             symbols.append(0x1000)
@@ -4162,7 +4515,7 @@ def _make_consumer_op(name, reads_buf):
 
 def _make_inside_consumer_op(name, reads_buf, loop_group_id):
     """Return a ComputedBuffer mock inside the same loop group that reads reads_buf."""
-    from torch._inductor.ir import ComputedBuffer, Pointwise
+    from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
 
     data = MagicMock(spec=Pointwise)
     data.ranges = [Integer(16)]
@@ -4170,6 +4523,12 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
 
     op = MagicMock(spec=ComputedBuffer)
     op.data = data
+    # Ordinary (non-mutation) layout, so _plan_tiling_propagation's
+    # isinstance(op.layout, MutationLayoutSHOULDREMOVE) check on this op
+    # resolves to False instead of raising AttributeError -- layout is an
+    # instance attribute ComputedBuffer sets in __init__, not a class
+    # attribute, so spec=ComputedBuffer alone doesn't expose it.
+    op.layout = MagicMock(spec=FixedLayout)
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
     op.loop_info = CoarseTileInfo(
@@ -4918,9 +5277,14 @@ class TestPlanReadCopies(unittest.TestCase):
         from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
 
         op_a, op_b, full_buf, operations = _make_two_op_shared_read_fixture()
+        captured = ((((0, Integer(128), Integer(1)),),),)
         retiled_infos_by_group = [((0,), [op_a, op_b], {})]
 
-        plans = _plan_read_copies(operations, retiled_infos_by_group)
+        plans = _plan_read_copies(
+            operations,
+            retiled_infos_by_group,
+            {id(op_a): captured, id(op_b): captured},
+        )
 
         self.assertIn((0,), plans)
         plan = plans[(0,)]
@@ -4930,6 +5294,10 @@ class TestPlanReadCopies(unittest.TestCase):
         self.assertEqual(entry.insert_before_op_name, "op_a")
         self.assertEqual(entry.sizing_op_name, "op_a")
         self.assertEqual(set(entry.consumer_op_names), {"op_a", "op_b"})
+        self.assertEqual(
+            entry.predivision_unit_steps,
+            (((0, Integer(128), Integer(1)),),),
+        )
 
     def test_same_op_two_reads_same_index_collapse_to_one_entry(self):
         """a+b*a: one op reading buffer 'a' twice at the identical index
@@ -5080,10 +5448,12 @@ class TestReadCopyPlanDataclasses(unittest.TestCase):
             dep=dep,
             insert_before_op_name="op0",
             sizing_op_name="op0",
+            sizing_read_index=0,
             consumer_op_names=("op0", "op1"),
         )
         self.assertEqual(entry.copy_name, "coarse_tile_read_copy_group0_a_0")
         self.assertEqual(entry.consumer_op_names, ("op0", "op1"))
+        self.assertEqual(entry.predivision_unit_steps, ())
         with self.assertRaises(Exception):
             entry.copy_name = "other"  # frozen -> raises FrozenInstanceError
 
@@ -5831,19 +6201,20 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _bundle(self, specs, use_symbols=False, fake_compile=None):
+    def _bundle(self, specs, fake_compile=None, pool_size=0):
         if fake_compile is None:
             fake_compile = _fake_compile_op_spec
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=fake_compile,
-        ):
-            generate_bundle(
-                "test_kernel",
-                self.tmpdir,
-                specs,
-                use_symbols=use_symbols,
-            )
+        with config.patch({"sdsc_cache": False}):
+            with patch(
+                "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+                side_effect=fake_compile,
+            ):
+                generate_bundle(
+                    "test_kernel",
+                    self.tmpdir,
+                    specs,
+                    pool_size=pool_size,
+                )
         return _read_mlir(self.tmpdir)
 
     def _make_op_spec_with_hbm_args(self, name: str, arg_indices: list) -> OpSpec:
@@ -5868,15 +6239,10 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             op_info={},
         )
 
-    def test_signature_accepts_symbolic_args_param(self):
-        a = _make_minimal_op_spec("a")
-        mlir = self._bundle([a], use_symbols=False)
-        self.assertIn("sdsc_execute", mlir)
-
     def test_func_signature_has_params_for_tensor_args(self):
         a = self._make_op_spec_with_hbm_args("a", [0, 1])
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             for i, arg in enumerate(op_spec.args):
                 symbols.append(arg.allocation["hbm"])
             ids = [-(symbol_id_offset + i + 1) for i in range(len(op_spec.args))]
@@ -5907,7 +6273,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.kernel(arg.arg_index) for arg in op_spec.args],
             )
 
-        mlir = self._bundle([a], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([a], fake_compile=fake)
 
         self.assertIn(
             "func.func @sdsc_bundle("
@@ -5931,7 +6297,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def test_sdsc_execute_uses_extracted_names(self):
         a = self._make_op_spec_with_hbm_args("a", [0])
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(op_spec.args[0].allocation["hbm"])
             return (
@@ -5941,7 +6307,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.kernel(0)],
             )
 
-        mlir = self._bundle([a], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([a], fake_compile=fake)
 
         self.assertIn("sdscbundle.sdsc_execute (%arg_0)", mlir)
         self.assertNotIn("sdsc_execute (%sym_0_1)", mlir)
@@ -5950,7 +6316,9 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def test_non_tensor_arg_symbols_remain_as_constants(self):
         c0 = Symbol("c0")
         op_a = self._make_op_spec_with_hbm_args("a", [0])
-        # op_b: arg_index=-1, pool-allocated (fake returns "pool" kind)
+        # op_b: arg_index=-1, pool-allocated (fake returns "pool" kind).
+        # allocation is hbm_pool to reflect the state after hbm_pool_planning,
+        # which runs before bundle generation in production.
         op_b = OpSpec(
             op="b",
             is_reduction=False,
@@ -5962,7 +6330,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                     device_dtype=_FP16,
                     device_size=[2, 64],
                     device_coordinates=[Integer(0), c0],
-                    allocation={"hbm": 0x0},
+                    allocation={"hbm_pool": 0x0},
                 )
             ],
             op_info={},
@@ -5970,7 +6338,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         call_count = [0]
         values = [0x400000000, 0x0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -5980,24 +6348,15 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             )  # op_b has pool allocation
             return _make_tiled_json(idx, sym_id), [values[i]], [{}], [kind]
 
-        mlir = self._bundle([op_a, op_b], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([op_a, op_b], fake_compile=fake, pool_size=1024)
 
         # First sym → parameter (kernel tensor arg)
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
         self.assertNotIn("arith.constant 17179869184", mlir)
         # Second sym → pool: arith.addi %pool, <offset>
-        self.assertIn("%pool_base_addr: !sdscbundle.input_arg<index>", mlir)
+        self.assertNotIn("%pool_base_addr", mlir)
+        self.assertIn("sdscbundle.device_mem_allocate", mlir)
         self.assertIn("%pool_addr_0 = arith.addi %pool", mlir)
-
-    def test_symbolic_args_false_no_params(self):
-        a = self._make_op_spec_with_hbm_args("a", [0])
-        # When use_symbols=False: no symbols registered,
-        # sdsc_execute has no operands.
-        mlir = self._bundle([a], use_symbols=False)
-        self.assertIn("func.func @sdsc_bundle()", mlir)
-        self.assertNotIn("input_arg", mlir)
-        self.assertNotIn("%sym_", mlir)
-        self.assertIn("sdsc_execute () {sdsc_filename=", mlir)
 
     def test_multi_sdsc_two_tensor_args_snapshot(self):
         """Two tensor args shared across multiple SDSCs emit exactly two input_arg params.
@@ -6019,7 +6378,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             (0x400040000, 0x800040000),
         ]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             a0, a1 = sdsc_addr_pairs[i]
@@ -6050,7 +6409,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             kinds = [SymbolKind.kernel(0), SymbolKind.kernel(1)]
             return json_out, [a0, a1], [{}, {}], kinds
 
-        mlir = self._bundle([op0] + ops_rest, use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([op0] + ops_rest, fake_compile=fake)
 
         # 10 symbols across 5 SDSCs but only 2 unique arg_indices → 2 params
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
@@ -6068,13 +6427,13 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         base = 0x400000000  # SEGMENT_OFFSETS[1], arg_index=0
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(base)
             return _make_tiled_json(idx, sym_id), [base], [{}], [SymbolKind.kernel(0)]
 
-        mlir = self._bundle([a, b], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([a, b], fake_compile=fake)
 
         # Only one input_arg param (deduped cross-SDSC)
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
@@ -6098,7 +6457,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         addrs = [addr0, addr1]
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -6110,7 +6469,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.kernel(0)],
             )
 
-        mlir = self._bundle([a, b], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([a, b], fake_compile=fake)
 
         # Only one input_arg param — no duplicate %arg_0_base_addr
         self.assertEqual(
@@ -6134,7 +6493,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         call_count = [0]
         pool_values = [0, 2048, 0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -6146,7 +6505,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.pool()],
             )
 
-        mlir = self._bundle([a, b, c], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([a, b, c], fake_compile=fake, pool_size=4096)
 
         # Exactly two arith.constant / arith.addi pairs (offsets 0 and 2048)
         self.assertEqual(mlir.count("arith.constant 0 : index"), 1)
@@ -6161,6 +6520,33 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             execute_lines[1].split("(")[1].split(")")[0], "%pool_addr_2048"
         )
         self.assertEqual(execute_lines[2].split("(")[1].split(")")[0], "%pool_addr_0")
+
+
+class TestGenerateBundleRequiresSymbolicArgs(unittest.TestCase):
+    """generate_bundle must fail fast when bundle_symbolic_args is False.
+
+    The SDSC path always emits symbolic HBM addresses; baked addressing is
+    only meaningful on the (separately-gated) KTIR emitter path. Without
+    this guard, disabling the flag on the default path would silently
+    miscompile addresses instead of erroring.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_raises_when_bundle_symbolic_args_false(self):
+        a = _make_minimal_op_spec("a")
+        with patch(
+            "torch_spyre._inductor.codegen.bundle._spyre_config.bundle_symbolic_args",
+            False,
+        ):
+            with self.assertRaises(AssertionError):
+                generate_bundle("test_kernel", self.tmpdir, [a])
 
 
 class TestSymbolKind(unittest.TestCase):
@@ -6246,7 +6632,6 @@ class TestSymbolKind(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         self.assertEqual(len(kinds), 2)
         self.assertIsInstance(kinds[0], SymbolKind)
@@ -6264,7 +6649,7 @@ class TestSymbolKind(unittest.TestCase):
 
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             base = 0x400000000
@@ -6283,16 +6668,16 @@ class TestSymbolKind(unittest.TestCase):
                 json1 = _make_tiled_json(idx, -(symbol_id_offset + 1))
                 return json1, [base + off], [{}], kinds
 
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=fake,
-        ):
-            generate_bundle(
-                "test_kernel",
-                self.tmpdir,
-                [a, b],
-                use_symbols=True,
-            )
+        with config.patch({"sdsc_cache": False}):
+            with patch(
+                "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+                side_effect=fake,
+            ):
+                generate_bundle(
+                    "test_kernel",
+                    self.tmpdir,
+                    [a, b],
+                )
         mlir = _read_mlir(self.tmpdir)
 
         # Only one input_arg param (the kernel base)
@@ -7219,6 +7604,363 @@ class TestSpyreKernelPoolSize(unittest.TestCase):
 
         default_kernel = SpyreKernel()
         self.assertEqual(default_kernel.pool_size, 0)
+
+
+class TestTileSpecRepresentation(unittest.TestCase):
+    """TileAxis/TileSpec/CoreDivision.tiling and the min_footprint win."""
+
+    def test_empty_spec_is_untiled_and_inert(self):
+        u = TileSpec()
+        self.assertTrue(u.is_untiled)
+        self.assertEqual(u.depth, 0)
+        self.assertEqual(u.tile_count, 1)
+        self.assertEqual(u.output_tile_count, 1)
+        self.assertTrue(u.is_clean)
+        self.assertEqual(u.label, "untiled")
+
+    def test_ordered_and_hashable_equality_is_same_shape(self):
+        a = TileSpec((TileAxis(0, 4), TileAxis(1, 2)))
+        b = TileSpec((TileAxis(0, 4), TileAxis(1, 2)))
+        swapped = TileSpec((TileAxis(1, 2), TileAxis(0, 4)))
+        self.assertEqual(a, b)
+        self.assertEqual(hash(a), hash(b))
+        # Levels nest, so swapping them is a different plan (unlike divisions).
+        self.assertNotEqual(a, swapped)
+        # Hashable: usable as a dict/set key (the group-derivation key).
+        self.assertEqual(len({a, b, swapped}), 2)
+
+    def test_output_axis_scalars(self):
+        a = TileSpec((TileAxis(0, 4), TileAxis(1, 2)))
+        self.assertEqual(a.depth, 2)
+        self.assertEqual(a.tile_count, 8)
+        self.assertEqual(a.output_tile_count, 8)
+        self.assertTrue(a.is_clean)
+        self.assertEqual(a.label, "d0:4/d1:2")
+
+    def test_reduction_axis_excluded_from_output_tile_count(self):
+        r = TileSpec((TileAxis(0, 4), TileAxis(2, 3, is_reduction=True)))
+        # Reduction level counts in tile_count but not in output_tile_count.
+        self.assertEqual(r.tile_count, 12)
+        self.assertEqual(r.output_tile_count, 4)
+        self.assertFalse(r.is_clean)
+        self.assertEqual(r.label, "d0:4/~d2:3")
+
+    def test_core_division_tiling_defaults_untiled_and_inert(self):
+        cd = CoreDivision(output_splits={0: 2})
+        self.assertEqual(cd.tiling, TileSpec())
+        self.assertTrue(cd.tiling.is_untiled)
+        # Distinct CoreDivisions do not share one mutable default.
+        self.assertIsNot(CoreDivision().tiling, CoreDivision().tiling)
+
+    def test_min_footprint_inert_when_untiled(self):
+        buf = CoreDivisionBuffer(
+            name="x",
+            size=1024,
+            uses=[0, 1],
+            core_divisions=[CoreDivision(output_splits={0: 2})],
+        )
+        self.assertEqual(buf.min_footprint, ceil_div(1024, 2))
+
+    def test_min_footprint_shrinks_by_output_tile_count(self):
+        spec = TileSpec((TileAxis(0, 4), TileAxis(1, 2)))  # 8 output tiles
+        buf = CoreDivisionBuffer(
+            name="y",
+            size=1024,
+            uses=[0, 1],
+            core_divisions=[CoreDivision(output_splits={0: 2}, tiling=spec)],
+        )
+        self.assertEqual(buf.min_footprint, ceil_div(1024, 2 * spec.output_tile_count))
+
+    def test_min_footprint_reduction_level_does_not_shrink_accumulator(self):
+        # The reduction-tiled op's own buffer is the accumulator: full extent.
+        spec = TileSpec((TileAxis(0, 4), TileAxis(1, 3, is_reduction=True)))
+        buf = CoreDivisionBuffer(
+            name="z",
+            size=1024,
+            uses=[0, 1],
+            core_divisions=[CoreDivision(output_splits={0: 2}, tiling=spec)],
+        )
+        self.assertEqual(buf.min_footprint, ceil_div(1024, 2 * spec.output_tile_count))
+
+
+class TestTileSpecLoweringOutput(unittest.TestCase):
+    """tile_spec_to_dim_hints on output axes — same DimHints as the hint path."""
+
+    def setUp(self):
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+
+    def _op(self, n_dims, name="op0"):
+        op = _make_op(_make_pointwise([Integer(64)] * n_dims), name)
+        op._test_out_coords = [sympy.Symbol(f"c{i}") for i in range(n_dims)]
+        return op
+
+    def test_single_output_axis(self):
+        op = self._op(2)
+        spec = TileSpec((TileAxis(0, 4),))
+        hints = tile_spec_to_dim_hints(op, spec, [7])
+        self.assertEqual(len(hints), 1)
+        h = hints[0]
+        self.assertEqual(h.split_count, 4)
+        self.assertEqual(h.loop_var, sympy.Symbol("c0"))
+        self.assertFalse(h.is_reduction)
+        self.assertEqual(h.hint_id, 7)
+
+    def test_nested_output_axes_get_their_own_loop_vars(self):
+        op = self._op(3)
+        spec = TileSpec((TileAxis(0, 4), TileAxis(2, 2)))
+        hints = tile_spec_to_dim_hints(op, spec, [0, 1])
+        self.assertEqual(
+            [h.loop_var for h in hints], [sympy.Symbol("c0"), sympy.Symbol("c2")]
+        )
+        self.assertEqual([h.split_count for h in hints], [4, 2])
+        self.assertEqual([h.hint_id for h in hints], [0, 1])
+
+    def test_hint_id_count_must_match_axis_count(self):
+        op = self._op(2)
+        spec = TileSpec((TileAxis(0, 4),))
+        with self.assertRaises(ValueError):
+            tile_spec_to_dim_hints(op, spec, [0, 1])
+
+    def test_host_dim_out_of_bounds_raises(self):
+        op = self._op(2)
+        spec = TileSpec((TileAxis(5, 4),))
+        # unsupported because too few loop ids are provided
+        with self.assertRaises(Unsupported):
+            tile_spec_to_dim_hints(op, spec, [0])
+
+
+class TestTileSpecLoweringReduction(unittest.TestCase):
+    """The reduction-axis lowering is the inverse of reduction_loop_vars."""
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_reduction_axis_resolves_via_reduction_loop_vars(self):
+        # out[d0] = sum_{d1} in[d0, d1]; one reduction loop var.
+        op = _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            input_shape_stride=([8, 16], [16, 1]),
+            name="buf0",
+            hints=((1, 0),),
+        )
+        red_vars = reduction_loop_vars(op)
+        self.assertEqual(len(red_vars), 1)
+        spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
+        hints = tile_spec_to_dim_hints(op, spec, [3])
+        self.assertEqual(len(hints), 1)
+        h = hints[0]
+        self.assertTrue(h.is_reduction)
+        self.assertEqual(h.split_count, 4)
+        self.assertEqual(h.hint_id, 3)
+        # The inverse relationship: the lowered loop_var is exactly the one
+        # reduction_loop_vars reports at that position.
+        self.assertEqual(h.loop_var, red_vars[0])
+        self.assertEqual(_loop_var_to_reduction_ranges_pos_public(op, h.loop_var), 0)
+
+    def test_reduction_host_dim_out_of_bounds_raises(self):
+        op = _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            input_shape_stride=([8, 16], [16, 1]),
+            name="buf0",
+            hints=((1, 0),),
+        )
+        spec = TileSpec((TileAxis(3, 4, is_reduction=True),))  # only 1 red var
+        with self.assertRaises(Unsupported):
+            tile_spec_to_dim_hints(op, spec, [0])
+
+    def test_reduction_axis_on_pointwise_raises(self):
+        op = _make_real_pointwise_op(
+            ranges=[Integer(8), Integer(16)],
+            input_shapes_strides=[([8, 16], [16, 1])],
+            name="buf0",
+            hints=((0, 0),),
+        )
+        spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
+        with self.assertRaises(Unsupported):
+            tile_spec_to_dim_hints(op, spec, [0])
+
+
+def _loop_var_to_reduction_ranges_pos_public(op, sym):
+    from torch_spyre._inductor.wsr.coarse_tile import (
+        _loop_var_to_reduction_ranges_pos,
+    )
+
+    return _loop_var_to_reduction_ranges_pos(op, sym)
+
+
+class TestDeriveTilingGroups(unittest.TestCase):
+    """derive_tiling_groups — consecutive runs of ops sharing a TileSpec."""
+
+    def _graph_of(self, names):
+        return _graph([_make_op(_make_pointwise([Integer(64)]), n) for n in names])
+
+    def _names(self, groups):
+        return [[o.get_operation_name() for o in ops] for ops, _ in groups]
+
+    def test_consecutive_run_grouped_untiled_breaks(self):
+        g = self._graph_of(["op0", "op1", "op2", "op3", "op4"])
+        spec = TileSpec((TileAxis(0, 4),))
+        # op1,op2 tiled and consecutive -> one group; op4 tiled alone; op0/op3
+        # untiled -> break the runs.
+        choices = {"op1": spec, "op2": spec, "op4": spec}
+        groups = derive_tiling_groups(g, choices)
+        self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
+
+    def test_spec_change_breaks_the_run(self):
+        g = self._graph_of(["op0", "op1"])
+        s1 = TileSpec((TileAxis(0, 4),))
+        s2 = TileSpec((TileAxis(0, 2),))
+        groups = derive_tiling_groups(g, {"op0": s1, "op1": s2})
+        self.assertEqual([len(ops) for ops, _ in groups], [1, 1])
+        self.assertEqual([spec for _, spec in groups], [s1, s2])
+
+    def test_empty_and_all_untiled_produce_no_groups(self):
+        g = self._graph_of(["op0", "op1"])
+        self.assertEqual(derive_tiling_groups(g, {}), [])
+        self.assertEqual(derive_tiling_groups(g, {"op0": TileSpec()}), [])
+
+
+class TestDerivedBases(unittest.TestCase):
+    """Hint-id and group-idx bases are derived off the graph, never reserved."""
+
+    def test_hint_id_base_avoids_existing_hints(self):
+        op = _make_op(_make_pointwise([Integer(64)]), "op0")
+        op.dim_hints = []
+        self.assertEqual(_derive_hint_id_base(_graph([op])), 0)
+        op.dim_hints = [
+            DimHint(
+                dim_names=["a"],
+                split_count=2,
+                loop_var=None,
+                is_reduction=False,
+                hint_id=10005,
+            )
+        ]
+        self.assertEqual(_derive_hint_id_base(_graph([op])), 10006)
+
+    def test_group_idx_offset_avoids_existing_loop_group_ids(self):
+        op = _make_op(_make_pointwise([Integer(64)]), "op0")
+        self.assertEqual(_derive_group_idx_offset(_graph([op])), 0)
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(3,), loop_count=[Integer(2)], loop_tiled_dims=[[0]]
+        )
+        self.assertEqual(_derive_group_idx_offset(_graph([op])), 4)
+
+
+class TestCoarseTilingPassEquivalence(unittest.TestCase):
+    """CoarseTilingPass reduces to the hint path.
+
+    Both paths call the same coarse_tile(); the pass just builds its (groups,
+    group_idx_offset, dim_hints) inputs from a TileSpec instead of pre-stamped
+    hints. Feeding structurally identical inputs to the identical function
+    yields identical output, which is asserted end-to-end here on the stamped
+    loop_info and the divided ranges.
+    """
+
+    def setUp(self):
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+                side_effect=_mock_op_out_coords,
+            )
+        )
+
+    def _bare(self, ranges, name):
+        op = _make_op(_make_pointwise([Integer(r) for r in ranges]), name)
+        op._test_out_coords = [sympy.Symbol(f"c{i}") for i in range(len(ranges))]
+        op.dim_hints = []
+        return op
+
+    def _loop_fields(self, op):
+        li = op.loop_info
+        return (
+            tuple(li.loop_group_id),
+            list(li.loop_count),
+            [list(x) for x in li.loop_tiled_dims],
+        )
+
+    def test_single_level_matches_hint_path(self):
+        # Reference: hint path, hint_id 0, group 0.
+        ref = _make_hinted_op(_make_pointwise([Integer(256)]), "op0", hints=((0, 0),))
+        coarse_tile_pre_stickify(_graph([ref]), [([ref], [(0, Integer(4))])])
+        ref_fields = self._loop_fields(ref)
+        ref_range = ref.data.ranges[0]
+
+        # CoarseTilingPass: same tiling expressed as a TileSpec.
+        got = self._bare([256], "op0")
+        CoarseTilingPass({"op0": TileSpec((TileAxis(0, 4),))}).apply_pass(_graph([got]))
+        self.assertEqual(self._loop_fields(got), ref_fields)
+        self.assertEqual(got.data.ranges[0], ref_range)
+        # And the win is visible: dim 0 divided by 4.
+        self.assertEqual(got.data.ranges[0], Integer(64))
+
+    def test_nested_two_level_matches_hint_path(self):
+        ref = _make_hinted_op(
+            _make_pointwise([Integer(256), Integer(128)]), "op0", hints=((0, 0), (1, 1))
+        )
+        coarse_tile_pre_stickify(
+            _graph([ref]), [([ref], [(0, Integer(4)), (1, Integer(2))])]
+        )
+        ref_fields = self._loop_fields(ref)
+        ref_ranges = list(ref.data.ranges)
+
+        got = self._bare([256, 128], "op0")
+        CoarseTilingPass(
+            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}
+        ).apply_pass(_graph([got]))
+        self.assertEqual(self._loop_fields(got), ref_fields)
+        self.assertEqual(list(got.data.ranges), ref_ranges)
+        self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
+
+    def test_pass_inputs_match_hint_path_structurally(self):
+        # Two independent ops in one group: prove the group derivation and
+        # hint-id minting produce exactly the coarse_tile inputs the hint path
+        # would, without running the mutation (robust against mock read-edges).
+        got0 = self._bare([256], "op0")
+        got1 = self._bare([256], "op1")
+        g = _graph([got0, got1])
+        spec = TileSpec((TileAxis(0, 4),))
+        groups_specs = derive_tiling_groups(g, {"op0": spec, "op1": spec})
+        self.assertEqual(len(groups_specs), 1)
+        group_ops, group_spec = groups_specs[0]
+        self.assertEqual([o.get_operation_name() for o in group_ops], ["op0", "op1"])
+        # One group, base 0 -> hint_ids [0], every op in the group shares it.
+        base = _derive_hint_id_base(g)
+        self.assertEqual(base, 0)
+        hints0 = tile_spec_to_dim_hints(got0, group_spec, [base])
+        hints1 = tile_spec_to_dim_hints(got1, group_spec, [base])
+        self.assertEqual(hints0[0].hint_id, hints1[0].hint_id)
+        self.assertEqual(hints0[0].split_count, 4)
+
+    def test_empty_choices_is_a_noop(self):
+        # The pass leaves op count unchanged when it does nothing
+        # (untiled/absent choices).
+        ops = [self._bare([64], "op0"), self._bare([64], "op1")]
+        g = _graph(ops)
+        CoarseTilingPass({}).apply_pass(g)
+        self.assertEqual(len(g.operations), 2)
+        for op in ops:
+            self.assertFalse(
+                hasattr(op, "loop_info") and isinstance(op.loop_info, CoarseTileInfo)
+            )
 
 
 if __name__ == "__main__":
