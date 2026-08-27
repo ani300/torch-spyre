@@ -431,6 +431,7 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
         write_index=dims[0],
         read_index=dims[-1],
         dep_coeff={dims[0]: 1, dims[1]: 2, dims[2]: 0},
+        dep_device_coordinates=(dims[0], dims[1]),
         device_size=[2, 4],
         stride_map=[1, 2],
         elems_per_stick=64,
@@ -465,6 +466,15 @@ def test_flattened_iteration_span_is_not_a_single_axis_view():
         write_index=512 * heads + flat,
         read_index=512 * heads + flat,
         dep_coeff={heads: 512, flat: 1},
+        dep_device_coordinates=(
+            sympy.floor(flat / 256),
+            sympy.S.Zero,
+            sympy.S.Zero,
+            sympy.S.Zero,
+            sympy.floor(sympy.Mod(flat, 256) / 64),
+            heads,
+            sympy.Mod(flat, 64),
+        ),
         device_size=[2, 1, 1, 1, 4, 16, 64],
         stride_map=[256, -1, -1, -1, 64, 512, 1],
         elems_per_stick=64,
@@ -483,3 +493,86 @@ def test_flattened_iteration_span_is_not_a_single_axis_view():
     assert not representable
     assert not partial
     assert not view.work_slice_dims
+
+
+def test_reshape_changes_per_core_ownership_within_one_device_axis():
+    """A split of an inner term is not a contiguous split of the containing axis.
+
+    This is the Gemma 4 decode geometry: the producer splits a flattened
+    512-element dimension into two contiguous 256-element halves, while its
+    consumer views that dimension as ``[2, 256]`` and splits the inner 256.
+    The latter owns alternating pairs of sticks, not contiguous groups of four.
+    """
+    producer_head, producer_flat = sympy.symbols("producer_head producer_flat")
+    producer_prep = pass_utils_module._ViewPrep(
+        iter_space={producer_head: 16, producer_flat: 512},
+        write_index=512 * producer_head + producer_flat,
+        read_index=512 * producer_head + producer_flat,
+        dep_coeff={producer_head: 512, producer_flat: 1},
+        dep_device_coordinates=(
+            sympy.S.Zero,
+            sympy.S.Zero,
+            sympy.floor(producer_flat / 64),
+            producer_head,
+            sympy.Mod(producer_flat, 64),
+        ),
+        device_size=[1, 1, 8, 16, 64],
+        stride_map=[-1, -1, 64, 512, 1],
+        elems_per_stick=64,
+        device_stride_to_dim={64: 2, 512: 3, 1: 4},
+        stick_host_stride=1,
+        num_stick_dim=2,
+        num_stick=8,
+        num_stick_stride=64,
+        is_matmul=False,
+    )
+    producer_view, _, producer_representable = (
+        pass_utils_module._per_core_view_from_prep(
+            producer_prep,
+            {producer_head: 16, producer_flat: 2},
+        )
+    )
+
+    consumer_head, consumer_outer, consumer_inner = sympy.symbols(
+        "consumer_head consumer_outer consumer_inner"
+    )
+    consumer_prep = pass_utils_module._ViewPrep(
+        iter_space={consumer_head: 16, consumer_outer: 2, consumer_inner: 256},
+        write_index=512 * consumer_head + 256 * consumer_outer + consumer_inner,
+        read_index=512 * consumer_head + 256 * consumer_outer + consumer_inner,
+        dep_coeff={consumer_head: 512, consumer_outer: 256, consumer_inner: 1},
+        dep_device_coordinates=(
+            sympy.S.Zero,
+            sympy.S.Zero,
+            4 * consumer_outer + sympy.floor(consumer_inner / 64),
+            consumer_head,
+            sympy.Mod(consumer_inner, 64),
+        ),
+        device_size=[1, 1, 8, 16, 64],
+        stride_map=[-1, -1, 64, 512, 1],
+        elems_per_stick=64,
+        device_stride_to_dim={64: 2, 512: 3, 1: 4},
+        stick_host_stride=1,
+        num_stick_dim=2,
+        num_stick=8,
+        num_stick_stride=64,
+        is_matmul=False,
+    )
+    consumer_view, _, consumer_representable = (
+        pass_utils_module._per_core_view_from_prep(
+            consumer_prep,
+            {consumer_head: 16, consumer_outer: 1, consumer_inner: 2},
+        )
+    )
+
+    assert producer_representable
+    assert not consumer_representable
+    assert producer_view != consumer_view
+
+    # Splitting the outer term of the same compound coordinate is contiguous:
+    # each core group owns one four-stick half of the physical axis.
+    _, _, outer_split_representable = pass_utils_module._per_core_view_from_prep(
+        consumer_prep,
+        {consumer_head: 16, consumer_outer: 2, consumer_inner: 1},
+    )
+    assert outer_split_representable

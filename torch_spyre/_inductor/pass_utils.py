@@ -2444,6 +2444,11 @@ class _ViewPrep(NamedTuple):
     # concretize_expr(dep.index.coeff(sym)) over the *full* iteration space, so
     # the per-candidate path does a dict lookup instead of a sympy .coeff() call.
     dep_coeff: dict
+    # The target dependency projected into the buffer's physical device
+    # coordinates.  A single physical axis can contain multiple logical loop
+    # symbols after a reshape; their relative host strides determine whether a
+    # split owns one contiguous slice or several interleaved slices.
+    dep_device_coordinates: tuple["sympy.Expr", ...]
     device_size: Any
     stride_map: Any
     elems_per_stick: int
@@ -2520,12 +2525,17 @@ def _prepare_per_core_view(
     # iteration-space symbols, so precomputing the coeff for every iter symbol
     # covers every symbol the per-candidate path can ask for.
     dep_coeff = {sym: concretize_expr(dep.index.coeff(sym)) for sym in iter_space}
+    coordinates = try_device_coordinates(dev_layout, dep, None)
+    if coordinates is None:
+        return None
+    dep_device_coordinates = tuple(coordinates)
 
     return _ViewPrep(
         iter_space=iter_space,
         write_index=write_index,
         read_index=read_index,
         dep_coeff=dep_coeff,
+        dep_device_coordinates=dep_device_coordinates,
         device_size=device_size,
         stride_map=stride_map,
         elems_per_stick=elems_per_stick,
@@ -2665,6 +2675,31 @@ def _per_core_view_from_prep(
             if split * k == num_stick:
                 dev_dim = num_stick_dim
                 split *= k
+
+        # A reshape can place more than one logical loop symbol on one physical
+        # device axis.  Splitting an inner symbol while an unsplit outer symbol
+        # also contributes to that axis gives each core several interleaved
+        # regions, which PerCoreView's single ``(axis, slice)`` cannot express.
+        #
+        # For example, ``4 * outer + floor(inner / 64)`` over an 8-stick axis,
+        # with ``inner`` split in two, gives the two core groups ownership of
+        # {0, 1, 4, 5} and {2, 3, 6, 7}; it is not the contiguous 2-way split
+        # represented by ``work_slice_dims=(axis, 2)``.  Host-index coefficient
+        # order identifies those outer contributors without depending on the
+        # iteration order of SymPy's ``free_symbols`` set.
+        if dev_dim is not None:
+            axis_symbols = prep.dep_device_coordinates[dev_dim].free_symbols
+            if any(
+                other != sym
+                and per_sym.get(other, 1) <= 1
+                and prep.dep_coeff.get(other, 0) > h
+                for other in axis_symbols
+            ):
+                logger.debug(
+                    f"split iteration {sym} is interleaved by an outer loop "
+                    f"on device dim {dev_dim}; returning empty_view"
+                )
+                return unrepresentable
         # TODO: two known unhandled failure modes fall through to the
         # empty_view fallback (cases catalogued in
         # per_core_view_failing_cases.md):
