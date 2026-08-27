@@ -18,7 +18,7 @@ import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import sympy
 
@@ -60,12 +60,14 @@ class EdgeCostMap:
         target_layouts: list,
         target_dep: "MemoryDep",
         op,
+        force_target_layout: Callable[[SpyreTensorLayout], bool] | None = None,
     ):
         self.dep = dep
         self._op = op
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
+        self._force_target_layout = force_target_layout
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
 
@@ -98,6 +100,16 @@ class EdgeCostMap:
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
         )
+        if (
+            (tgt is not None or not needed)
+            and in_stl != target_stl
+            and self._force_target_layout is not None
+            and self._force_target_layout(in_stl)
+        ):
+            # Some hardware ops constrain more than the within-stick variable.
+            # Use their exact target only after ordinary feasibility analysis
+            # has proved both endpoint coordinate systems representable.
+            needed, tgt = True, target_stl
         if not needed:
             cost = 0.0
             self._layout[in_stl][target_stl] = None
@@ -280,11 +292,23 @@ class FixedInOutNode(RestickNodeCost):
         )
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op):
+    def from_args(cls, args, out_stl, req_stls, op, force_target_layouts=None):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
+        if force_target_layouts is None:
+            force_target_layouts = [None] * len(args)
+        assert len(force_target_layouts) == len(args)
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
-            for arg, req in zip(args, req_stls)
+            EdgeCostMap(
+                arg.dep,
+                arg.layouts,
+                [req],
+                arg.dep,
+                op,
+                force_target_layout=force_target,
+            )
+            for arg, req, force_target in zip(
+                args, req_stls, force_target_layouts, strict=True
+            )
         ]
         return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
 

@@ -12,30 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import sympy
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import FixedLayout
-from torch_spyre._C import DataFormats, SpyreTensorLayout
+from torch._inductor.virtualized import V
+from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, get_device_dtype
+from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_FP8_OP,
+    BATCH_MATMUL_OP,
+)
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.optimize_restickify import EdgeCostMap, FixedInOutNode
 from torch_spyre._inductor.pass_utils import (
     device_coordinates,
     try_device_coordinates,
 )
 from torch_spyre._inductor.propagate_layouts import (
     PropArg,
+    _canonicalize_factorized_matmul_dim,
     _check_supported_input_sticks,
     _find_alt_target_stl,
+    find_stick_compatible_input_layout,
 )
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
+    align_tensors,
     compute_coordinates,
     normalize_coordinates,
     tiling_expr_to_device_expr,
 )
-from torch.utils._sympy.functions import ModularIndexing
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 p0, p1, p2, p3, p4, p5 = sympy.symbols("p0 p1 p2 p3 p4 p5", integer=True)
 
@@ -153,6 +166,68 @@ class TestCoordinates(TestCase):
         )
         # offset 1855 = 3*600 + 1*30 + 25*1
         self.assertEqual(cx, [p0 + 3, p1 + 1, p2 + 25])
+
+    def test_compute_coordinates_mixed_radix_flattened_dim(self):
+        """A flattened H*D loop maps back to separate H and D coordinates."""
+        lq, hd = sympy.symbols("lq hd", integer=True, nonnegative=True)
+        with V.set_graph_handler(SimpleNamespace()):
+            repeat_info: dict = {}
+            cx = compute_coordinates(
+                [1, 32, 64, 128],
+                [262144, 8192, 128, 1],
+                {lq: 64, hd: 4096},
+                128 * lq
+                + 8192 * ModularIndexing(hd, 128, 32)
+                + ModularIndexing(hd, 1, 128),
+                repeat_info_out=repeat_info,
+            )
+            self.assertEqual(
+                cx,
+                [0, sympy.Mod(FloorDiv(hd, 128), 32), lq, sympy.Mod(hd, 128)],
+            )
+
+            terms = normalize_coordinates(
+                {lq: 64, hd: 4096},
+                [1, 32, 64, 128],
+                cx,
+                lambda: sympy.Symbol("z0"),
+            )
+            high_digit = next(
+                term for term in terms if term.var == hd and term.dim_size == 32
+            )
+            self.assertEqual(high_digit.den, 128)
+            self.assertEqual(high_digit.mod, 4096)
+
+            iteration_space, tensors, remap = align_tensors(
+                {lq: (64, 1), hd: (4096, 1)},
+                [{"size": [1, 32, 64, 128], "coordinates": cx}],
+                repeat_info=repeat_info,
+            )
+            self.assertEqual(iteration_space[hd][0], 128)
+            self.assertEqual(remap[hd][0], (hd, 1))
+            high_var = remap[hd][1][0]
+            self.assertEqual(iteration_space[high_var][0], 32)
+            self.assertTrue(all(size > 0 for size in tensors[0]["size"]))
+
+    def test_compute_coordinates_rejects_overlapping_moduli(self):
+        """Multiple Mods remain unsupported unless they form one digit chain."""
+        with self.assertRaisesRegex(Unsupported, "multiple Mod"):
+            compute_coordinates(
+                [4, 6],
+                [6, 1],
+                {p0: 24},
+                6 * (p0 % 4) + p0 % 6,
+            )
+
+    def test_compute_coordinates_rejects_fractional_mixed_radix_coefficient(self):
+        """An unsupported digit scale is rejected before normalization."""
+        with self.assertRaisesRegex(Unsupported, "multiple Mod"):
+            compute_coordinates(
+                [4, 6],
+                [6, 1],
+                {p0: 24},
+                sympy.Rational(3, 2) * (p0 % 4) + 6 * sympy.Mod(FloorDiv(p0, 4), 6),
+            )
 
     def test_compute_device_coordinates(self):
         # B, S, E -> B, E/H, S, H
@@ -388,6 +463,202 @@ class TestUnrepresentableStickCandidates(TestCase):
         dep, bad, _ = self._traced_scenario()
         arg = PropArg(dep, None, [bad])
         _check_supported_input_sticks([arg], "batchmatmul")  # must not raise
+
+
+class TestFactorizedMatmulCandidates(TestCase):
+    def _scenario(self, layouts):
+        lq, generated, contraction = sympy.symbols(
+            "lq generated contraction", integer=True, nonnegative=True
+        )
+        dep = MemoryDep(
+            "x",
+            4096 * lq + contraction,
+            (lq, generated, contraction),
+            (8, 4096, 4096),
+        )
+        host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [1, 8, 4096],
+            [32768, 4096, 1],
+        )
+        return PropArg(dep, host, layouts), contraction
+
+    def _same_graph_attention_scenario(
+        self,
+        host_stride=(262144, 4096, 128, 1),
+        contraction_range=4096,
+    ):
+        """SDPA's BLHD producer viewed as BL(H*D) by a fused o_proj."""
+        lq, generated, contraction = sympy.symbols(
+            "lq generated contraction", integer=True, nonnegative=True
+        )
+        dep = MemoryDep(
+            "x",
+            4096 * lq + contraction,
+            (lq, generated, contraction),
+            (64, 4096, contraction_range),
+        )
+        host_size = [1, 64, 32, 128]
+        host = FixedLayout(
+            torch.device("cpu"),
+            torch.float16,
+            host_size,
+            list(host_stride),
+        )
+        if tuple(host_stride) == (262144, 4096, 128, 1):
+            source = SpyreTensorLayout(
+                [64, 2, 32, 64],
+                [4096, 64, 128, 1],
+                get_device_dtype(torch.float16),
+            )
+        else:
+            source = SpyreTensorLayout(
+                host_size,
+                list(host_stride),
+                torch.float16,
+                [0, 1, 2, 3],
+            )
+        return PropArg(dep, host, [source]), contraction, source
+
+    def test_canonicalization_is_independent_of_candidate_order(self):
+        """Every factorized candidate is rejected, regardless of list order."""
+        dtype = get_device_dtype(torch.float16)
+        factorized = SpyreTensorLayout([8, 2, 32, 64], [4096, 64, 128, 1], dtype)
+        canonical = SpyreTensorLayout(
+            [1, 8, 4096], [32768, 4096, 1], torch.float16, [0, 1, 2]
+        )
+
+        for layouts in ([factorized, canonical], [canonical, factorized]):
+            arg, contraction = self._scenario(layouts)
+            selected = find_stick_compatible_input_layout(
+                arg, contraction, BATCH_MATMUL_OP, "x"
+            )
+            required, force_target = _canonicalize_factorized_matmul_dim(
+                arg, selected, contraction, BATCH_MATMUL_OP, "x"
+            )
+            self.assertEqual(required, canonical)
+            self.assertIsNotNone(force_target)
+            self.assertTrue(force_target(factorized))
+            self.assertFalse(force_target(canonical))
+
+    def test_canonicalizes_same_graph_attention_flatten(self):
+        """Contiguous H,D producer dims become one o_proj contraction dim."""
+        arg, contraction, source = self._same_graph_attention_scenario()
+        expected = SpyreTensorLayout(
+            [1, 64, 4096],
+            [262144, 4096, 1],
+            torch.float16,
+            [0, 1, 2],
+        )
+
+        required, force_target = _canonicalize_factorized_matmul_dim(
+            arg, source, contraction, BATCH_MATMUL_OP, "x"
+        )
+
+        self.assertEqual(required, expected)
+        self.assertIsNotNone(force_target)
+        self.assertTrue(force_target(source))
+        with V.set_graph_handler(SimpleNamespace()):
+            self.assertEqual(
+                device_coordinates(required, arg.dep, None),
+                [
+                    arg.dep.var_names[0],
+                    sympy.floor(contraction / 64),
+                    0,
+                    sympy.Mod(contraction, 64),
+                ],
+            )
+
+    def test_rejects_noncontiguous_or_partial_factorized_chain(self):
+        """Only a full, gap-free mixed-radix view is safe to collapse."""
+        scenarios = (
+            self._same_graph_attention_scenario(host_stride=(262144, 4096, 256, 1)),
+            self._same_graph_attention_scenario(contraction_range=2048),
+        )
+        for arg, contraction, source in scenarios:
+            with self.subTest(
+                stride=arg.layout.stride,
+                contraction_range=arg.dep.ranges[contraction],
+            ):
+                with self.assertRaisesRegex(Unsupported, "full-range contiguous"):
+                    _canonicalize_factorized_matmul_dim(
+                        arg, source, contraction, BATCH_MATMUL_OP, "x"
+                    )
+
+    def test_nonstandard_matmul_layout_is_not_canonicalized(self):
+        dtype = get_device_dtype(torch.float16)
+        qfp8wt = SpyreTensorLayout(
+            [8, 2, 32, 64],
+            [4096, 64, 128, 1],
+            dtype,
+            ElementArrangement.QFP8WT,
+        )
+        arg, contraction = self._scenario([qfp8wt])
+        required, force_target = _canonicalize_factorized_matmul_dim(
+            arg, qfp8wt, contraction, BATCH_MATMUL_FP8_OP, "x"
+        )
+        self.assertEqual(required, qfp8wt)
+        self.assertIsNone(force_target)
+
+    def test_forced_target_does_not_override_infeasibility(self):
+        """Unrepresentable pairs retain infinite cost before the predicate."""
+        dtype = get_device_dtype(torch.float16)
+        source = SpyreTensorLayout([8, 2, 32, 64], [4096, 64, 128, 1], dtype)
+        target = SpyreTensorLayout([8, 64, 64], [4096, 64, 1], dtype)
+        arg, _ = self._scenario([source])
+        graph = SimpleNamespace(
+            get_buffer=lambda _name: SimpleNamespace(get_layout=lambda: arg.layout)
+        )
+        with (
+            V.set_graph_handler(graph),
+            patch(
+                "torch_spyre._inductor.optimize_restickify.compute_restickify_needed",
+                return_value=(True, None),
+            ),
+        ):
+            edge = EdgeCostMap(
+                arg.dep,
+                [source],
+                [target],
+                arg.dep,
+                None,
+                force_target_layout=lambda _candidate: True,
+            )
+            self.assertEqual(edge.cost(source, target), math.inf)
+            self.assertIs(edge.layout(source, target), EdgeCostMap.INFEASIBLE)
+
+    def test_factorized_candidate_forces_exact_finite_restick(self):
+        """Every feasible factorized candidate materializes the exact target."""
+        dtype = get_device_dtype(torch.float16)
+        source = SpyreTensorLayout([8, 2, 32, 64], [4096, 64, 128, 1], dtype)
+        target = SpyreTensorLayout([1, 8, 4096], [32768, 4096, 1], dtype)
+        arg, _ = self._scenario([source])
+        graph = SimpleNamespace(
+            get_buffer=lambda _name: SimpleNamespace(get_layout=lambda: arg.layout)
+        )
+
+        ordinary_target = SpyreTensorLayout([8, 64, 64], [4096, 64, 1], dtype)
+        for ordinary_result in ((False, None), (True, ordinary_target)):
+            with (
+                self.subTest(ordinary_result=ordinary_result),
+                V.set_graph_handler(graph),
+                patch(
+                    "torch_spyre._inductor.optimize_restickify.compute_restickify_needed",
+                    return_value=ordinary_result,
+                ),
+            ):
+                node = FixedInOutNode.from_args(
+                    [arg],
+                    target,
+                    [target],
+                    None,
+                    force_target_layouts=[lambda _candidate: True],
+                )
+                self.assertEqual(
+                    node.cost([source], target), math.prod(source.device_size)
+                )
+                self.assertEqual(node.edge_costs[0].layout(source, target), target)
 
 
 class TestTilingExprToDeviceExpr(TestCase):

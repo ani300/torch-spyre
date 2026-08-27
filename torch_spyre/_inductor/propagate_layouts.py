@@ -14,7 +14,7 @@
 
 
 from collections import Counter
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import logging
 import math
@@ -860,6 +860,149 @@ def find_stick_compatible_input_layout(
     )
 
 
+def _canonicalize_factorized_matmul_dim(
+    arg: PropArg,
+    required_stl: SpyreTensorLayout,
+    matmul_var: sympy.Symbol,
+    reduction_type: str,
+    label: str,
+) -> tuple[
+    SpyreTensorLayout,
+    Callable[[SpyreTensorLayout], bool] | None,
+]:
+    """Canonicalize a matmul dimension split over multiple outer device axes.
+
+    A matmul dimension may occupy its within-stick axis and at most one outer
+    device axis. Views such as ``BHLD -> BL(H*D)`` can preserve a physical
+    ``[..., D/64, H, 64]`` layout while presenting ``H*D`` as one logical
+    contraction dimension. Its coordinates contain the same loop variable in
+    two outer axes, which the backend turns into two contraction dimensions.
+
+    Return a legal required layout and a per-candidate predicate identifying
+    the otherwise stick-compatible layouts that must be materialized into it.
+    This canonicalization is currently defined only for ordinary STANDARD
+    batchmatmul layouts; FP8/QFP8WT has different two-dimensional stick
+    geometry and must retain its format-specific propagation.
+    """
+    if (
+        reduction_type != BATCH_MATMUL_OP
+        or required_stl.element_arrangement != ElementArrangement.STANDARD
+    ):
+        return required_stl, None
+
+    def is_factorized(candidate: SpyreTensorLayout) -> bool:
+        if candidate.element_arrangement != ElementArrangement.STANDARD:
+            return False
+        dev_coords = try_device_coordinates(candidate, arg.dep, None)
+        if dev_coords is None:
+            # compute_restickify_needed marks this candidate infeasible before
+            # EdgeCostMap consults the predicate.
+            return False
+        outer_axes = [
+            coord for coord in dev_coords[:-1] if matmul_var in coord.free_symbols
+        ]
+        return len(outer_axes) > 1
+
+    if not is_factorized(required_stl):
+        return required_stl, is_factorized
+
+    host_coords = host_coordinates(arg.layout, arg.dep, None)
+    host_dims = [
+        dim for dim, coord in enumerate(host_coords) if matmul_var in coord.free_symbols
+    ]
+    if len(host_dims) == 1:
+        canonical_size = [concretize_expr(size) for size in arg.layout.size]
+        canonical_stride = [concretize_expr(stride) for stride in arg.layout.stride]
+        stick_dim = host_dims[0]
+    else:
+        # The consumer may flatten several physically contiguous producer
+        # dimensions into one matmul dimension. For example, SDPA produces
+        # [B,L,H,D] while o_proj consumes [B,L,H*D], so K appears as adjacent
+        # mixed-radix host coordinates floor(K/D), Mod(K,D). A restickify can
+        # materialize that full-buffer view as one logical K dimension, but it
+        # is only sound when the view is affine and covers one contiguous chain
+        # exactly. Reject slices, offsets, and strided/gapped chains rather
+        # than guessing a layout.
+        zeroed_index = arg.dep.index.xreplace({matmul_var: sympy.S.Zero})
+        var_delta = sympy.expand(arg.dep.index - zeroed_index)
+        var_stride = sympy.expand(var_delta.coeff(matmul_var))
+        var_range = concretize_expr(arg.dep.ranges[matmul_var])
+        host_size = [concretize_expr(size) for size in arg.layout.size]
+        host_stride = [concretize_expr(stride) for stride in arg.layout.stride]
+
+        carrier_dims = [dim for dim in host_dims if host_size[dim] > 1]
+        affine_full_range = (
+            len(carrier_dims) > 1
+            and not var_stride.free_symbols
+            and var_stride.is_Integer
+            and var_stride > 0
+            and sympy.simplify(var_delta - var_stride * matmul_var) == 0
+            and all(
+                coord.free_symbols <= {matmul_var}
+                and sympy.simplify(coord.xreplace({matmul_var: sympy.S.Zero})) == 0
+                for dim, coord in enumerate(host_coords)
+                if dim in host_dims
+            )
+            and math.prod(host_size[dim] for dim in carrier_dims) == var_range
+        )
+        chain = sorted(carrier_dims, key=lambda dim: host_stride[dim], reverse=True)
+        contiguous_chain = bool(chain) and all(
+            host_stride[outer] == host_stride[inner] * host_size[inner]
+            for outer, inner in zip(chain, chain[1:])
+        )
+        if (
+            not affine_full_range
+            or not contiguous_chain
+            or host_stride[chain[-1]] != var_stride
+        ):
+            raise Unsupported(
+                f"{reduction_type}: cannot canonicalize factorized {label}_var="
+                f"{matmul_var}; expected an affine full-range contiguous host "
+                f"dimension chain, got host coordinates {host_coords}, "
+                f"size={list(arg.layout.size)}, stride={list(arg.layout.stride)}, "
+                f"dep={arg.dep.name}, index={arg.dep.index}, "
+                f"ranges={dict(arg.dep.ranges)}, required_stl={required_stl}"
+            )
+
+        # Replace the mixed-radix host dimensions with one logical dimension.
+        # Keeping every unrelated dimension (including size-one batch dims)
+        # preserves the ordinary rank/layout conventions used by batchmatmul.
+        collapsed_dims = set(host_dims)
+        insert_at = min(host_dims)
+        canonical_size = []
+        canonical_stride = []
+        stick_dim = -1
+        for dim, (size, stride) in enumerate(zip(host_size, host_stride)):
+            if dim == insert_at:
+                stick_dim = len(canonical_size)
+                canonical_size.append(var_range)
+                canonical_stride.append(int(var_stride))
+            if dim not in collapsed_dims:
+                canonical_size.append(size)
+                canonical_stride.append(stride)
+        assert stick_dim >= 0
+
+    dim_order = [dim for dim in range(len(canonical_size)) if dim != stick_dim]
+    dim_order.append(stick_dim)
+    canonical = SpyreTensorLayout(
+        canonical_size,
+        canonical_stride,
+        arg.layout.dtype,
+        dim_order,
+        required_stl.element_arrangement,
+    )
+    if canonical.device_dtype != required_stl.device_dtype:
+        # Do not reinterpret a format whose logical dtype maps to different
+        # physical storage. Such formats need format-aware canonicalization.
+        return required_stl, None
+    if is_factorized(canonical):
+        raise Unsupported(
+            f"{reduction_type}: canonical {label} layout still factorizes "
+            f"{matmul_var}: {canonical}"
+        )
+    return canonical, is_factorized
+
+
 def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
@@ -897,8 +1040,14 @@ def _matmul_layouts(
     x_req_stl = find_stick_compatible_input_layout(
         x, reduction_var, data.reduction_type, "x"
     )
+    x_req_stl, x_force_target = _canonicalize_factorized_matmul_dim(
+        x, x_req_stl, reduction_var, data.reduction_type, "x"
+    )
     y_req_stl = find_stick_compatible_input_layout(
         y, generated_var, data.reduction_type, "y"
+    )
+    y_req_stl, y_force_target = _canonicalize_factorized_matmul_dim(
+        y, y_req_stl, generated_var, data.reduction_type, "y"
     )
 
     out_stick_dim = next(
@@ -923,7 +1072,11 @@ def _matmul_layouts(
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
 
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [x, y], out_stl, [x_req_stl, y_req_stl], op
+        [x, y],
+        out_stl,
+        [x_req_stl, y_req_stl],
+        op,
+        force_target_layouts=[x_force_target, y_force_target],
     )
     return [out_stl]
 
