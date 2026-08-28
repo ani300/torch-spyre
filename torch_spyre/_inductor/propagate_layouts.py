@@ -416,7 +416,9 @@ def _single_arg_op_layout(
         )
         stick_size = get_elem_in_stick(out_dtype_for_layout)
 
-        x_dev_coords = device_coordinates(stl, dep, None)
+        x_dev_coords = try_device_coordinates(stl, dep, None)
+        if x_dev_coords is None:
+            return []
         x_stick_expr = x_dev_coords[-1]
         reduction_var = next(
             iter(dep.index.free_symbols - output_dep.index.free_symbols), None
