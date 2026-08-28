@@ -1118,6 +1118,25 @@ def test_gather_advanced_indexing_2d():
     )
 
 
+def test_keep_by_index_reduction_dim_from_indices():
+    tokens, experts, selected = 64, 128, 8
+    probs = torch.rand(tokens, experts, dtype=torch.float16, device=DEVICE)
+    indices = torch.randint(
+        0, experts, (tokens, selected), dtype=torch.int32, device=DEVICE
+    )
+
+    def fn(probs, indices):
+        return torch.ops.spyre.keep_by_index(probs, indices, -1, 0.0)
+
+    _run_and_capture(
+        fn,
+        [probs, indices],
+        named_dims={"T": tokens, "E": experts, "K": selected},
+        tensor_dims={probs: ["T", "E"], indices: ["T", "K"]},
+        expected_propagated_dims=["T", "E"],
+    )
+
+
 def test_gather_advanced_indexing_with_exp():
     """x[i].exp(): a unary fused onto the gather still drives the gather's input
     read through compute_input_named_dims; must not raise."""

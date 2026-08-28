@@ -37,7 +37,6 @@ from ..pass_utils import (
     device_coordinates,
     indirect_sizes_from_op,
     op_out_coords,
-    find_reduction_var,
 )
 from ..ir import SpyreConstantFallback
 from ..propagate_hints import DimHint, get_op_hints
@@ -290,7 +289,15 @@ def _compute_named_dims(op, inputs):
         named_dims.extend(names)
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
-        reduction_sym = find_reduction_var(inputs[0], output_dep)
+        reduction_vars = (
+            set().union(*(inp.index.free_symbols for inp in inputs))
+            - output_dep.index.free_symbols
+        )
+        if len(reduction_vars) != 1:
+            raise Unsupported(
+                f"expected exactly 1 reduction variable, got {reduction_vars}"
+            )
+        reduction_sym = next(iter(reduction_vars))
         if reduction_sym not in loop_var_dims:
             size = int(inputs[0].ranges[reduction_sym])
             loop_var_dims[reduction_sym] = [
