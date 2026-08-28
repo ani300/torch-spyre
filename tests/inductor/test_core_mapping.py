@@ -21,7 +21,7 @@ import sympy
 
 import torch_spyre._inductor.codegen.superdsc as superdsc_module
 import torch_spyre._inductor.pass_utils as pass_utils_module
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen.superdsc import parse_op_spec
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_FP8_OP,
@@ -495,6 +495,57 @@ def test_flattened_iteration_span_is_not_a_single_axis_view():
     assert not view.work_slice_dims
 
 
+def _prepare_compound_axis_view(iter_space, index, repeat_info=None):
+    device_layout = pass_utils_module.SpyreTensorLayout(
+        [1, 1, 8, 16, 64],
+        [-1, -1, 64, 512, 1],
+        DataFormats.SEN169_FP16,
+        ElementArrangement.STANDARD,
+    )
+    layout = pass_utils_module.FixedTiledLayout(
+        "spyre:0",
+        pass_utils_module.torch.float16,
+        [16, 512],
+        [512, 1],
+        device_layout,
+    )
+    dep = pass_utils_module.MemoryDep(
+        "buf",
+        index,
+        tuple(iter_space),
+        tuple(iter_space.values()),
+    )
+    graph = SimpleNamespace(
+        _repeat_info={} if repeat_info is None else repeat_info,
+        get_buffer=lambda name: SimpleNamespace(layout=layout),
+    )
+    with pass_utils_module.V.set_graph_handler(graph):
+        prep = pass_utils_module._prepare_per_core_view(
+            object(),
+            dep,
+            "buf",
+            parts=(iter_space, index, index),
+        )
+    assert prep is not None
+    return prep, graph
+
+
+def test_prepare_per_core_view_does_not_record_repeat_info():
+    head, flat = sympy.symbols("head flat", integer=True, nonnegative=True)
+    prior = sympy.Symbol("prior")
+    existing = {prior: {"kind": "mod", "modulus": 2}}
+    before = dict(existing)
+
+    _, graph = _prepare_compound_axis_view(
+        {head: 16, flat: 512},
+        512 * head + sympy.Mod(flat, 256),
+        existing,
+    )
+
+    assert graph._repeat_info is existing
+    assert graph._repeat_info == before
+
+
 def test_reshape_changes_per_core_ownership_within_one_device_axis():
     """A split of an inner term is not a contiguous split of the containing axis.
 
@@ -503,28 +554,12 @@ def test_reshape_changes_per_core_ownership_within_one_device_axis():
     consumer views that dimension as ``[2, 256]`` and splits the inner 256.
     The latter owns alternating pairs of sticks, not contiguous groups of four.
     """
-    producer_head, producer_flat = sympy.symbols("producer_head producer_flat")
-    producer_prep = pass_utils_module._ViewPrep(
-        iter_space={producer_head: 16, producer_flat: 512},
-        write_index=512 * producer_head + producer_flat,
-        read_index=512 * producer_head + producer_flat,
-        dep_coeff={producer_head: 512, producer_flat: 1},
-        dep_device_coordinates=(
-            sympy.S.Zero,
-            sympy.S.Zero,
-            sympy.floor(producer_flat / 64),
-            producer_head,
-            sympy.Mod(producer_flat, 64),
-        ),
-        device_size=[1, 1, 8, 16, 64],
-        stride_map=[-1, -1, 64, 512, 1],
-        elems_per_stick=64,
-        device_stride_to_dim={64: 2, 512: 3, 1: 4},
-        stick_host_stride=1,
-        num_stick_dim=2,
-        num_stick=8,
-        num_stick_stride=64,
-        is_matmul=False,
+    producer_head, producer_flat = sympy.symbols(
+        "producer_head producer_flat", integer=True, nonnegative=True
+    )
+    producer_prep, _ = _prepare_compound_axis_view(
+        {producer_head: 16, producer_flat: 512},
+        512 * producer_head + producer_flat,
     )
     producer_view, _, producer_representable = (
         pass_utils_module._per_core_view_from_prep(
@@ -534,29 +569,14 @@ def test_reshape_changes_per_core_ownership_within_one_device_axis():
     )
 
     consumer_head, consumer_outer, consumer_inner = sympy.symbols(
-        "consumer_head consumer_outer consumer_inner"
+        "consumer_head consumer_outer consumer_inner",
+        integer=True,
+        nonnegative=True,
     )
-    consumer_prep = pass_utils_module._ViewPrep(
-        iter_space={consumer_head: 16, consumer_outer: 2, consumer_inner: 256},
-        write_index=512 * consumer_head + 256 * consumer_outer + consumer_inner,
-        read_index=512 * consumer_head + 256 * consumer_outer + consumer_inner,
-        dep_coeff={consumer_head: 512, consumer_outer: 256, consumer_inner: 1},
-        dep_device_coordinates=(
-            sympy.S.Zero,
-            sympy.S.Zero,
-            4 * consumer_outer + sympy.floor(consumer_inner / 64),
-            consumer_head,
-            sympy.Mod(consumer_inner, 64),
-        ),
-        device_size=[1, 1, 8, 16, 64],
-        stride_map=[-1, -1, 64, 512, 1],
-        elems_per_stick=64,
-        device_stride_to_dim={64: 2, 512: 3, 1: 4},
-        stick_host_stride=1,
-        num_stick_dim=2,
-        num_stick=8,
-        num_stick_stride=64,
-        is_matmul=False,
+    consumer_index = 512 * consumer_head + 256 * consumer_outer + consumer_inner
+    consumer_prep, _ = _prepare_compound_axis_view(
+        {consumer_head: 16, consumer_outer: 2, consumer_inner: 256},
+        consumer_index,
     )
     consumer_view, _, consumer_representable = (
         pass_utils_module._per_core_view_from_prep(
