@@ -124,6 +124,22 @@ def _input_range_for_symbol(inputs: list[MemoryDep], sym: sympy.Symbol) -> sympy
     raise Unsupported(f"reduction variable {sym} has no range in any input")
 
 
+def _reduction_symbols(
+    inputs: list[MemoryDep], output_dep: MemoryDep
+) -> set[sympy.Symbol]:
+    """Return input iteration symbols that are reduced from the output.
+
+    Indirect symbols address gather/scatter inputs; they are not iteration
+    dimensions and therefore cannot be reduction variables.
+    """
+    return {
+        sym
+        for inp in inputs
+        for sym in inp.index.free_symbols
+        if not is_indirect(sym.name)
+    } - output_dep.index.free_symbols
+
+
 def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
     """Return the prefix of remaining whose declared sizes multiply to layout_size."""
     product = 1
@@ -297,9 +313,7 @@ def _compute_named_dims(op, inputs):
         named_dims.extend(names)
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
-        reduction_vars = {
-            sym for inp in inputs for sym in inp.index.free_symbols
-        } - output_dep.index.free_symbols
+        reduction_vars = _reduction_symbols(inputs, output_dep)
         if len(reduction_vars) != 1:
             raise Unsupported(
                 f"expected exactly 1 reduction variable, got {reduction_vars}"
