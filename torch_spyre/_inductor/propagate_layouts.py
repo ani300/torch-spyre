@@ -399,9 +399,11 @@ def _single_arg_op_layout(
     in_layout: FixedLayout,
     stl: SpyreTensorLayout,
 ) -> list[SpyreTensorLayout]:
-    """
-    Compute the output STL(s) for a single-arg op given one candidate input STL.
+    """Compute output STL(s) for one candidate input STL of a single-arg op.
+
     Called once per candidate input STL to produce corresponding output STL(s).
+    An empty result means this candidate cannot produce a supported output layout;
+    callers continue trying the other input STLs and fail only if none are usable.
     """
     data = op.data
     c_size = [concretize_expr(s) for s in output.size]

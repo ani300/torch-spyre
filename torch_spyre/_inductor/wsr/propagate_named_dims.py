@@ -116,6 +116,14 @@ def _untracked_name(context: str, sym, size: int) -> str:
     return name
 
 
+def _input_range_for_symbol(inputs: list[MemoryDep], sym: sympy.Symbol) -> sympy.Expr:
+    """Return ``sym``'s range from the input dependency that defines it."""
+    for inp in inputs:
+        if sym in inp.index.free_symbols and sym in inp.ranges:
+            return inp.ranges[sym]
+    raise Unsupported(f"reduction variable {sym} has no range in any input")
+
+
 def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
     """Return the prefix of remaining whose declared sizes multiply to layout_size."""
     product = 1
@@ -289,17 +297,16 @@ def _compute_named_dims(op, inputs):
         named_dims.extend(names)
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
-        reduction_vars = (
-            set().union(*(inp.index.free_symbols for inp in inputs))
-            - output_dep.index.free_symbols
-        )
+        reduction_vars = {
+            sym for inp in inputs for sym in inp.index.free_symbols
+        } - output_dep.index.free_symbols
         if len(reduction_vars) != 1:
             raise Unsupported(
                 f"expected exactly 1 reduction variable, got {reduction_vars}"
             )
         reduction_sym = next(iter(reduction_vars))
         if reduction_sym not in loop_var_dims:
-            size = int(inputs[0].ranges[reduction_sym])
+            size = int(_input_range_for_symbol(inputs, reduction_sym))
             loop_var_dims[reduction_sym] = [
                 _untracked_name(op.get_name(), reduction_sym, size)
             ]
