@@ -129,14 +129,15 @@ def _reduction_symbols(
 ) -> set[sympy.Symbol]:
     """Return input iteration symbols that are reduced from the output.
 
-    Indirect symbols address gather/scatter inputs; they are not iteration
-    dimensions and therefore cannot be reduction variables.
+    Only symbols with an input range are iteration dimensions. Indirect
+    gather/scatter addresses are excluded explicitly even if they acquire a
+    range in a future dependency representation.
     """
     return {
         sym
         for inp in inputs
         for sym in inp.index.free_symbols
-        if not is_indirect(sym.name)
+        if sym in inp.ranges and not is_indirect(sym.name)
     } - output_dep.index.free_symbols
 
 

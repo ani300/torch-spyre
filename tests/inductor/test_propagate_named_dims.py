@@ -1167,13 +1167,13 @@ def test_reduction_range_can_come_from_later_input():
     assert _pnd._input_range_for_symbol([first_input, indices], reduction_sym) == 8
 
 
-def test_indirect_symbols_are_not_reduction_vars():
-    output_sym, reduction_sym, indirect_sym = sympy.symbols(
-        "output reduction indirect0"
+def test_non_iteration_symbols_are_not_reduction_vars():
+    output_sym, reduction_sym, indirect_sym, address_sym = sympy.symbols(
+        "output reduction indirect0 address_coefficient"
     )
     data = MemoryDep(
         "data",
-        output_sym + reduction_sym + indirect_sym,
+        output_sym + reduction_sym + indirect_sym + address_sym,
         (output_sym, reduction_sym),
         (64, 8),
     )
