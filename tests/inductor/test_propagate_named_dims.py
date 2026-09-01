@@ -20,17 +20,18 @@
 
 import collections
 import math
+from unittest.mock import patch
 
 import pytest
 import sympy
 import torch
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ComputedBuffer
-from unittest.mock import patch
 
 import torch_spyre._inductor.passes as _passes
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor import spyre_hint as _spyre_hint
+from torch_spyre._inductor.pass_utils import find_reduction_var
 from utils_inductor import _compile_and_run
 
 DEVICE = torch.device("spyre")
@@ -1167,10 +1168,11 @@ def test_reduction_range_can_come_from_later_input():
     assert _pnd._input_range_for_symbol([first_input, indices], reduction_sym) == 8
 
 
-def test_non_iteration_symbols_are_not_reduction_vars():
+def test_find_reduction_var_across_inputs_ignores_non_iteration_symbols():
     output_sym, reduction_sym, indirect_sym, address_sym = sympy.symbols(
         "output reduction indirect0 address_coefficient"
     )
+    first_input = MemoryDep("first", output_sym, (output_sym,), (64,))
     data = MemoryDep(
         "data",
         output_sym + reduction_sym + indirect_sym + address_sym,
@@ -1179,7 +1181,8 @@ def test_non_iteration_symbols_are_not_reduction_vars():
     )
     output = MemoryDep("output", output_sym, (output_sym,), (64,))
 
-    assert _pnd._reduction_symbols([data], output) == {reduction_sym}
+    assert find_reduction_var([first_input, data], output) == reduction_sym
+    assert find_reduction_var([data], output) == reduction_sym
 
 
 def test_gather_advanced_indexing_with_exp():

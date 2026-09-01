@@ -33,6 +33,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from ..errors import Unsupported
 from ..pass_utils import (
+    find_reduction_var,
     host_coordinates,
     device_coordinates,
     indirect_sizes_from_op,
@@ -122,23 +123,6 @@ def _input_range_for_symbol(inputs: list[MemoryDep], sym: sympy.Symbol) -> sympy
         if sym in inp.index.free_symbols and sym in inp.ranges:
             return inp.ranges[sym]
     raise Unsupported(f"reduction variable {sym} has no range in any input")
-
-
-def _reduction_symbols(
-    inputs: list[MemoryDep], output_dep: MemoryDep
-) -> set[sympy.Symbol]:
-    """Return input iteration symbols that are reduced from the output.
-
-    Only symbols with an input range are iteration dimensions. Indirect
-    gather/scatter addresses are excluded explicitly even if they acquire a
-    range in a future dependency representation.
-    """
-    return {
-        sym
-        for inp in inputs
-        for sym in inp.index.free_symbols
-        if sym in inp.ranges and not is_indirect(sym.name)
-    } - output_dep.index.free_symbols
 
 
 def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
@@ -314,12 +298,7 @@ def _compute_named_dims(op, inputs):
         named_dims.extend(names)
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
-        reduction_vars = _reduction_symbols(inputs, output_dep)
-        if len(reduction_vars) != 1:
-            raise Unsupported(
-                f"expected exactly 1 reduction variable, got {reduction_vars}"
-            )
-        reduction_sym = next(iter(reduction_vars))
+        reduction_sym = find_reduction_var(inputs, output_dep)
         if reduction_sym not in loop_var_dims:
             size = int(_input_range_for_symbol(inputs, reduction_sym))
             loop_var_dims[reduction_sym] = [
