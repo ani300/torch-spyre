@@ -19,13 +19,13 @@ import pickle
 import unittest
 
 import torch
-from torch.spyre import SpyreTensorLayout, get_device_dtype
 from torch.testing._internal.common_utils import (
     TestCase,
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
 )
+from torch.spyre import SpyreTensorLayout, get_device_dtype
 
 
 @instantiate_parametrized_tests
