@@ -5074,7 +5074,7 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
             [[(0, Integer(4))], [(1, Integer(64))]],
         ]
         self.assertEqual(list(read_copy.data.ranges), [Integer(4), Integer(64)])
-        self.assertEqual(read_copy.loop_info.loop_tiled_dims, [[1], [2]])
+        self.assertEqual(read_copy.loop_info.loop_tiled_dims, [[0], [1]])
         self.assertEqual(
             read_copy.loop_info.tiled_dims_per_read, expected_read_advances
         )

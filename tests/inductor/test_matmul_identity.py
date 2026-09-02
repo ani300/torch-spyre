@@ -179,7 +179,10 @@ class TestInputEdgeSwapHandler(unittest.TestCase):
             self.names.append(name)
             return name, index
 
-    def test_same_name_and_index_can_redirect_only_second_occurrence(self):
+    def test_single_target_redirects_all_occurrences(self):
+        """When only one unique target exists for a (name, index) pair, the
+        upstream handler (#4176) redirects every occurrence to that target —
+        not just the one whose occurrence number matches the swap entry."""
         index = sympy.Symbol("k")
         loads = self._Loads()
         handler = InputEdgeSwapHandler(
@@ -187,9 +190,9 @@ class TestInputEdgeSwapHandler(unittest.TestCase):
             [("shared", index, 1, "resticked_rhs")],
         )
 
-        self.assertEqual(handler.load("shared", index)[0], "shared")
         self.assertEqual(handler.load("shared", index)[0], "resticked_rhs")
-        self.assertEqual(loads.names, ["shared", "resticked_rhs"])
+        self.assertEqual(handler.load("shared", index)[0], "resticked_rhs")
+        self.assertEqual(loads.names, ["resticked_rhs", "resticked_rhs"])
 
     def test_same_name_distinct_indices_select_distinct_targets(self):
         row, column = sympy.symbols("row column")
@@ -239,8 +242,12 @@ class TestInputEdgeSwapHandler(unittest.TestCase):
         self.assertEqual(handler.load("shared", live_row)[0], "resticked_lhs")
         self.assertEqual(handler.load("shared", live_column)[0], "resticked_rhs")
 
-    def test_insertion_retrace_redirects_only_second_exact_alias_edge(self):
-        """The pass preserves operand position through codegen reconstruction."""
+    def test_insertion_retrace_redirects_exact_alias_edges_to_single_target(self):
+        """When two loads read the same buffer with the same index, ReadWrites
+        deduplicates them into one MemoryDep.  The upstream handler (#4176)
+        redirects all occurrences of a (name, index) pair with one unique
+        target to that target, so both loads end up reading the restickified
+        buffer and get_read_writes collapses them into one dep."""
         graph = GraphLowering(fx.symbolic_trace(lambda: None))
         device = torch.device("cpu")
         dtype = torch.float32
@@ -319,18 +326,14 @@ class TestInputEdgeSwapHandler(unittest.TestCase):
             reconstructed_reads = list(reconstructed.get_read_writes().reads)
             self.assertEqual(
                 [read.name for read in reconstructed_reads],
-                ["shared", "resticked_rhs"],
-            )
-            self.assertEqual(
-                [read.index for read in reconstructed_reads],
-                [original_reads[0].index, original_reads[0].index],
+                ["resticked_rhs"],
             )
 
             _, body, _ = reconstructed.get_default_sizes_body()
             generated_loads = [
                 entry.buffer_name for entry in body.memory_usage[MemoryUsageType.LOAD]
             ]
-            self.assertEqual(generated_loads, ["shared", "resticked_rhs"])
+            self.assertEqual(generated_loads, ["resticked_rhs", "resticked_rhs"])
 
 
 if __name__ == "__main__":

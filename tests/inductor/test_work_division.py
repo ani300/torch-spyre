@@ -528,10 +528,10 @@ class TestCostModelConstraints(unittest.TestCase):
 
 class TestPerCoreSpan(unittest.TestCase):
     @staticmethod
-    def _granite_embedding_output_dep(d0, d1):
-        """Return the physical layout produced by Granite's 32K embedding."""
-        shape = (1, 32768, 4096)
-        stride = (134217728, 4096, 1)
+    def _granite_embedding_output_dep(d0, d1, d0_size=32768):
+        """Return the physical layout produced by Granite's embedding."""
+        shape = (1, d0_size, 4096)
+        stride = (d0_size * 4096, 4096, 1)
         device_layout = SpyreTensorLayout(
             shape,
             stride,
@@ -545,14 +545,14 @@ class TestPerCoreSpan(unittest.TestCase):
             "buf0",
             4096 * d0 + d1,
             (d0, d1),
-            (32768, 4096),
+            (d0_size, 4096),
         )
         return TensorDep(dep=dep, layout=layout)
 
     def test_trailing_bare_symbol_split_reduces_span(self):
         d0, d1 = (_isym(name) for name in ("d0", "d1"))
-        td = self._granite_embedding_output_dep(d0, d1)
-        it_space = {d0: 32768, d1: 4096}
+        td = self._granite_embedding_output_dep(d0, d1, d0_size=32832)
+        it_space = {d0: 32832, d1: 4096}
 
         self.assertEqual(
             td.device_coords,
@@ -563,10 +563,10 @@ class TestPerCoreSpan(unittest.TestCase):
                 sympy.Mod(d1, 64),
             ],
         )
-        self.assertEqual(get_per_core_span(td, {}, it_space, {}), 268435456)
+        self.assertEqual(get_per_core_span(td, {}, it_space, {}), 268959744)
         self.assertEqual(
             get_per_core_span(td, {d0: 32, d1: 1}, it_space, {}),
-            264372224,
+            264888576,
         )
         self.assertLessEqual(
             get_per_core_span(td, {d0: 32, d1: 1}, it_space, {}),
@@ -576,7 +576,7 @@ class TestPerCoreSpan(unittest.TestCase):
             must_split_vars(
                 [td],
                 it_space,
-                {d0: 32768, d1: 64},
+                {d0: 32832, d1: 64},
                 {d1: 64},
                 32,
                 {},
