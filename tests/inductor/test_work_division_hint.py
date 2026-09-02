@@ -43,6 +43,8 @@ import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import IDENTITY_OP
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
     work_division_from_view,
@@ -866,7 +868,7 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
 
     solver = allocator._build_solver(buffers)
     with caplog.at_level(logging.DEBUG, logger="spyre.inductor.scratchpad.allocator"):
-        allocation = allocator._solve(solver)
+        allocation = allocator._solve(solver, graph)
         allocator._finalize_lx_relayout_allocation(allocation)
 
     by_name = {buffer.name: buffer for buffer in allocation}
@@ -880,9 +882,9 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
     )
 
 
-def _assert_live_buffers_do_not_share_addresses(buffers, limit):
+def _assert_live_buffers_do_not_share_addresses(graph, buffers, limit):
     allocator = ScratchpadAllocator(GreedyLayoutSolver, limit)
-    allocation = allocator._solve(allocator._build_solver(buffers))
+    allocation = allocator._solve(allocator._build_solver(buffers), graph)
     assert all(buffer.address is not None for buffer in allocation)
     for index, left in enumerate(allocation):
         for right in allocation[index + 1 :]:
@@ -921,7 +923,7 @@ def test_lx_relayout_copies_loop_lifetime_to_every_destination():
     assert [buffer.lifetime_end_override for buffer in source.paired_with] == [12, 12]
     tail = LifetimeBoundBuffer("tail", 64, [8, 11])
     buffers.append(tail)
-    _assert_live_buffers_do_not_share_addresses(buffers, 384)
+    _assert_live_buffers_do_not_share_addresses(graph, buffers, 384)
 
 
 def test_lx_relayout_keeps_source_lifetime_for_later_original_reader():
@@ -942,7 +944,7 @@ def test_lx_relayout_keeps_source_lifetime_for_later_original_reader():
     assert source.paired_with[0].lifetime_end_override == 8
     tail = LifetimeBoundBuffer("tail", 64, [6, 7])
     buffers.append(tail)
-    _assert_live_buffers_do_not_share_addresses(buffers, 384)
+    _assert_live_buffers_do_not_share_addresses(graph, buffers, 384)
 
 
 @config.patch({"lx_planner_relayout": True})
@@ -974,7 +976,12 @@ class _RelayoutNode:
 
 
 def _relayout_layout(address, view):
-    return SimpleNamespace(allocation={"lx": address}, lx_view=view)
+    # FixedTiledLayout always carries the final physical device layout.  Keep
+    # that field in the test double so ownership verification exercises the
+    # same contract as the real post-allocation pipeline.
+    return SimpleNamespace(
+        allocation={"lx": address}, lx_view=view, device_layout=object()
+    )
 
 
 def test_lx_relayout_scheduler_checks_final_ownership_projection():
@@ -1095,6 +1102,108 @@ def test_lx_relayout_scheduler_demotes_groups_but_not_ordinary_unary():
     run_registered("projection")
     run_registered("missing")
     run_registered("missing_buffer")
+
+
+class _CarriedReductionDep:
+    def __init__(self, name):
+        self.name = name
+
+
+def _verify_carried_reduction(
+    drift=None, wrong_logical_dim=False, scheduled_rank_mismatch=False
+):
+    accumulator = "fill"
+    operation_row = Symbol("d0")
+    operation_other = Symbol("d1")
+    scheduled_row = Symbol("c0")
+    scheduled_other = Symbol("c1")
+    record = CarriedReductionRecord(
+        accumulator_name=accumulator,
+        row_dim_name="T",
+        required_row_split=8,
+        fill_name="fill",
+        combine_name="combine",
+        drain_name="drain",
+    )
+    dep = _CarriedReductionDep(accumulator)
+    nodes = [
+        _RelayoutNode("fill", writes=(dep,)),
+        _RelayoutNode("combine", reads=(dep,), writes=(dep,)),
+        _RelayoutNode("drain", reads=(dep,)),
+    ]
+    for node in nodes:
+        node.node._carried_reduction_record = record
+        node.node.work_div_loop_info = {
+            operation_row: ["T"],
+            operation_other: ["H"],
+        }
+
+    layout = _relayout_layout(0, _SOURCE_VIEW)
+    graph = SimpleNamespace(
+        try_get_buffer=lambda name: (
+            SimpleNamespace(get_layout=lambda: layout) if name == accumulator else None
+        )
+    )
+
+    def view(node, _dep, _name):
+        realized = _DESTINATION_VIEW if node.name == drift else _SOURCE_VIEW
+        return realized, False, True
+
+    def work_division(_view, _coordinates, _symbols):
+        symbol = scheduled_other if wrong_logical_dim else scheduled_row
+        return SimpleNamespace(work_slices={symbol: 8})
+
+    with (
+        mock_patch.object(scheduler_module, "SchedulerNode", _RelayoutNode),
+        mock_patch.object(scheduler_module, "MemoryDep", _CarriedReductionDep),
+        mock_patch.object(scheduler_module, "FixedTiledLayout", SimpleNamespace),
+        mock_patch.object(scheduler_module, "V", SimpleNamespace(graph=graph)),
+        mock_patch.object(scheduler_module, "per_core_view_scheduled", view),
+        mock_patch.object(
+            scheduler_module, "try_device_coordinates", return_value=[scheduled_row]
+        ),
+        mock_patch.object(
+            scheduler_module,
+            "iteration_space_from_op",
+            return_value={operation_row: 64, operation_other: 64},
+        ),
+        mock_patch.object(
+            scheduler_module,
+            "iteration_space",
+            return_value=(
+                {scheduled_row: 64}
+                if scheduled_rank_mismatch
+                else {scheduled_row: 64, scheduled_other: 64}
+            ),
+        ),
+        mock_patch.object(
+            scheduler_module, "work_division_from_view", side_effect=work_division
+        ),
+    ):
+        return scheduler_module.verify_carried_reduction_ownership(nodes)
+
+
+def test_carried_reduction_verifier_accepts_matching_final_ownership():
+    assert [node.name for node in _verify_carried_reduction()] == [
+        "fill",
+        "combine",
+        "drain",
+    ]
+
+
+def test_carried_reduction_verifier_rejects_final_ownership_drift():
+    with pytest.raises(Unsupported, match="does not match accumulator ownership"):
+        _verify_carried_reduction(drift="drain")
+
+
+def test_carried_reduction_verifier_rejects_same_count_on_wrong_dimension():
+    with pytest.raises(Unsupported, match="expected only T split=8"):
+        _verify_carried_reduction(wrong_logical_dim=True)
+
+
+def test_carried_reduction_verifier_rejects_scheduler_rank_change():
+    with pytest.raises(Unsupported, match="changed iteration rank"):
+        _verify_carried_reduction(scheduled_rank_mismatch=True)
 
 
 def aot_backend(gm: GraphModule, example_inputs: Sequence[InputType]):

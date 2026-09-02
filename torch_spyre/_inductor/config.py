@@ -32,8 +32,6 @@ hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 # spyre_empty_with_layout) and pass its address in as %pool_base_addr.
 frontend_pool_allocation: bool = _get_env_bool("FRONTEND_POOL_ALLOCATION", False)
 
-global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
-
 # Emit a native conv2d SDSC (opFuncName="conv2d" on the "pt" unit) instead of
 # the im2col+matmul decomposition (conv2d_via_bmm_decomp). Off by default: the
 # decomposition remains the default path and the fallback for cases the direct
@@ -93,6 +91,10 @@ ignore_work_division_hints: bool = (
 )
 
 ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+
+# Temporary kill switch for removing a proven-redundant read copy after LX
+# planning.  A failed proof leaves the original graph unchanged.
+read_copy_elision: bool = _get_env_bool("SPYRE_READ_COPY_ELISION", True)
 
 # Per-pass operation logging for CustomPreSchedulingPasses.
 # Set to "all" or "1" to log after every pass, or a comma-separated list of
@@ -175,7 +177,6 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 # joint-ness is selected by ``co_optimizing_lx_planning``; for the gap-based
 # solvers that same flag instead wraps them in ExhaustiveSearchSolver.
 
-# TODO(isuruf): Change to firstfit when deeptools PR4298 lands
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
@@ -192,5 +193,8 @@ validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 # to force the pure-Python packer. A missing native class is a stale or
 # incomplete build, not a supported mode, and raises rather than falling back.
 native_layout_packer: bool = _get_env_bool("TORCH_SPYRE_NATIVE_PACKER", True)
+
+# When symbolic cost_expr fails, use the fallback cost instead of erroring out
+_cpsat_warn_on_cost_expr: bool = True
 
 install_config_module(sys.modules[__name__])

@@ -242,14 +242,8 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
         write_dep = next(iter(rw.writes))
         x_dep, y_dep = identify_matmul_inputs(reads, write_dep)
-        if x_dep is None or y_dep is None:
-            logger.warning(
-                "insert_bmm_padding: could not identify x/y for %s, skipping",
-                op.get_name(),
-            )
-            continue
 
-        reduction_var = find_reduction_var(x_dep, write_dep)
+        reduction_var = find_reduction_var((x_dep,), write_dep)
 
         # y's K host dim: the dim whose host coordinate contains reduction_var.
         y_buf_tmp = graph.get_buffer(y_dep.name)

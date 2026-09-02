@@ -21,7 +21,7 @@ import sympy
 
 import torch_spyre._inductor.codegen.superdsc as superdsc_module
 import torch_spyre._inductor.pass_utils as pass_utils_module
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.codegen.superdsc import parse_op_spec
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_FP8_OP,
@@ -431,6 +431,7 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
         write_index=dims[0],
         read_index=dims[-1],
         dep_coeff={dims[0]: 1, dims[1]: 2, dims[2]: 0},
+        dep_device_coordinates=(dims[0], dims[1]),
         device_size=[2, 4],
         stride_map=[1, 2],
         elems_per_stick=64,
@@ -465,6 +466,15 @@ def test_flattened_iteration_span_is_not_a_single_axis_view():
         write_index=512 * heads + flat,
         read_index=512 * heads + flat,
         dep_coeff={heads: 512, flat: 1},
+        dep_device_coordinates=(
+            sympy.floor(flat / 256),
+            sympy.S.Zero,
+            sympy.S.Zero,
+            sympy.S.Zero,
+            sympy.floor(sympy.Mod(flat, 256) / 64),
+            heads,
+            sympy.Mod(flat, 64),
+        ),
         device_size=[2, 1, 1, 1, 4, 16, 64],
         stride_map=[256, -1, -1, -1, 64, 512, 1],
         elems_per_stick=64,
@@ -483,3 +493,106 @@ def test_flattened_iteration_span_is_not_a_single_axis_view():
     assert not representable
     assert not partial
     assert not view.work_slice_dims
+
+
+def _prepare_compound_axis_view(iter_space, index, repeat_info=None):
+    device_layout = pass_utils_module.SpyreTensorLayout(
+        [1, 1, 8, 16, 64],
+        [-1, -1, 64, 512, 1],
+        DataFormats.SEN169_FP16,
+        ElementArrangement.STANDARD,
+    )
+    layout = pass_utils_module.FixedTiledLayout(
+        "spyre:0",
+        pass_utils_module.torch.float16,
+        [16, 512],
+        [512, 1],
+        device_layout,
+    )
+    dep = pass_utils_module.MemoryDep(
+        "buf",
+        index,
+        tuple(iter_space),
+        tuple(iter_space.values()),
+    )
+    graph = SimpleNamespace(
+        _repeat_info={} if repeat_info is None else repeat_info,
+        get_buffer=lambda name: SimpleNamespace(layout=layout),
+    )
+    with pass_utils_module.V.set_graph_handler(graph):
+        prep = pass_utils_module._prepare_per_core_view(
+            object(),
+            dep,
+            "buf",
+            parts=(iter_space, index, index),
+        )
+    assert prep is not None
+    return prep, graph
+
+
+def test_prepare_per_core_view_does_not_record_repeat_info():
+    head, flat = sympy.symbols("head flat", integer=True, nonnegative=True)
+    prior = sympy.Symbol("prior")
+    existing = {prior: {"kind": "mod", "modulus": 2}}
+    before = dict(existing)
+
+    _, graph = _prepare_compound_axis_view(
+        {head: 16, flat: 512},
+        512 * head + sympy.Mod(flat, 256),
+        existing,
+    )
+
+    assert graph._repeat_info is existing
+    assert graph._repeat_info == before
+
+
+def test_reshape_changes_per_core_ownership_within_one_device_axis():
+    """A split of an inner term is not a contiguous split of the containing axis.
+
+    This is the Gemma 4 decode geometry: the producer splits a flattened
+    512-element dimension into two contiguous 256-element halves, while its
+    consumer views that dimension as ``[2, 256]`` and splits the inner 256.
+    The latter owns alternating pairs of sticks, not contiguous groups of four.
+    """
+    producer_head, producer_flat = sympy.symbols(
+        "producer_head producer_flat", integer=True, nonnegative=True
+    )
+    producer_prep, _ = _prepare_compound_axis_view(
+        {producer_head: 16, producer_flat: 512},
+        512 * producer_head + producer_flat,
+    )
+    producer_view, _, producer_representable = (
+        pass_utils_module._per_core_view_from_prep(
+            producer_prep,
+            {producer_head: 16, producer_flat: 2},
+        )
+    )
+
+    consumer_head, consumer_outer, consumer_inner = sympy.symbols(
+        "consumer_head consumer_outer consumer_inner",
+        integer=True,
+        nonnegative=True,
+    )
+    consumer_index = 512 * consumer_head + 256 * consumer_outer + consumer_inner
+    consumer_prep, _ = _prepare_compound_axis_view(
+        {consumer_head: 16, consumer_outer: 2, consumer_inner: 256},
+        consumer_index,
+    )
+    consumer_view, _, consumer_representable = (
+        pass_utils_module._per_core_view_from_prep(
+            consumer_prep,
+            {consumer_head: 16, consumer_outer: 1, consumer_inner: 2},
+        )
+    )
+
+    assert producer_representable
+    assert not consumer_representable
+    assert producer_view != consumer_view
+
+    # Splitting the outer term of the same compound coordinate is contiguous:
+    # each core group owns one four-stick half of the physical axis.
+    _, _, outer_split_representable = pass_utils_module._per_core_view_from_prep(
+        consumer_prep,
+        {consumer_head: 16, consumer_outer: 2, consumer_inner: 1},
+    )
+    assert outer_split_representable

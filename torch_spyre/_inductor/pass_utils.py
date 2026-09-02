@@ -407,16 +407,23 @@ def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
     """Return whether a single-input pointwise copy is a RESTICKIFY (vs IDENTITY).
 
     ``in_coords`` / ``out_coords`` are the operands' device-space coordinates.
-    It is a restickify iff a *different* host dim lands within the stick (the
-    within-stick coords carry different free symbols) -- except a broadcast (an
-    all-zero input expanding to non-scalar output), which is an identity fill.
+    It is a restickify iff a *different* host dim lands within the stick. A
+    broadcast into a new stick dim is an identity fill, not a stick swap.
 
     The authoritative test, shared by the codegen store side and the padding
     pass matcher (``is_restickify_op``) so the two cannot disagree.
     """
     if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
         return False  # broadcast: scalar input expanding to non-scalar output
-    return in_coords[-1].free_symbols != out_coords[-1].free_symbols
+    out_stick_syms = out_coords[-1].free_symbols
+    if out_stick_syms == in_coords[-1].free_symbols:
+        return False
+    in_stick_syms = in_coords[-1].free_symbols
+    if not in_stick_syms and out_stick_syms:
+        in_syms = set().union(*(coord.free_symbols for coord in in_coords))
+        if out_stick_syms.isdisjoint(in_syms):
+            return False
+    return True
 
 
 def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
@@ -878,44 +885,52 @@ def host_coordinates(
 def identify_matmul_inputs(
     inputs: list[MemoryDep],
     write_dep: MemoryDep,
-) -> tuple[MemoryDep, MemoryDep] | tuple[None, None]:
+) -> tuple[MemoryDep, MemoryDep]:
     """Identify Input1 (x) and Input2 (y) of a BatchMatmul op.
 
-    Uses the BatchMatmul semantic dimension definitions:
-      reduction_dim: in Input1, Input2,  NOT Output
-      generated_dim: in Input2, Output,  NOT Input1
-      preserved_dim: in Input1, Output,  NOT Input2
-      noreuse_dim:   in Input1, Input2,  Output
+    Uses positional order: lower_bmm always emits x before y, so inputs[0] is
+    x and inputs[1] is y.  This is valid even when N=1 (the N symbol is
+    constant-folded out of index expressions) or when both deps are identical
+    (ReadWrites deduplicated a self-alias read).
 
-    Identifies y by its generated_dim (N): present in y and the output, absent
-    from x.  This is more robust than identifying x by its preserved_dim (M):
-    when M=1, M is constant-folded out of both x's and the output's index
-    simultaneously, making the preserved_dim test blind.  N is immune — even
-    N=1 ranges stay in the output's index expression.
+    For a 1-element input list, the single dep is treated as both x and y
+    (self-matmul where ReadWrites collapsed two identical MemoryDeps to one).
 
-    Returns (None, None) if y cannot be identified.
+    Raises ValueError for 0 or 3+ inputs.
     """
-    assert len(inputs) == 2
+    if len(inputs) == 0 or len(inputs) > 2:
+        raise ValueError(
+            f"identify_matmul_inputs: expected 1 or 2 inputs, got {len(inputs)}"
+        )
+    if len(inputs) == 1:
+        return inputs[0], inputs[0]
+
     a, b = inputs[0], inputs[1]
-    out_syms = write_dep.index.free_symbols
-    syms_a = a.index.free_symbols
-    syms_b = b.index.free_symbols
-
-    # b has generated_dim → b is y, a is x
-    if (syms_b & out_syms) - syms_a:
-        return a, b
-    # a has generated_dim → a is y, b is x
-    if (syms_a & out_syms) - syms_b:
-        return b, a
-    return None, None
+    return a, b
 
 
-def find_reduction_var(x_dep: MemoryDep, out_dep: MemoryDep) -> sympy.Symbol:
-    """Return the single loop variable that appears in x's index but not in the output's.
+def get_matmul_n_size(op: "Operation") -> int:
+    """Return the concrete N (output columns) extent of a matmul op.
 
-    Raises Unsupported if the count is not exactly 1.
+    Reads from op.data.ranges[-1] rather than inferring from index expressions,
+    so it is correct even when N=1 and the N symbol has been constant-folded
+    out of every MemoryDep.
     """
-    reduction_vars = x_dep.index.free_symbols - out_dep.index.free_symbols
+    return concretize_expr(op.data.ranges[-1])
+
+
+def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
+    """Return the single input iteration symbol reduced from the output.
+
+    Symbols must have a range on the input dependency that uses them. Indirect
+    gather/scatter address symbols are not iteration dimensions.
+    """
+    reduction_vars = {
+        sym
+        for inp in inputs
+        for sym in inp.index.free_symbols
+        if sym in inp.ranges and not is_indirect(sym.name)
+    } - out_dep.index.free_symbols
     if len(reduction_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 reduction variable, got {reduction_vars}"
@@ -1003,11 +1018,39 @@ def find_matmul_generated_var(
 
     Raises Unsupported if the count is not exactly 1.
     """
-    generated_vars = (
-        y_dep.index.free_symbols & out_dep.index.free_symbols
-    ) - x_dep.index.free_symbols
+    y_syms = y_dep.index.free_symbols
+    x_syms = x_dep.index.free_symbols
+    out_syms = out_dep.index.free_symbols
+    logger.debug(
+        "[find_matmul_generated_var] looking for N (generated dim = in y & out, not in x)\n"
+        "  x   index=%-20s  free=%s\n"
+        "  y   index=%-20s  free=%s\n"
+        "  out index=%-20s  free=%s\n"
+        "  (y & out) = %s  =>  minus x = %s",
+        x_dep.index,
+        x_syms,
+        y_dep.index,
+        y_syms,
+        out_dep.index,
+        out_syms,
+        y_syms & out_syms,
+        (y_syms & out_syms) - x_syms,
+    )
+    generated_vars = (y_syms & out_syms) - x_syms
+    logger.debug("  generated_vars = %s", generated_vars)
     if op is not None and len(generated_vars) > 1:
         generated_vars = generated_vars - broadcast_batch_vars(op, x_dep, out_dep)
+        logger.debug("  generated_vars (after broadcast filter) = %s", generated_vars)
+    if len(generated_vars) > 1 and out_dep.var_names:
+        # The Inductor matmul lowering always places N (the generated/output-column
+        # dim) last in ranges — see lower_bmm/lower_mm in lowering.py.  The last
+        # squeezed output var is therefore always the generated var.
+        last_var = out_dep.var_names[-1]
+        if last_var in generated_vars:
+            generated_vars = {last_var}
+            logger.debug(
+                "  generated_vars (after last-output-var fallback) = %s", generated_vars
+            )
     if len(generated_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 generated variable, got {generated_vars}"
@@ -1945,6 +1988,34 @@ def compute_restickify_needed(
     ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]
 
+    if target_stick == sympy.S.Zero and in_stick_offset_free and _is_matmul_op(op):
+        # The output stick is 0 (sparse) and the input is clean-dense.  For
+        # matmul, y may legally arrive sparse when N=1 collapses the N symbol.
+        # Build the sparse target from in_stl's device dimensions — not from host
+        # dimensions, which may include size-1 dims (e.g. M=1) that cause
+        # SpyreTensorLayout constructor 2 to produce an extra device dimension.
+        # Rule: find the K-chunk dim (stride == elem_stride * stick_size), expand
+        # it by stick_size, promote the element stride there, set stick to -1.
+        stick_size = get_elem_in_stick(in_host.dtype)
+        ds = list(in_stl.device_size)
+        sm = list(in_stl.stride_map)
+        elem_stride = sm[-1]
+        k_chunk_dim = next(
+            (i for i in range(len(sm) - 1) if sm[i] == elem_stride * stick_size),
+            None,
+        )
+        if k_chunk_dim is not None:
+            y_ds = list(ds)
+            y_sm = list(sm)
+            y_ds[k_chunk_dim] = ds[k_chunk_dim] * stick_size
+            y_sm[k_chunk_dim] = elem_stride
+            y_sm[-1] = -1
+            return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
+        assert False, (
+            f"k_chunk_dim not found in sparse-N=1 restickify path: "
+            f"stride_map={sm}, elem_stride={elem_stride}, stick_size={stick_size}"
+        )
+
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
         # No output dim carries the input's stick var, so compute_restickify_target_layout
         # would fail to match. Promote the reduction var to the stick dimension so the
@@ -2444,6 +2515,11 @@ class _ViewPrep(NamedTuple):
     # concretize_expr(dep.index.coeff(sym)) over the *full* iteration space, so
     # the per-candidate path does a dict lookup instead of a sympy .coeff() call.
     dep_coeff: dict
+    # The target dependency projected into the buffer's physical device
+    # coordinates.  A single physical axis can contain multiple logical loop
+    # symbols after a reshape; their relative host strides determine whether a
+    # split owns one contiguous slice or several interleaved slices.
+    dep_device_coordinates: tuple["sympy.Expr", ...]
     device_size: Any
     stride_map: Any
     elems_per_stick: int
@@ -2520,12 +2596,17 @@ def _prepare_per_core_view(
     # iteration-space symbols, so precomputing the coeff for every iter symbol
     # covers every symbol the per-candidate path can ask for.
     dep_coeff = {sym: concretize_expr(dep.index.coeff(sym)) for sym in iter_space}
+    coordinates = try_device_coordinates(dev_layout, dep, None)
+    if coordinates is None:
+        return None
+    dep_device_coordinates = tuple(coordinates)
 
     return _ViewPrep(
         iter_space=iter_space,
         write_index=write_index,
         read_index=read_index,
         dep_coeff=dep_coeff,
+        dep_device_coordinates=dep_device_coordinates,
         device_size=device_size,
         stride_map=stride_map,
         elems_per_stick=elems_per_stick,
@@ -2665,6 +2746,31 @@ def _per_core_view_from_prep(
             if split * k == num_stick:
                 dev_dim = num_stick_dim
                 split *= k
+
+        # A reshape can place more than one logical loop symbol on one physical
+        # device axis.  Splitting an inner symbol while an unsplit outer symbol
+        # also contributes to that axis gives each core several interleaved
+        # regions, which PerCoreView's single ``(axis, slice)`` cannot express.
+        #
+        # For example, ``4 * outer + floor(inner / 64)`` over an 8-stick axis,
+        # with ``inner`` split in two, gives the two core groups ownership of
+        # {0, 1, 4, 5} and {2, 3, 6, 7}; it is not the contiguous 2-way split
+        # represented by ``work_slice_dims=(axis, 2)``.  Host-index coefficient
+        # order identifies those outer contributors without depending on the
+        # iteration order of SymPy's ``free_symbols`` set.
+        if dev_dim is not None:
+            axis_symbols = prep.dep_device_coordinates[dev_dim].free_symbols
+            if any(
+                other != sym
+                and per_sym.get(other, 1) <= 1
+                and prep.dep_coeff.get(other, 0) > h
+                for other in axis_symbols
+            ):
+                logger.debug(
+                    f"split iteration {sym} is interleaved by an outer loop "
+                    f"on device dim {dev_dim}; returning empty_view"
+                )
+                return unrepresentable
         # TODO: two known unhandled failure modes fall through to the
         # empty_view fallback (cases catalogued in
         # per_core_view_failing_cases.md):
