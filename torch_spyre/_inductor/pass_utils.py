@@ -2049,8 +2049,10 @@ def compute_restickify_needed(
     ]
     is_factorized = bool(stick_syms) and len(outer_axes_with_stick_var) > 1
     factorized_layout_mismatch = is_factorized and in_stl != out_stl
-    if not factorized_layout_mismatch and in_stick_offset_free and stick_compatible(
-        [idc, out_idc]
+    if (
+        not factorized_layout_mismatch
+        and in_stick_offset_free
+        and stick_compatible([idc, out_idc])
     ):
         return False, None
 

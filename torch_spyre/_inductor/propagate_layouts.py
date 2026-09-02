@@ -442,9 +442,12 @@ def _single_arg_op_layout(
     origin_node = next(iter(data.origins))
     aten_op = origin_node.target
     match aten_op:
-        case prims.convert_element_type.default | aten.copy.default if (
-            output.dtype != torch.bool
-            and stl.elems_per_stick() != get_elem_in_stick(output.dtype)
+        case (
+            prims.convert_element_type.default
+            | aten.copy.default
+            | torch.ops.spyre.to_dtype_d2d.default
+        ) if output.dtype != torch.bool and stl.elems_per_stick() != get_elem_in_stick(
+            output.dtype
         ):
             # Type conversion may require padding when input has padding due to stick
             # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
@@ -504,9 +507,7 @@ def _single_arg_op_layout(
                         )
                         if target_stl is None:
                             continue
-                        candidate = rescale_stl_for_dtype(
-                            target_stl, output.dtype, fmt
-                        )
+                        candidate = rescale_stl_for_dtype(target_stl, output.dtype, fmt)
                         if candidate not in layouts:
                             layouts.append(candidate)
 
