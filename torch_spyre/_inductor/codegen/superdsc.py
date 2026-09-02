@@ -1579,9 +1579,7 @@ def _create_sdsc_tensors(
                 # Non-matmul QFP8WT users retain the physical inference.
                 effective_stick = dim_order[-2:]
 
-        if not has_indirect_access and (
-            _is_matmul(op_spec.op) or op_spec.op == CONV2D_FWD_OP
-        ):
+        if not has_indirect_access and _is_matmul(op_spec.op):
             # Matmul tensor roles are semantic and positional: lowering and
             # SpyreKernel always build [INPUT, KERNEL, OUTPUT].  Do not infer
             # them by deduplicating physical layouts.  With squeezed unit M/N

@@ -358,7 +358,18 @@ def _matmul_batch_dim_owners(operand, shape) -> tuple[bool, ...]:
             # symbolic nonzero expression still denotes an owned axis: its
             # runtime value may depend on dynamic extents, but it is not an
             # expand/broadcast stride.
-            owners[dim] = sympy.simplify(strides[dim]) != 0
+            #
+            # A unit-extent broadcast (size 1, stride 0) is physically
+            # indistinguishable from an owned axis at the device level.
+            # Reporting it as unowned would drop its role from the operand's
+            # SDSC arg_dims while keeping it in the iteration space — an
+            # inconsistency that makes the DXP dimension mapper fail.
+            is_broadcast = sympy.simplify(strides[dim]) == 0
+            try:
+                is_unit = int(shape[dim]) == 1
+            except (TypeError, ValueError):
+                is_unit = False
+            owners[dim] = not is_broadcast or is_unit
 
     # TensorBox -> StorageBox -> BaseView is the ordinary representation of an
     # unsqueeze/expand passed to a lowering.  ReinterpretView unwraps nested
@@ -388,7 +399,13 @@ def _matmul_batch_dim_owners(operand, shape) -> tuple[bool, ...]:
                 sympy.simplify(a - b) == 0 for a, b in zip(shape[inserted:], base_shape)
             )
         ):
-            owners[:inserted] = [False] * inserted
+            for d in range(inserted):
+                try:
+                    dim_is_unit = int(shape[d]) == 1
+                except (TypeError, ValueError):
+                    dim_is_unit = False
+                if not dim_is_unit:
+                    owners[d] = False
 
     unresolved = [dim for dim, owner in enumerate(owners) if owner is None]
     if unresolved:
