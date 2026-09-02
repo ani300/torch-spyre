@@ -643,6 +643,30 @@ def _matmul_role_shapes(matmul_operand_shapes, matmul_operand_batch_dim_owners=N
     return iteration_role_shapes, argument_role_shapes
 
 
+def _adjust_matmul_shapes_for_tiling(matmul_operand_shapes, iteration_space):
+    """Replace tiled-away leading batch dims with 1 in operand shapes.
+
+    Coarse-tiling divides a broadcast batch dim to 1-per-tile, then
+    index_vars_squeeze removes it from the iteration space.  The logical
+    operand shapes still carry the full pre-tiling extent.  Replace those
+    leading batch dims with 1 so the role system sees the per-tile view.
+    """
+    iteration_role_shapes, _ = _matmul_role_shapes(matmul_operand_shapes)
+    surviving = sum(1 for _, sz in iteration_role_shapes if not _is_static_one(sz))
+    missing = surviving - len(iteration_space)
+    if missing <= 0:
+        return matmul_operand_shapes
+
+    def trim(shape):
+        trimmed = list(shape)
+        batch_rank = len(shape) - 2
+        for d in range(min(missing, batch_rank)):
+            trimmed[d] = 1
+        return tuple(trimmed)
+
+    return tuple(trim(s) for s in matmul_operand_shapes)
+
+
 def _align_matmul_dim_labels(matmul_operand_shapes, iteration_space) -> list[str]:
     """Align surviving matmul loops with semantic B/M/N/K roles.
 
@@ -1938,8 +1962,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         dim_labels = _align_pool_dim_labels(op_spec.node_output_ranges, ndim)
     elif is_matmul:
         assert op_spec.matmul_operand_shapes is not None
-        dim_labels = _align_matmul_dim_labels(
+        matmul_operand_shapes = _adjust_matmul_shapes_for_tiling(
             op_spec.matmul_operand_shapes, op_spec.iteration_space
+        )
+        dim_labels = _align_matmul_dim_labels(
+            matmul_operand_shapes, op_spec.iteration_space
         )
     else:
         dim_labels = _get_op_dim_labels(ndim, is_matmul, is_conv2d)
@@ -2020,7 +2047,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         assert op_spec.matmul_operand_shapes is not None
         assert op_spec.matmul_operand_batch_dim_owners is not None
         iteration_role_shapes, argument_role_shapes = _matmul_role_shapes(
-            op_spec.matmul_operand_shapes,
+            matmul_operand_shapes,
             op_spec.matmul_operand_batch_dim_owners,
         )
         canonical_dims = tuple(Symbol(role) for role, _size in iteration_role_shapes)

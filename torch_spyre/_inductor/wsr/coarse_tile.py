@@ -5772,7 +5772,7 @@ def _squeezed_retile_dims(
         return []
 
     consumer_ranges = tuple(consumer.data.ranges)
-    if len(consumer_ranges) != len(info.new_size):
+    if len(consumer_ranges) < len(info.new_size):
         raise Unsupported(
             "coarse_tile: cannot restore dimensions squeezed from a retiled "
             "producer through a rank-changing consumer view; "
