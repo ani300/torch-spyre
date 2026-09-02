@@ -19,16 +19,16 @@ from unittest.mock import patch
 import regex as re
 import sympy
 import torch
-from torch.testing import FileCheck
 from torch._inductor.exc import InductorError
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import (
     run_and_get_code,
 )
+from torch._inductor.virtualized import V
+from torch.testing import FileCheck
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config
-from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.codegen.compute_ops import (
     SymbolKind,
     _per_core_symbolic_dim_info,
@@ -36,12 +36,23 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _tensor_has_symbolic_split,
 )
 from torch_spyre._inductor.codegen.superdsc import (
+    _align_matmul_dim_labels,
     _align_pool_dim_labels,
+    _matmul_role_shapes,
     _resolve_sdsc_size,
     compile_op_spec,
+    parse_op_spec,
 )
+from torch_spyre._inductor.constants import MATMUL_OPERANDS_INFO_KEY
 from torch_spyre._inductor.core_mapping import derive_operation_mapping
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.lowering import lower_bmm, lower_mm, lower_scaled_mm
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
+from torch_spyre._inductor.op_spec_validation import validate_op_specs
+from torch_spyre._inductor.spyre_kernel import (
+    _matmul_destination_shapes,
+    simplify_op_spec,
+)
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
     _effective_size,
@@ -482,6 +493,1242 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
         for stage in ("ss_", "el_"):
             sym_info = dsc["dataStageParam_"]["0"][stage]["symbolicDimInfo_"]
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
+
+
+class TestMatmulLoweringMetadata(InductorTestCase):
+    @staticmethod
+    def _fake_tensor(name, shape, dtype, stride=None):
+        def get_stride():
+            if stride is None:
+                raise NotImplementedError
+            return stride
+
+        return SimpleNamespace(
+            name=name,
+            shape=list(shape),
+            realize=lambda: None,
+            make_loader=lambda: lambda _indices: None,
+            get_size=lambda: list(shape),
+            get_stride=get_stride,
+            get_dtype=lambda: dtype,
+            get_device=lambda: torch.device("cpu"),
+            get_name=lambda: name,
+        )
+
+    def _captured_reduction(self, lowering_fn, lhs, rhs):
+        captured = {}
+
+        def create(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(realize=lambda: None)
+
+        with patch(
+            "torch_spyre._inductor.lowering.SpyreReduction.create",
+            side_effect=create,
+        ):
+            # Bypass Inductor's registration wrappers: they validate that the
+            # mocked return is real IR, while this test intentionally captures
+            # only the arguments passed to SpyreReduction.create.  lower_bmm
+            # has two registration decorators, so unwrap to the original
+            # implementation rather than peeling a single layer.
+            while hasattr(lowering_fn, "__wrapped__"):
+                lowering_fn = lowering_fn.__wrapped__
+            lowering_fn(lhs, rhs)
+        return captured
+
+    def test_all_matmul_lowerings_preserve_ordered_logical_operands(self):
+        symbolic_batch = sympy.Symbol("s0", integer=True, positive=True)
+        cases = (
+            (
+                lower_mm,
+                self._fake_tensor(
+                    "lhs_mm",
+                    (symbolic_batch, 4, 128),
+                    torch.float16,
+                    stride=(512, 128, 1),
+                ),
+                self._fake_tensor("rhs_mm", (128, 64), torch.float16),
+                (symbolic_batch, 4, 64),
+            ),
+            (
+                lower_bmm,
+                self._fake_tensor(
+                    "lhs_bmm", (2, 4, 128), torch.float16, stride=(512, 128, 1)
+                ),
+                self._fake_tensor(
+                    "rhs_bmm", (2, 128, 64), torch.float16, stride=(8192, 64, 1)
+                ),
+                (2, 4, 64),
+            ),
+            (
+                lower_scaled_mm,
+                self._fake_tensor("lhs_fp8", (4, 128), torch.float8_e4m3fn),
+                self._fake_tensor("rhs_fp8", (128, 64), torch.float8_e4m3fn),
+                (4, 64),
+            ),
+        )
+
+        for lowering_fn, lhs, rhs, output_shape in cases:
+            with self.subTest(lowering=lowering_fn.__name__):
+                captured = self._captured_reduction(lowering_fn, lhs, rhs)
+                metadata = captured["op_info"][MATMUL_OPERANDS_INFO_KEY]
+                self.assertEqual(
+                    metadata["shapes"],
+                    (tuple(lhs.shape), tuple(rhs.shape), output_shape),
+                )
+                self.assertEqual(
+                    metadata["batch_dim_owners"],
+                    (
+                        (True,) * max(0, len(lhs.shape) - 2),
+                        (True,) * max(0, len(rhs.shape) - 2),
+                    ),
+                )
+
+    def test_lowering_rejects_inconsistent_matmul_contracts(self):
+        invalid_cases = (
+            (
+                self._fake_tensor("lhs", (4, 64, 64, 128), torch.float16),
+                self._fake_tensor("rhs", (1, 4, 128, 64), torch.float16),
+            ),
+            (
+                self._fake_tensor("lhs", (2, 4, 128), torch.float16),
+                self._fake_tensor("rhs", (2, 64, 32), torch.float16),
+            ),
+        )
+
+        for lhs, rhs in invalid_cases:
+            with (
+                self.subTest(lhs=lhs.shape, rhs=rhs.shape),
+                self.assertRaisesRegex(Unsupported, "invalid matmul contract"),
+            ):
+                self._captured_reduction(lower_bmm, lhs, rhs)
+
+    def test_lowering_records_zero_stride_batch_ownership(self):
+        lhs = self._fake_tensor(
+            "lhs",
+            (4, 67, 256),
+            torch.float16,
+            stride=(67 * 256, 256, 1),
+        )
+        rhs = self._fake_tensor(
+            "rhs",
+            (4, 256, 128),
+            torch.float16,
+            stride=(0, 128, 1),
+        )
+
+        captured = self._captured_reduction(lower_bmm, lhs, rhs)
+
+        self.assertEqual(
+            captured["op_info"][MATMUL_OPERANDS_INFO_KEY]["batch_dim_owners"],
+            ((True,), (False,)),
+        )
+
+    def test_destination_shape_accounts_for_coarse_tiling(self):
+        full_shape = (1, 32, 64, 64)
+        ir_node = SimpleNamespace(
+            loop_info=SimpleNamespace(
+                loop_count=(2, 4),
+                loop_tiled_dims=((1,), (1, 2)),
+            )
+        )
+
+        self.assertEqual(
+            _matmul_destination_shapes(full_shape, ir_node),
+            ((1, 4, 16, 64),),
+        )
+        self.assertEqual(
+            _matmul_destination_shapes(full_shape, ir_node, is_mutation_alias=True),
+            (full_shape, (1, 4, 16, 64)),
+        )
+
+
+class TestMatmulTensorRoleLabels(InductorTestCase):
+    def _make_matmul_spec(
+        self,
+        operand_shapes,
+        observed_dim_orders,
+        *,
+        fp8_kernel=False,
+        batch_dim_owners=None,
+    ):
+        """Build a host-only OpSpec with selected live physical dimensions."""
+        output_shape = operand_shapes[-1]
+        if batch_dim_owners is None:
+            batch_dim_owners = tuple(
+                (True,) * max(0, len(shape) - 2) for shape in operand_shapes[:2]
+            )
+        labels = ["ki", "kj", "y", "x", "mb", "out", "in"][-(len(output_shape) + 1) :]
+        output_roles = tuple(labels[:-1])
+        batch_roles = output_roles[:-2]
+        m_role, n_role = output_roles[-2:]
+        k_role = labels[-1]
+
+        def roles_for(shape, tail):
+            batch_rank = len(shape) - 2
+            return batch_roles[-batch_rank:] + tail if batch_rank else tail
+
+        argument_roles = (
+            roles_for(operand_shapes[0], (m_role, k_role)),
+            roles_for(operand_shapes[1], (k_role, n_role)),
+            output_roles,
+        )
+        iteration_role_sizes = tuple(zip(output_roles, output_shape)) + (
+            (k_role, operand_shapes[0][-1]),
+        )
+        raw_symbols = {
+            role: sympy.Symbol(f"d{idx}")
+            for idx, (role, size) in enumerate(iteration_role_sizes)
+            if int(size) != 1
+        }
+        iteration_space = {
+            raw_symbols[role]: (sympy.Integer(size), 1)
+            for role, size in iteration_role_sizes
+            if int(size) != 1
+        }
+
+        args = []
+        semantic_sticks = (k_role, n_role, n_role)
+        for idx, (shape, roles, observed_order, stick_role) in enumerate(
+            zip(
+                operand_shapes,
+                argument_roles,
+                observed_dim_orders,
+                semantic_sticks,
+            )
+        ):
+            role_sizes = dict(zip(roles, shape))
+            coordinates = [raw_symbols[role] for role in reversed(observed_order)]
+            coordinates.append(
+                raw_symbols[stick_role]
+                if int(role_sizes[stick_role]) != 1
+                else sympy.S.Zero
+            )
+            device_size = [
+                max(1, int(role_sizes[role])) for role in reversed(observed_order)
+            ] + [128 if fp8_kernel and idx == 1 else 64]
+            args.append(
+                TensorArg(
+                    is_input=idx < 2,
+                    arg_index=idx,
+                    device_dtype=(
+                        DataFormats.SEN143_FP8
+                        if fp8_kernel and idx < 2
+                        else DataFormats.SEN169_FP16
+                    ),
+                    device_size=device_size,
+                    device_coordinates=coordinates,
+                    allocation={"hbm": idx},
+                    element_arrangement=(
+                        ElementArrangement.QFP8WT
+                        if fp8_kernel and idx == 1
+                        else ElementArrangement.STANDARD
+                    ),
+                )
+            )
+
+        return OpSpec(
+            op="batchmatmulfp8" if fp8_kernel else "batchmatmul",
+            is_reduction=True,
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
+            args=args,
+            op_info={},
+            matmul_operand_shapes=tuple(
+                tuple(sympy.Integer(dim) for dim in shape) for shape in operand_shapes
+            ),
+            matmul_operand_batch_dim_owners=batch_dim_owners,
+        )
+
+    def _factorize_physical_axis(self, spec, symbol, first_factor):
+        extent = int(spec.iteration_space[symbol][0])
+        self.assertEqual(extent % first_factor, 0)
+        second_factor = extent // first_factor
+        replacements = 0
+        for arg in spec.args:
+            for dim, (size, coordinate) in enumerate(
+                zip(arg.device_size, arg.device_coordinates)
+            ):
+                if coordinate != symbol:
+                    continue
+                self.assertEqual(int(size), extent)
+                arg.device_size[dim : dim + 1] = [first_factor, second_factor]
+                arg.device_coordinates[dim : dim + 1] = [
+                    sympy.Mod(symbol, first_factor),
+                    sympy.floor(symbol / first_factor),
+                ]
+                replacements += 1
+                break
+        return replacements
+
+    @staticmethod
+    def _matmul_layout_orders(sdsc_spec):
+        return [
+            [str(dim) for dim in sdsc_spec.layouts[arg.layout]["dim_order"]]
+            for arg in sdsc_spec.args
+        ]
+
+    @staticmethod
+    def _matmul_stick_orders(sdsc_spec):
+        return [
+            [str(dim) for dim in sdsc_spec.layouts[arg.layout]["stick_dim_order"]]
+            for arg in sdsc_spec.args
+        ]
+
+    def test_role_reconstruction_rejects_inconsistent_shapes(self):
+        invalid_shapes = (
+            (
+                (4, 64, 64, 128),
+                (1, 4, 128, 64),
+                (1, 4, 64, 64),
+            ),
+            (
+                (1, 64, 32, 128),
+                (4096, 4096),
+                (1, 64, 4096),
+            ),
+        )
+
+        for shapes in invalid_shapes:
+            with self.subTest(shapes=shapes):
+                symbolic_shapes = tuple(
+                    tuple(sympy.Integer(dim) for dim in shape) for shape in shapes
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "invalid matmul operand/output contract"
+                ):
+                    _matmul_role_shapes(symbolic_shapes)
+
+    def test_batch_ownership_rank_is_validated(self):
+        malformed = self._make_matmul_spec(
+            ((4, 67, 256), (4, 256, 128), (4, 67, 128)),
+            (("x", "in", "mb"), ("in", "out"), ("x", "out", "mb")),
+            batch_dim_owners=((True,), ()),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "invalid matmul operand batch-dimension ownership"
+        ):
+            parse_op_spec(malformed)
+
+    def test_parse_rejects_incomplete_matmul_semantics(self):
+        cases = (
+            (None, ((True,), (False,))),
+            (
+                (
+                    (sympy.Integer(1), sympy.Integer(1), sympy.Integer(4096)),
+                    (sympy.Integer(1), sympy.Integer(4096), sympy.Integer(4096)),
+                    (sympy.Integer(1), sympy.Integer(1), sympy.Integer(4096)),
+                ),
+                None,
+            ),
+            (None, None),
+        )
+        for shapes, owners in cases:
+            with self.subTest(shapes=shapes, owners=owners):
+                malformed = self._make_matmul_spec(
+                    (
+                        (1, 1, 4096),
+                        (1, 4096, 4096),
+                        (1, 1, 4096),
+                    ),
+                    (("in",), ("in", "out"), ("out",)),
+                    batch_dim_owners=((True,), (False,)),
+                )
+                malformed.matmul_operand_shapes = shapes
+                malformed.matmul_operand_batch_dim_owners = owners
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "requires authoritative matmul_operand_shapes and "
+                    "matmul_operand_batch_dim_owners",
+                ):
+                    parse_op_spec(malformed)
+
+    def test_alignment_uses_logical_roles_not_post_tiling_extents(self):
+        shapes = (
+            (sympy.Integer(1), sympy.Integer(1), sympy.Integer(4096)),
+            (sympy.Integer(1), sympy.Integer(4096), sympy.Integer(4096)),
+            (sympy.Integer(1), sympy.Integer(1), sympy.Integer(4096)),
+        )
+        iteration_space = {
+            sympy.Symbol("d0"): (sympy.Integer(1), 1),
+            sympy.Symbol("d1"): (sympy.Integer(1), 1),
+        }
+
+        self.assertEqual(
+            _align_matmul_dim_labels(shapes, iteration_space),
+            ["out", "in"],
+        )
+
+    def test_alignment_rejects_factorized_logical_role(self):
+        shapes = (
+            (sympy.Integer(1), sympy.Integer(1), sympy.Integer(4096)),
+            (sympy.Integer(1), sympy.Integer(4096), sympy.Integer(4096)),
+            (sympy.Integer(1), sympy.Integer(1), sympy.Integer(4096)),
+        )
+        factorized_k_space = {
+            sympy.Symbol("c0"): (sympy.Integer(4096), 32),
+            sympy.Symbol("c1"): (sympy.Integer(128), 1),
+            sympy.Symbol("z0"): (sympy.Integer(32), 1),
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "must contain exactly the ordered non-unit logical roles",
+        ):
+            _align_matmul_dim_labels(shapes, factorized_k_space)
+
+    def test_prefill_simplification_restores_squeezed_batch_role(self):
+        """Preserve the physical slot of the squeezed batch role in QK."""
+        d0, d1, d2, d3 = sympy.symbols("d0 d1 d2 d3")
+        args = [
+            TensorArg(
+                is_input=True,
+                arg_index=18,
+                device_dtype=DataFormats.SEN169_FP16,
+                device_size=[64, 64, 2, 4, 64],
+                device_coordinates=[
+                    d1,
+                    sympy.S.Zero,
+                    sympy.floor(d3 / 64),
+                    d0,
+                    sympy.Mod(d3, 64),
+                ],
+                allocation={"hbm": 18},
+            ),
+            TensorArg(
+                is_input=True,
+                arg_index=17,
+                device_dtype=DataFormats.SEN169_FP16,
+                device_size=[4, 128, 64],
+                device_coordinates=[
+                    d0,
+                    d3,
+                    sympy.Mod(d2, 64),
+                ],
+                allocation={"hbm": 17},
+            ),
+            TensorArg(
+                is_input=False,
+                arg_index=-1,
+                device_dtype=DataFormats.SEN169_FP16,
+                device_size=[4, 64, 64],
+                device_coordinates=[
+                    d0,
+                    d1,
+                    sympy.Mod(d2, 64),
+                ],
+                allocation={"lx": 0},
+            ),
+        ]
+        spec = OpSpec(
+            op="batchmatmul",
+            is_reduction=True,
+            iteration_space={
+                d0: (sympy.Integer(4), 1),
+                d1: (sympy.Integer(64), 32),
+                d2: (sympy.Integer(64), 1),
+                d3: (sympy.Integer(128), 1),
+            },
+            args=args,
+            op_info={},
+            matmul_operand_shapes=(
+                tuple(map(sympy.Integer, (1, 32, 64, 128))),
+                tuple(map(sympy.Integer, (1, 32, 128, 64))),
+                tuple(map(sympy.Integer, (1, 32, 64, 64))),
+            ),
+            matmul_operand_batch_dim_owners=((True, True), (True, True)),
+        )
+
+        with V.set_graph_handler(SimpleNamespace()):
+            simplify_op_spec(spec)
+
+        validate_op_specs([spec], stage="after_simplification")
+
+        self.assertEqual(list(spec.iteration_space), [d0, d1, d2, d3])
+        y_role = sympy.Symbol("y")
+        self.assertTrue(
+            all(
+                coordinate.free_symbols <= {d0, d1, d2, d3, y_role}
+                for arg in spec.args
+                for coordinate in arg.device_coordinates
+            )
+        )
+        self.assertTrue(
+            all(
+                any(
+                    y_role in coordinate.free_symbols
+                    for coordinate in arg.device_coordinates
+                )
+                for arg in spec.args
+            ),
+            "the physical placeholder shared by lhs/rhs/output must retain the "
+            "canonical unit batch role",
+        )
+        self.assertEqual(
+            _align_matmul_dim_labels(spec.matmul_operand_shapes, spec.iteration_space),
+            ["x", "mb", "out", "in"],
+        )
+
+        sdsc_spec, _ = parse_op_spec(spec)
+        self.assertEqual(
+            self._matmul_layout_orders(sdsc_spec),
+            [
+                ["x", "in", "y", "mb"],
+                ["in", "x", "y", "out"],
+                ["mb", "x", "y", "out"],
+            ],
+        )
+        self.assertEqual(
+            self._matmul_stick_orders(sdsc_spec),
+            [["in"], ["out"], ["out"]],
+        )
+        self.assertEqual(
+            [
+                {str(dim): gap for dim, gap in arg.backGap.items()}
+                for arg in sdsc_spec.args
+            ],
+            [{"y": 63}, {}, {}],
+        )
+
+    def test_decode_simplification_restores_unique_squeezed_batch_role(self):
+        """Decode B=1/M=1 maps the physical gap only to incidence-proven B."""
+        c0, c1, c2 = sympy.symbols("c0 c1 c2")
+        args = [
+            TensorArg(
+                is_input=True,
+                arg_index=0,
+                device_dtype=DataFormats.SEN169_FP16,
+                device_size=[64, 4, 128],
+                device_coordinates=[sympy.S.Zero, c0, c2],
+                allocation={"hbm": 0},
+            ),
+            TensorArg(
+                is_input=True,
+                arg_index=1,
+                device_dtype=DataFormats.SEN169_FP16,
+                device_size=[1, 4, 128, 64],
+                device_coordinates=[sympy.S.Zero, c0, c2, c1],
+                allocation={"hbm": 1},
+            ),
+            TensorArg(
+                is_input=False,
+                arg_index=2,
+                device_dtype=DataFormats.SEN169_FP16,
+                device_size=[1, 4, 64],
+                device_coordinates=[sympy.S.Zero, c0, c1],
+                allocation={"hbm": 2},
+            ),
+        ]
+        spec = OpSpec(
+            op="batchmatmul",
+            is_reduction=True,
+            iteration_space={
+                c0: (sympy.Integer(4), 4),
+                c1: (sympy.Integer(64), 1),
+                c2: (sympy.Integer(128), 2),
+            },
+            args=args,
+            op_info={},
+            matmul_operand_shapes=(
+                tuple(map(sympy.Integer, (1, 32, 1, 128))),
+                tuple(map(sympy.Integer, (1, 32, 128, 64))),
+                tuple(map(sympy.Integer, (1, 32, 1, 64))),
+            ),
+            matmul_operand_batch_dim_owners=((True, True), (True, True)),
+        )
+
+        with V.set_graph_handler(SimpleNamespace()):
+            simplify_op_spec(spec)
+
+        validate_op_specs([spec], stage="after_simplification")
+
+        y_role = sympy.Symbol("y")
+        mb_role = sympy.Symbol("mb")
+        self.assertEqual(list(spec.iteration_space), [c0, c1, c2])
+        self.assertTrue(
+            all(
+                any(
+                    y_role in coordinate.free_symbols
+                    for coordinate in arg.device_coordinates
+                )
+                for arg in spec.args
+            )
+        )
+        self.assertTrue(
+            all(
+                mb_role not in coordinate.free_symbols
+                for arg in spec.args
+                for coordinate in arg.device_coordinates
+            ),
+            "the all-operand physical gap must map to B, not the lhs/output-only M",
+        )
+
+        sdsc_spec, _ = parse_op_spec(spec)
+        self.assertEqual(
+            self._matmul_layout_orders(sdsc_spec),
+            [
+                ["x", "y", "in", "mb"],
+                ["in", "x", "y", "out"],
+                ["x", "y", "out", "mb"],
+            ],
+        )
+        self.assertEqual(
+            self._matmul_stick_orders(sdsc_spec),
+            [["in"], ["out"], ["out"]],
+        )
+        self.assertEqual(
+            [
+                {str(dim): gap for dim, gap in arg.backGap.items()}
+                for arg in sdsc_spec.args
+            ],
+            [{"y": 63}, {}, {}],
+        )
+
+    def test_simplification_rejects_ambiguous_squeezed_batch_role(self):
+        """Two all-operand unit batch roles cannot be assigned positionally."""
+        m, n, k = sympy.symbols("m n k")
+        spec = OpSpec(
+            op="batchmatmul",
+            is_reduction=True,
+            iteration_space={
+                m: (sympy.Integer(4), 1),
+                n: (sympy.Integer(64), 1),
+                k: (sympy.Integer(128), 1),
+            },
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[64, 4, 128],
+                    device_coordinates=[sympy.S.Zero, m, k],
+                    allocation={"hbm": 0},
+                ),
+                TensorArg(
+                    is_input=True,
+                    arg_index=1,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[1, 128, 64],
+                    device_coordinates=[sympy.S.Zero, k, n],
+                    allocation={"hbm": 1},
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=2,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[1, 4, 64],
+                    device_coordinates=[sympy.S.Zero, m, n],
+                    allocation={"hbm": 2},
+                ),
+            ],
+            op_info={},
+            matmul_operand_shapes=(
+                tuple(map(sympy.Integer, (1, 1, 4, 128))),
+                tuple(map(sympy.Integer, (1, 1, 128, 64))),
+                tuple(map(sympy.Integer, (1, 1, 4, 64))),
+            ),
+            matmul_operand_batch_dim_owners=((True, True), (True, True)),
+        )
+
+        with (
+            V.set_graph_handler(SimpleNamespace()),
+            self.assertRaisesRegex(
+                Unsupported,
+                r"cannot map synthetic unit axis .* candidates are \['x', 'y'\]",
+            ),
+        ):
+            simplify_op_spec(spec)
+
+    def test_simplification_maps_unit_m_only_to_owning_operands(self):
+        """Pre-broadcast provenance restores M on lhs/output, never rhs."""
+        x, n, k = sympy.symbols("x n k")
+        spec = OpSpec(
+            op="batchmatmul",
+            is_reduction=True,
+            iteration_space={
+                x: (sympy.Integer(2), 1),
+                n: (sympy.Integer(64), 1),
+                k: (sympy.Integer(128), 1),
+            },
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[2, 64, 128],
+                    device_coordinates=[x, sympy.S.Zero, k],
+                    allocation={"hbm": 0},
+                ),
+                TensorArg(
+                    is_input=True,
+                    arg_index=1,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[2, 128, 64],
+                    device_coordinates=[x, k, n],
+                    allocation={"hbm": 1},
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=2,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[2, 64, 64],
+                    device_coordinates=[x, sympy.S.Zero, n],
+                    allocation={"hbm": 2},
+                ),
+            ],
+            op_info={},
+            matmul_operand_shapes=(
+                tuple(map(sympy.Integer, (2, 1, 128))),
+                tuple(map(sympy.Integer, (2, 128, 64))),
+                tuple(map(sympy.Integer, (2, 1, 64))),
+            ),
+            matmul_operand_batch_dim_owners=((True,), (True,)),
+        )
+
+        with V.set_graph_handler(SimpleNamespace()):
+            simplify_op_spec(spec)
+
+        validate_op_specs([spec], stage="after_simplification")
+
+        m_role = sympy.Symbol("mb")
+        self.assertEqual(
+            [
+                any(
+                    m_role in coordinate.free_symbols
+                    for coordinate in arg.device_coordinates
+                )
+                for arg in spec.args
+            ],
+            [True, False, True],
+        )
+        sdsc_spec, _ = parse_op_spec(spec)
+        self.assertEqual(
+            self._matmul_layout_orders(sdsc_spec),
+            [["mb", "x", "in"], ["in", "x", "out"], ["mb", "x", "out"]],
+        )
+
+    def test_simplification_drops_padding_only_synthetic_axis(self):
+        """A physical gap with no static-unit logical role remains padding."""
+        x, m, n, k = sympy.symbols("x m n k")
+
+        def tensor(is_input, index, size, coordinates):
+            return TensorArg(
+                is_input=is_input,
+                arg_index=index,
+                device_dtype=DataFormats.SEN169_FP16,
+                device_size=size,
+                device_coordinates=coordinates,
+                allocation={"hbm": index},
+            )
+
+        spec = OpSpec(
+            op="batchmatmul",
+            is_reduction=True,
+            iteration_space={
+                x: (sympy.Integer(2), 1),
+                m: (sympy.Integer(4), 1),
+                n: (sympy.Integer(64), 1),
+                k: (sympy.Integer(128), 1),
+            },
+            args=[
+                tensor(True, 0, [64, 2, 4, 128], [sympy.S.Zero, x, m, k]),
+                tensor(True, 1, [1, 2, 128, 64], [sympy.S.Zero, x, k, n]),
+                tensor(False, 2, [1, 2, 4, 64], [sympy.S.Zero, x, m, n]),
+            ],
+            op_info={},
+            matmul_operand_shapes=tuple(
+                tuple(map(sympy.Integer, shape))
+                for shape in ((2, 4, 128), (2, 128, 64), (2, 4, 64))
+            ),
+            matmul_operand_batch_dim_owners=((True,), (True,)),
+        )
+
+        with V.set_graph_handler(SimpleNamespace()):
+            simplify_op_spec(spec)
+
+        validate_op_specs([spec], stage="after_simplification")
+        self.assertEqual(list(spec.iteration_space), [x, m, n, k])
+        self.assertFalse(
+            any(
+                str(symbol).startswith("z")
+                for arg in spec.args
+                for coordinate in arg.device_coordinates
+                for symbol in coordinate.free_symbols
+            )
+        )
+
+    def test_simplification_rejects_gap_from_nonowning_operand(self):
+        """A rhs-only gap cannot be relabeled as lhs/output-only unit M."""
+        x, n, k = sympy.symbols("x n k")
+        spec = OpSpec(
+            op="batchmatmul",
+            is_reduction=True,
+            iteration_space={
+                x: (sympy.Integer(2), 1),
+                n: (sympy.Integer(64), 1),
+                k: (sympy.Integer(128), 1),
+            },
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[2, 128],
+                    device_coordinates=[x, k],
+                    allocation={"hbm": 0},
+                ),
+                TensorArg(
+                    is_input=True,
+                    arg_index=1,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[2, 64, 128, 64],
+                    device_coordinates=[x, sympy.S.Zero, k, n],
+                    allocation={"hbm": 1},
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=2,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[2, 64],
+                    device_coordinates=[x, n],
+                    allocation={"hbm": 2},
+                ),
+            ],
+            op_info={},
+            matmul_operand_shapes=(
+                tuple(map(sympy.Integer, (2, 1, 128))),
+                tuple(map(sympy.Integer, (2, 128, 64))),
+                tuple(map(sympy.Integer, (2, 1, 64))),
+            ),
+            matmul_operand_batch_dim_owners=((True,), (True,)),
+        )
+
+        with (
+            V.set_graph_handler(SimpleNamespace()),
+            self.assertRaisesRegex(
+                Unsupported,
+                r"from tensor\(s\) \[1\].*candidates are \[\]",
+            ),
+        ):
+            simplify_op_spec(spec)
+
+    def test_simplification_validates_full_matmul_contract(self):
+        malformed = self._make_matmul_spec(
+            ((4, 128), (128, 64), (4, 64)),
+            (("in", "mb"), ("in", "out"), ("out", "mb")),
+        )
+        malformed.matmul_operand_shapes = 42
+
+        with self.assertRaisesRegex(
+            Unsupported, "invalid authoritative matmul metadata"
+        ):
+            simplify_op_spec(malformed)
+
+    def test_fp8_simplification_restores_unit_k_by_provenance(self):
+        x, m, n = sympy.symbols("x m n")
+        spec = OpSpec(
+            op="batchmatmulfp8",
+            is_reduction=True,
+            iteration_space={
+                x: (sympy.Integer(2), 1),
+                m: (sympy.Integer(4), 1),
+                n: (sympy.Integer(64), 1),
+            },
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.SEN143_FP8,
+                    device_size=[2, 4, 128],
+                    device_coordinates=[x, m, sympy.S.Zero],
+                    allocation={"hbm": 0},
+                ),
+                TensorArg(
+                    is_input=True,
+                    arg_index=1,
+                    device_dtype=DataFormats.SEN143_FP8,
+                    device_size=[2, 128, 128],
+                    device_coordinates=[x, sympy.S.Zero, n],
+                    allocation={"hbm": 1},
+                    element_arrangement=ElementArrangement.QFP8WT,
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=2,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[2, 4, 64],
+                    device_coordinates=[x, m, n],
+                    allocation={"hbm": 2},
+                ),
+            ],
+            op_info={},
+            matmul_operand_shapes=(
+                tuple(map(sympy.Integer, (2, 4, 1))),
+                tuple(map(sympy.Integer, (2, 1, 64))),
+                tuple(map(sympy.Integer, (2, 4, 64))),
+            ),
+            matmul_operand_batch_dim_owners=((True,), (True,)),
+        )
+
+        with V.set_graph_handler(SimpleNamespace()):
+            simplify_op_spec(spec)
+
+        k_role = sympy.Symbol("in")
+        self.assertEqual(
+            [
+                any(
+                    k_role in coordinate.free_symbols
+                    for coordinate in arg.device_coordinates
+                )
+                for arg in spec.args
+            ],
+            [True, True, False],
+        )
+        sdsc_spec, _ = parse_op_spec(spec)
+        self.assertEqual(
+            self._matmul_stick_orders(sdsc_spec),
+            [["in"], ["in", "out"], ["out"]],
+        )
+
+    def test_simplification_refines_factorized_m_with_shared_rhs(self):
+        spec = self._make_matmul_spec(
+            ((8, 64), (64, 64), (8, 64)),
+            (("mb",), ("in",), ("mb",)),
+        )
+        (m, _n, _k) = spec.iteration_space
+        self.assertEqual(self._factorize_physical_axis(spec, m, 4), 2)
+
+        with V.set_graph_handler(SimpleNamespace()):
+            simplify_op_spec(spec)
+
+        validate_op_specs([spec], stage="after_simplification")
+        self.assertEqual(
+            tuple(tuple(map(int, shape)) for shape in spec.matmul_operand_shapes),
+            ((4, 2, 64), (64, 64), (4, 2, 64)),
+        )
+        self.assertEqual(spec.matmul_operand_batch_dim_owners, ((True,), ()))
+        self.assertEqual(
+            _align_matmul_dim_labels(spec.matmul_operand_shapes, spec.iteration_space),
+            ["x", "mb", "out", "in"],
+        )
+
+    def test_simplification_refines_factorized_batch_axis(self):
+        spec = self._make_matmul_spec(
+            ((16, 8, 64), (16, 64, 64), (16, 8, 64)),
+            (
+                ("x", "mb"),
+                ("x", "in"),
+                ("x", "mb"),
+            ),
+        )
+        (batch, _m, _n, _k) = spec.iteration_space
+        self.assertEqual(self._factorize_physical_axis(spec, batch, 8), 3)
+
+        with V.set_graph_handler(SimpleNamespace()):
+            simplify_op_spec(spec)
+
+        validate_op_specs([spec], stage="after_simplification")
+        self.assertEqual(
+            tuple(tuple(map(int, shape)) for shape in spec.matmul_operand_shapes),
+            (
+                (8, 2, 8, 64),
+                (8, 2, 64, 64),
+                (8, 2, 8, 64),
+            ),
+        )
+        self.assertEqual(
+            spec.matmul_operand_batch_dim_owners,
+            ((True, True), (True, True)),
+        )
+        self.assertEqual(
+            _align_matmul_dim_labels(spec.matmul_operand_shapes, spec.iteration_space),
+            ["y", "x", "mb", "out", "in"],
+        )
+
+    def test_simplification_promotes_factorized_m_for_batched_rhs(self):
+        spec = self._make_matmul_spec(
+            ((2, 12, 128), (2, 128, 64), (2, 12, 64)),
+            (
+                ("x", "mb"),
+                ("x", "in"),
+                ("x", "mb"),
+            ),
+        )
+        (_batch, m, _n, _k) = spec.iteration_space
+        self.assertEqual(self._factorize_physical_axis(spec, m, 4), 2)
+
+        with V.set_graph_handler(SimpleNamespace()):
+            simplify_op_spec(spec)
+
+        validate_op_specs([spec], stage="after_simplification")
+        self.assertEqual(
+            tuple(tuple(map(int, shape)) for shape in spec.matmul_operand_shapes),
+            (
+                (2, 4, 3, 128),
+                (2, 4, 128, 64),
+                (2, 4, 3, 64),
+            ),
+        )
+        self.assertEqual(
+            spec.matmul_operand_batch_dim_owners,
+            ((True, True), (True, False)),
+        )
+        self.assertEqual(
+            _align_matmul_dim_labels(spec.matmul_operand_shapes, spec.iteration_space),
+            ["y", "x", "mb", "out", "in"],
+        )
+
+    def test_factorized_m_relabels_leading_static_unit_batch_role(self):
+        spec = self._make_matmul_spec(
+            ((1, 8, 64), (1, 64, 64), (1, 8, 64)),
+            (("mb",), ("in",), ("mb",)),
+            batch_dim_owners=((True,), (True,)),
+        )
+        (m, _n, _k) = spec.iteration_space
+        self.assertEqual(self._factorize_physical_axis(spec, m, 4), 2)
+        for index, arg in enumerate(spec.args):
+            arg.device_size.insert(0, 64 if index == 0 else 1)
+            arg.device_coordinates.insert(0, sympy.S.Zero)
+
+        with V.set_graph_handler(SimpleNamespace()):
+            simplify_op_spec(spec)
+
+        validate_op_specs([spec], stage="after_simplification")
+        self.assertEqual(
+            tuple(tuple(map(int, shape)) for shape in spec.matmul_operand_shapes),
+            (
+                (1, 4, 2, 64),
+                (1, 4, 64, 64),
+                (1, 4, 2, 64),
+            ),
+        )
+        self.assertEqual(
+            spec.matmul_operand_batch_dim_owners,
+            ((True, True), (True, False)),
+        )
+        y_role = sympy.Symbol("y")
+        x_role = sympy.Symbol("x")
+        self.assertTrue(
+            all(
+                any(
+                    y_role in coordinate.free_symbols
+                    for coordinate in arg.device_coordinates
+                )
+                for arg in spec.args
+            )
+        )
+        self.assertTrue(
+            all(
+                x_role not in coordinate.free_symbols
+                for arg in spec.args
+                for coordinate in arg.device_coordinates
+            )
+        )
+
+    def test_simplification_preserves_non_unit_factorization(self):
+        """A normalization-created radix digit remains visible and rejected."""
+        n, k = sympy.symbols("n k")
+        spec = OpSpec(
+            op="batchmatmul",
+            is_reduction=True,
+            iteration_space={
+                n: (sympy.Integer(4096), 32),
+                k: (sympy.Integer(4096), 1),
+            },
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=0,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[1, 4096],
+                    device_coordinates=[sympy.S.Zero, k],
+                    allocation={"hbm": 0},
+                ),
+                TensorArg(
+                    is_input=True,
+                    arg_index=1,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[32, 2, 128, 4096],
+                    device_coordinates=[
+                        sympy.floor(k / 128),
+                        sympy.S.Zero,
+                        sympy.Mod(k, 128),
+                        n,
+                    ],
+                    allocation={"hbm": 1},
+                ),
+                TensorArg(
+                    is_input=False,
+                    arg_index=2,
+                    device_dtype=DataFormats.SEN169_FP16,
+                    device_size=[1, 4096],
+                    device_coordinates=[sympy.S.Zero, n],
+                    allocation={"hbm": 2},
+                ),
+            ],
+            op_info={},
+            matmul_operand_shapes=(
+                tuple(map(sympy.Integer, (1, 1, 4096))),
+                tuple(map(sympy.Integer, (1, 4096, 4096))),
+                tuple(map(sympy.Integer, (1, 1, 4096))),
+            ),
+            matmul_operand_batch_dim_owners=((True,), (True,)),
+        )
+
+        with V.set_graph_handler(SimpleNamespace()):
+            simplify_op_spec(spec)
+
+        self.assertEqual(
+            [int(size) for size, _split in spec.iteration_space.values()],
+            [4096, 128, 32],
+        )
+        with self.assertRaisesRegex(
+            ValueError, "must contain exactly the ordered non-unit logical roles"
+        ):
+            _align_matmul_dim_labels(spec.matmul_operand_shapes, spec.iteration_space)
+
+    def test_decode_projection_keeps_equal_n_k_roles_positional(self):
+        """Equal N/K extents cannot make the lhs acquire the output-N role."""
+        spec = self._make_matmul_spec(
+            (
+                (1, 1, 4096),
+                (1, 4096, 4096),
+                (1, 1, 4096),
+            ),
+            (("in",), ("in", "out"), ("out",)),
+            batch_dim_owners=((True,), (False,)),
+        )
+
+        sdsc_spec, _ = parse_op_spec(spec)
+
+        self.assertEqual(
+            [str(dim) for dim in sdsc_spec.iteration_space],
+            ["x", "mb", "out", "in"],
+        )
+        self.assertEqual(
+            self._matmul_layout_orders(sdsc_spec),
+            [
+                ["in", "mb", "x"],
+                ["in", "out"],
+                ["out", "mb", "x"],
+            ],
+        )
+        self.assertNotIn(
+            "out",
+            self._matmul_layout_orders(sdsc_spec)[0],
+            "projection lhs incorrectly acquired the equal-sized N role",
+        )
+
+    def test_role_matrix(self):
+        """Logical roles survive rank, broadcast, unit-axis, and FP8 variants."""
+        cases = (
+            (
+                "rank2",
+                ((4, 128), (128, 64), (4, 64)),
+                (("in", "mb"), ("in", "out"), ("out", "mb")),
+                [["in", "mb"], ["in", "out"], ["out", "mb"]],
+                None,
+                False,
+            ),
+            (
+                "rank3_shared_rhs",
+                ((2, 4, 128), (128, 64), (2, 4, 64)),
+                (("x", "in", "mb"), ("in", "out"), ("x", "out", "mb")),
+                [["x", "in", "mb"], ["in", "out"], ["x", "out", "mb"]],
+                None,
+                False,
+            ),
+            (
+                "rank3_batched",
+                ((2, 4, 128), (2, 128, 64), (2, 4, 64)),
+                (
+                    ("x", "in", "mb"),
+                    ("x", "out", "in"),
+                    ("x", "out", "mb"),
+                ),
+                [
+                    ["x", "in", "mb"],
+                    ["x", "out", "in"],
+                    ["x", "out", "mb"],
+                ],
+                None,
+                False,
+            ),
+            (
+                "rank3_broadcast_rhs",
+                ((4, 67, 256), (4, 256, 128), (4, 67, 128)),
+                (("x", "in", "mb"), ("in", "out"), ("x", "out", "mb")),
+                [["x", "in", "mb"], ["in", "out"], ["x", "out", "mb"]],
+                ((True,), (False,)),
+                False,
+            ),
+            (
+                "unit_m_and_n",
+                ((1, 1, 128), (1, 128, 1), (1, 1, 1)),
+                (("in",), ("in",), ()),
+                [
+                    ["in", "mb", "x"],
+                    ["in", "out", "x"],
+                    ["out", "mb", "x"],
+                ],
+                None,
+                False,
+            ),
+            (
+                "unit_k",
+                ((32, 4, 1), (32, 1, 64), (32, 4, 64)),
+                (("x", "mb"), ("x", "out"), ("x", "out", "mb")),
+                [
+                    ["x", "mb", "in"],
+                    ["x", "out", "in"],
+                    ["x", "out", "mb"],
+                ],
+                None,
+                False,
+            ),
+            (
+                "unit_k_qfp8wt",
+                ((4, 1), (1, 64), (4, 64)),
+                (("mb",), ("out",), ("mb", "out")),
+                [["mb", "in"], ["out", "in"], ["mb", "out"]],
+                None,
+                True,
+            ),
+        )
+        for name, shapes, observed, expected, owners, fp8 in cases:
+            with self.subTest(name=name):
+                sdsc_spec, _ = parse_op_spec(
+                    self._make_matmul_spec(
+                        shapes,
+                        observed,
+                        batch_dim_owners=owners,
+                        fp8_kernel=fp8,
+                    )
+                )
+                expected_dims = [
+                    "ki",
+                    "kj",
+                    "y",
+                    "x",
+                    "mb",
+                    "out",
+                    "in",
+                ][-(len(shapes[-1]) + 1) :]
+                self.assertEqual(
+                    [str(dim) for dim in sdsc_spec.iteration_space], expected_dims
+                )
+                self.assertEqual(
+                    [arg.layout for arg in sdsc_spec.args],
+                    ["INPUT", "KERNEL", "OUTPUT"],
+                )
+                self.assertEqual(self._matmul_layout_orders(sdsc_spec), expected)
+                expected_sticks = (
+                    [["in"], ["in", "out"], ["out"]]
+                    if fp8
+                    else [["in"], ["out"], ["out"]]
+                )
+                self.assertEqual(self._matmul_stick_orders(sdsc_spec), expected_sticks)
 
 
 class TestSymbolKindKernelDerivedSymbolic(InductorTestCase):

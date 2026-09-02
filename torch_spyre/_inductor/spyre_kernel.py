@@ -12,40 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
+import logging
+import math
+from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Callable, Self, Sequence, Tuple, Union
-from abc import ABC
-import itertools
 
-import torch
 import sympy
-
-from torch_spyre._C import DataFormats, ElementArrangement
-
+import torch
 from torch._inductor.codegen.common import (
     CSEVariable,
     Kernel,
 )
-from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch._inductor.virtualized import V
 
+from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.provenance import build_debug_handle
 
+from . import config as _spyre_config
 from .constants import (
-    SPYRE_FP32_OPS,
-    SPYRE_INT32_OPS,
+    BATCH_MATMUL_FP8_OP,
+    BATCH_MATMUL_OP,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
+    MATMUL_OPERANDS_INFO_KEY,
     MATMUL_REDUCTION_OPS,
     POOL_OPS,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
+    SPYRE_FP32_OPS,
+    SPYRE_INT32_OPS,
     TWO_INPUT_REDUCTION_OPS,
 )
-from . import config as _spyre_config
 from .core_mapping import (
     derive_operation_mapping,
     finalize_tensor_work_divisions,
@@ -53,38 +57,38 @@ from .core_mapping import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .scratchpad.lx_relayout import work_division_from_view
-from .pass_utils import (
-    AlignmentAccess,
-    build_operation_alignment_inputs,
-    concretize_expr,
-    compute_symbolic_bounds,
-    finite_upper_or_none,
-    iteration_space,
-    iteration_space_with_splits,
-    indirect_access_subs_from_kernel,
-    is_restickify_coords,
-    alignment_coordinates,
-)
-from .views import (
-    AlignmentInputs,
-    align_tensors,
-    align_tensors_pure,
-    tiling_expr_to_device_expr,
-)
 from .logging_utils import get_inductor_logger
 from .op_spec import (
     IndirectAccess,
     LoopSpec,
     OpSpec,
     TensorArg,
-    UnimplementedOp as OpSpecUnimplementedOp,
     format_op_spec_list,
     is_lx_relayout_identity,
 )
+from .op_spec import (
+    UnimplementedOp as OpSpecUnimplementedOp,
+)
 from .op_spec_validation import validate_op_specs
-from torch_spyre._inductor.provenance import build_debug_handle
-import logging
+from .pass_utils import (
+    AlignmentAccess,
+    alignment_coordinates,
+    build_operation_alignment_inputs,
+    compute_symbolic_bounds,
+    concretize_expr,
+    finite_upper_or_none,
+    indirect_access_subs_from_kernel,
+    is_restickify_coords,
+    iteration_space,
+    iteration_space_with_splits,
+)
+from .scratchpad.lx_relayout import work_division_from_view
+from .views import (
+    AlignmentInputs,
+    align_tensors,
+    align_tensors_pure,
+    tiling_expr_to_device_expr,
+)
 
 logger = get_inductor_logger("spyre_kernel")
 
@@ -100,6 +104,58 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
+
+
+def _shape_exprs_equal(lhs: Sequence, rhs: Sequence) -> bool:
+    """Whether two logical shapes are symbolically identical."""
+    if len(lhs) != len(rhs):
+        return False
+    return all(
+        sympy.simplify(lhs_dim - rhs_dim) == 0 for lhs_dim, rhs_dim in zip(lhs, rhs)
+    )
+
+
+def _matmul_destination_shapes(
+    logical_output_shape: Sequence,
+    ir_node,
+    *,
+    is_mutation_alias: bool = False,
+) -> tuple[tuple, ...]:
+    """Return valid full/tiled destination shapes for a matmul write.
+
+    Coarse tiling mutates ``data.ranges`` and ``layout.size`` to the per-tile
+    shape while retaining lowering's full logical matmul metadata.  A mutation
+    write-back can instead expose the full target layout.  Reconstruct the
+    per-tile candidate from the stamped tiling plan; only aliases may use
+    either representation.
+    """
+    full_shape = tuple(logical_output_shape)
+    loop_info = getattr(ir_node, "loop_info", None)
+    if loop_info is None:
+        return (full_shape,)
+    if len(loop_info.loop_count) != len(loop_info.loop_tiled_dims):
+        raise Unsupported(
+            "matmul coarse-tile metadata has mismatched loop-count and "
+            "output-dimension levels"
+        )
+
+    tile_shape = list(full_shape)
+    for count, tiled_dims in zip(loop_info.loop_count, loop_info.loop_tiled_dims):
+        for dim in tiled_dims:
+            if not 0 <= dim < len(tile_shape):
+                raise Unsupported(
+                    f"matmul tiled output dimension {dim} is outside logical "
+                    f"shape {full_shape!r}"
+                )
+            tile_shape[dim] = sympy.simplify(
+                sympy.sympify(tile_shape[dim]) / sympy.sympify(count)
+            )
+    per_tile_shape = tuple(tile_shape)
+    if per_tile_shape == full_shape:
+        return (full_shape,)
+    if is_mutation_alias:
+        return (full_shape, per_tile_shape)
+    return (per_tile_shape,)
 
 
 @dataclass
@@ -455,22 +511,21 @@ class SpyreKernelOpsHandler(DefaultHandler):
 
 def _tile_advance_expr_from_dep(
     dep: MemoryDep,
-    tiled_dim_extents: dict[int, sympy.Expr],
+    tiled_symbol_substitutions: dict[sympy.Symbol, sympy.Expr],
 ) -> sympy.Expr:
     """Element-offset advance of ``dep`` for one step of each tiled dim.
 
-    ``tiled_dim_extents`` maps a host-range positional index (the same
-    indices used in ``loop_tiled_dims`` / ``loop_tiled_reduction_dims``) to
-    the tile extent one loop step advances that dim's ``d{i}`` symbol by
-    (the product of ``loop_count`` for every level tiling that dim).
+    ``tiled_symbol_substitutions`` maps each advancing symbol in ``dep.index``
+    to its value for this tile step.  The caller is responsible for including
+    the tile extent and whichever loop-level symbol should remain in the
+    result.
 
-    Built by substituting, in ``dep.index``, each tiled dim's ``d{dim}``
-    with ``extent * d{dim}`` (staying symbolic in ``d{dim}`` -- the
-    expression is meant to stay unevaluated until a later compilation stage
-    substitutes a concrete tile-index value for each ``d{dim}``) and every
-    other free symbol in ``dep.index`` with ``0`` (dims that never advance:
-    untiled dims, and broadcast dims ``dep`` does not depend on).  Because
-    this is a direct substitution rather than coefficient extraction,
+    Every other free symbol is replaced with ``0`` (dims that never advance:
+    untiled dims, and broadcast dims ``dep`` does not depend on).  The index's
+    value with every loop symbol set to zero is then subtracted: a slice/storage
+    offset selects the window's base address, but is not an amount by which that
+    address advances on every coarse-tile iteration.  Because this is a direct
+    substitution rather than coefficient extraction,
     ``dep.index`` need not be affine in the tiled symbols -- a tiled dim
     wrapped in ``Mod``/``FloorDiv``/``ModularIndexing`` (reshape-split or
     gather/indirect-indexing dims; ``_loop_var_to_ranges_pos`` only checks
@@ -484,14 +539,14 @@ def _tile_advance_expr_from_dep(
     the advance expression any earlier risks reading a stale, not-yet-final
     index.
     """
-    subs = {
-        sympy_index_symbol(f"d{dim}"): extent * sympy_index_symbol(f"d{dim}")
-        for dim, extent in tiled_dim_extents.items()
-    }
+    subs = dict(tiled_symbol_substitutions)
     subs.update(
         {sym: sympy.Integer(0) for sym in dep.index.free_symbols if sym not in subs}
     )
-    return dep.index.subs(subs)
+    base_offset = dep.index.subs(
+        {sym: sympy.Integer(0) for sym in dep.index.free_symbols}
+    )
+    return sympy.expand(dep.index.subs(subs) - base_offset)
 
 
 class SpyreKernel(Kernel[CSEVariable]):
@@ -722,19 +777,13 @@ class SpyreKernel(Kernel[CSEVariable]):
             level_symbol = self._get_or_mint_level_symbol(level_idx, op_name)
             host_expr = sympy.S.Zero
             if dim_extent_pairs:
-                tiled_dim_extents = {
+                tiled_symbol_substitutions = {
                     self._host_dim_to_index_symbol(ir_node, d): extent * level_symbol
                     for d, extent in dim_extent_pairs
                 }
-                subs = dict(tiled_dim_extents)
-                subs.update(
-                    {
-                        sym: sympy.Integer(0)
-                        for sym in dep.index.free_symbols
-                        if sym not in subs
-                    }
+                host_expr += _tile_advance_expr_from_dep(
+                    dep, tiled_symbol_substitutions
                 )
-                host_expr += dep.index.subs(subs)
             for host_stride, extent in squeezed_pairs:
                 host_expr += level_symbol * extent * host_stride
             device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)
@@ -817,6 +866,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         args: Sequence[TensorArg],
         op_info: dict[str, Any],
         indirect_var_names: "frozenset[str] | None" = None,
+        matmul_operand_shapes: "tuple[tuple[sympy.Expr, ...], tuple[sympy.Expr, ...], tuple[sympy.Expr, ...]] | None" = None,
+        matmul_operand_batch_dim_owners: "tuple[tuple[bool, ...], tuple[bool, ...]] | None" = None,
     ) -> OpSpec:
         from torch_spyre._inductor.constants import SPYRE_FP8_OPS
 
@@ -973,8 +1024,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # so codegen can derive surviving dim roles and the channel count from
         # live IR instead of a lowering-time size snapshot.  Store raw ranges
         # (no int(): ranges may be symbolic); consumers convert only static
-        # dims.  Populated for pools and convs (forward + depthwise) — the only
-        # consumers — so other kernels' generated source is unchanged.
+        # dims.
         node_output_ranges = (
             tuple(ir_node.data.ranges)
             if op in POOL_OPS | CONV_OPS
@@ -992,6 +1042,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             tiled_symbol_trip_counts=tiled_symbol_trip_counts,
             symbolic_dim_bounds=symbolic_dim_bounds,
             node_output_ranges=node_output_ranges,
+            matmul_operand_shapes=matmul_operand_shapes,
+            matmul_operand_batch_dim_owners=matmul_operand_batch_dim_owners,
             debug_handle=debug_handle,
         )
         self._alignment_repeat_info_by_spec[id(op_spec)] = {
@@ -1195,6 +1247,72 @@ class SpyreKernel(Kernel[CSEVariable]):
         op_info = {}
         if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
             op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
+        matmul_operand_shapes: (
+            tuple[
+                tuple[sympy.Expr, ...],
+                tuple[sympy.Expr, ...],
+                tuple[sympy.Expr, ...],
+            ]
+            | None
+        ) = None
+        matmul_operand_batch_dim_owners: (
+            tuple[tuple[bool, ...], tuple[bool, ...]] | None
+        ) = None
+        matmul_operands_info = op_info.pop(MATMUL_OPERANDS_INFO_KEY, None)
+        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
+            if not isinstance(matmul_operands_info, dict):
+                raise Unsupported(
+                    f"{value.op} is missing authoritative logical operand metadata"
+                )
+            shapes = matmul_operands_info.get("shapes")
+            if (
+                not isinstance(shapes, (list, tuple))
+                or len(shapes) != 3
+                or any(not isinstance(shape, (list, tuple)) for shape in shapes)
+            ):
+                raise Unsupported(
+                    f"{value.op} has invalid logical operand shapes {shapes!r}"
+                )
+            matmul_operand_shapes = (
+                tuple(shapes[0]),
+                tuple(shapes[1]),
+                tuple(shapes[2]),
+            )
+            owners = matmul_operands_info.get("batch_dim_owners")
+            expected_owner_ranks = tuple(
+                max(0, len(shape) - 2) for shape in matmul_operand_shapes[:2]
+            )
+            if (
+                not isinstance(owners, (list, tuple))
+                or len(owners) != 2
+                or any(not isinstance(item, (list, tuple)) for item in owners)
+                or tuple(len(item) for item in owners) != expected_owner_ranks
+                or any(type(owner) is not bool for item in owners for owner in item)
+            ):
+                raise Unsupported(
+                    f"{value.op} has invalid batch-dimension ownership {owners!r}; "
+                    f"expected operand batch ranks {expected_owner_ranks!r}"
+                )
+            matmul_operand_batch_dim_owners = (
+                tuple(owners[0]),
+                tuple(owners[1]),
+            )
+            logical_output_shape = matmul_operand_shapes[-1]
+            destination_shape = tuple(layout.size)
+            valid_destination_shapes = _matmul_destination_shapes(
+                logical_output_shape,
+                self.current_node.node,
+                is_mutation_alias=real_dst_name != name,
+            )
+            if not any(
+                _shape_exprs_equal(candidate, destination_shape)
+                for candidate in valid_destination_shapes
+            ):
+                raise Unsupported(
+                    f"{value.op} logical output shape {logical_output_shape!r} "
+                    f"does not match destination shape {destination_shape!r}; "
+                    f"valid full/tiled shapes are {valid_destination_shapes!r}"
+                )
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -1219,7 +1337,16 @@ class SpyreKernel(Kernel[CSEVariable]):
                 self.create_tensor_arg(True, y.name, y),
                 self.create_tensor_arg(False, real_dst_name, dst),
             ]
-            self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
+            self.op_specs.append(
+                self.create_op_spec(
+                    value.op,
+                    True,
+                    args,
+                    op_info,
+                    matmul_operand_shapes=matmul_operand_shapes,
+                    matmul_operand_batch_dim_owners=matmul_operand_batch_dim_owners,
+                )
+            )
         elif value.op in DEPTHWISE_CONV_REDUCTION_OPS:
             if (
                 len(value.arguments) < 2
@@ -1539,6 +1666,19 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         )
                         + "),"
                     )
+                if op_spec.matmul_operand_shapes is not None:
+                    # Keep symbolic logical dimensions live across the
+                    # OpSpec -> generated-source -> exec round-trip.
+                    operand_shapes = ", ".join(
+                        "(" + "".join(sympy_str(dim) + ", " for dim in shape) + ")"
+                        for shape in op_spec.matmul_operand_shapes
+                    )
+                    buf.writeline(f"matmul_operand_shapes=({operand_shapes}),")
+                if op_spec.matmul_operand_batch_dim_owners is not None:
+                    buf.writeline(
+                        "matmul_operand_batch_dim_owners="
+                        f"{op_spec.matmul_operand_batch_dim_owners!r},"
+                    )
                 if op_spec.debug_handle is not None:
                     # Source-to-kernel provenance must survive the OpSpec ->
                     # generated-source -> exec round-trip. DebugHandle/SourceLoc
@@ -1695,6 +1835,198 @@ def _restickify_restore_elided_dim(op_spec) -> None:
         _restore(new_sym, out_arg, in_arg)
 
 
+def _refine_matmul_output_factorization(
+    op_spec: OpSpec,
+    original_iteration_space,
+    normalized_iteration_space,
+    work_division_remap,
+) -> None:
+    """Reflect exact normalized batch/M splits in authoritative matmul shapes.
+
+    align_tensors may split one original loop into adjacent mixed-radix axes.
+    SuperDSC can represent a full-range output batch split directly. It can
+    also represent a full-range M split by treating every factor except the
+    last as a batch axis, broadcasting a batched rhs over those promoted axes.
+    N and K deliberately remain strict: their factorization is left visible to
+    _align_matmul_dim_labels and is rejected there.
+    """
+    shapes = op_spec.matmul_operand_shapes
+    owners = op_spec.matmul_operand_batch_dim_owners
+    assert shapes is not None and owners is not None
+
+    # Use the same positional role contract as SuperDSC. Static-unit roles are
+    # absent from the incoming iteration space; every other original loop maps
+    # to the corresponding live role in order.
+    from .codegen.superdsc import _matmul_role_shapes
+
+    iteration_role_shapes, _argument_role_shapes = _matmul_role_shapes(shapes, owners)
+    live_roles = tuple(
+        (axis, role, extent)
+        for axis, (role, extent) in enumerate(iteration_role_shapes)
+        if sympy.simplify(sympy.sympify(extent) - 1) != 0
+    )
+    if len(original_iteration_space) != len(live_roles):
+        return
+
+    normalized_symbols = tuple(normalized_iteration_space)
+    normalized_positions = {
+        symbol: position for position, symbol in enumerate(normalized_symbols)
+    }
+
+    def same_extent(first, second):
+        return sympy.simplify(sympy.sympify(first) - sympy.sympify(second)) == 0
+
+    output_rank = len(shapes[-1])
+    m_axis = output_rank - 2
+    refinements: dict[int, tuple[sympy.Expr, ...]] = {}
+    for (old_symbol, (old_extent, _old_split)), (
+        role_axis,
+        _role,
+        logical_extent,
+    ) in zip(original_iteration_space.items(), live_roles):
+        # Only output batch roles and M can be re-expressed this way. Leaving
+        # N/K untouched preserves the existing strict rejection for them.
+        if role_axis > m_axis:
+            continue
+        remapped_axes = work_division_remap.get(old_symbol, ())
+        if len(remapped_axes) <= 1:
+            continue
+        remapped_symbols = tuple(symbol for symbol, _basis in remapped_axes)
+        start = normalized_positions.get(remapped_symbols[0])
+        if (
+            start is None
+            or normalized_symbols[start : start + len(remapped_symbols)]
+            != remapped_symbols
+        ):
+            continue
+        factors = tuple(
+            sympy.sympify(normalized_iteration_space[symbol][0])
+            for symbol in remapped_symbols
+        )
+        if any(
+            not same_extent(factor, basis)
+            for factor, (_symbol, basis) in zip(factors, remapped_axes)
+        ):
+            continue
+        if not (
+            same_extent(old_extent, logical_extent)
+            and same_extent(math.prod(factors), logical_extent)
+        ):
+            continue
+        refinements[role_axis] = factors
+
+    if not refinements:
+        return
+
+    lhs_shape, rhs_shape, output_shape = map(tuple, shapes)
+    lhs_owners, rhs_owners = map(tuple, owners)
+    rhs_is_batched = output_rank > 2 and len(rhs_shape) == output_rank
+
+    expanded_batch: list[sympy.Expr] = []
+    expanded_lhs_owners: list[bool] = []
+    expanded_rhs_owners: list[bool] = []
+    for axis, extent in enumerate(output_shape[:-2]):
+        factors = refinements.get(axis, (extent,))
+        expanded_batch.extend(factors)
+        expanded_lhs_owners.extend((lhs_owners[axis],) * len(factors))
+        if rhs_is_batched:
+            expanded_rhs_owners.extend((rhs_owners[axis],) * len(factors))
+
+    m_factors = refinements.get(m_axis, (output_shape[-2],))
+    promoted_m_factors = m_factors[:-1]
+    inner_m_factor = m_factors[-1]
+    expanded_lhs_owners.extend((True,) * len(promoted_m_factors))
+
+    if rhs_is_batched:
+        refined_rhs_shape = (
+            tuple(expanded_batch) + tuple(promoted_m_factors) + tuple(rhs_shape[-2:])
+        )
+        expanded_rhs_owners.extend((False,) * len(promoted_m_factors))
+        refined_rhs_owners = tuple(expanded_rhs_owners)
+    else:
+        refined_rhs_shape = rhs_shape
+        refined_rhs_owners = rhs_owners
+
+    op_spec.matmul_operand_shapes = (
+        tuple(expanded_batch)
+        + tuple(promoted_m_factors)
+        + (inner_m_factor, lhs_shape[-1]),
+        refined_rhs_shape,
+        tuple(expanded_batch)
+        + tuple(promoted_m_factors)
+        + (inner_m_factor, output_shape[-1]),
+    )
+    op_spec.matmul_operand_batch_dim_owners = (
+        tuple(expanded_lhs_owners),
+        refined_rhs_owners,
+    )
+
+
+def _matmul_unit_role_incidence(op_spec: OpSpec) -> dict[sympy.Symbol, frozenset[int]]:
+    """Return each static-unit matmul role's authoritative tensor incidence.
+
+    ``align_tensors`` may materialize a constant physical axis as a synthetic
+    one-trip symbol.  Although that symbol is not an operation loop, its
+    position in the tensor coordinates is meaningful: it identifies where the
+    corresponding squeezed logical matmul role sits in the physical layout.
+    The role incidence says which of [lhs, rhs, output] may retain that symbol;
+    the separate pre-broadcast origin record selects a unique compatible role.
+    """
+    shapes = op_spec.matmul_operand_shapes
+    owners = op_spec.matmul_operand_batch_dim_owners
+    if shapes is None or owners is None:
+        raise Unsupported(
+            f"{op_spec.op} is missing authoritative matmul operand metadata"
+        )
+    if len(op_spec.args) != 3:
+        raise Unsupported(
+            f"{op_spec.op} expected [lhs, rhs, output], got {len(op_spec.args)} tensors"
+        )
+
+    # Keep simplification and SuperDSC on one authoritative matmul contract.
+    # This is a local import because superdsc imports the OpSpec definitions used
+    # by this module, while simplification runs only after both modules load.
+    from .codegen.superdsc import _matmul_role_shapes
+
+    try:
+        iteration_role_shapes, argument_role_shapes = _matmul_role_shapes(
+            shapes, owners
+        )
+    except (IndexError, TypeError, ValueError, sympy.SympifyError) as exc:
+        raise Unsupported(
+            f"{op_spec.op} has invalid authoritative matmul metadata: {exc}"
+        ) from exc
+
+    unit_roles = {
+        sympy.Symbol(role)
+        for role, size in iteration_role_shapes
+        if sympy.simplify(sympy.sympify(size) - 1) == 0
+    }
+    return {
+        role: frozenset(
+            tensor_index
+            for tensor_index, role_shapes in enumerate(argument_role_shapes)
+            if str(role) in {argument_role for argument_role, _size in role_shapes}
+        )
+        for role in unit_roles
+    }
+
+
+def _constant_nonstick_axis_count(arg: TensorArg) -> int:
+    """Count constant physical slots before an argument's stick dimension."""
+    if len(arg.device_size) != len(arg.device_coordinates):
+        raise Unsupported(
+            "tensor device size/coordinate ranks differ while mapping a matmul "
+            "synthetic axis"
+        )
+    return sum(
+        not sympy.sympify(coordinate)
+        .replace(sympy.floor, lambda value: value)
+        .free_symbols
+        for coordinate in arg.device_coordinates[:-1]
+    )
+
+
 def simplify_op_spec(
     op_spec,
     indirect_sizes=None,
@@ -1705,13 +2037,22 @@ def simplify_op_spec(
 ):
     # Both parameters must be provided together for gather kernels — indirect_sizes
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
-
     if op_spec.op == RESTICKIFY_OP:
         # Restore a restickify's elided size-1 stick, creating a shared iteration
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
 
     it_space = op_spec.iteration_space
+    matmul_unit_role_incidence = None
+    synthetic_axis_origins: dict[sympy.Symbol, list[tuple[int, int, int]]] | None = None
+    if op_spec.op in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
+        matmul_unit_role_incidence = _matmul_unit_role_incidence(op_spec)
+        # ``align_tensors`` later broadcasts normalization placeholders to every
+        # tensor. Preserve where and in which constant-axis ordinal each one was
+        # actually created so semantic matching never treats that broadcast as
+        # provenance.
+        synthetic_axis_origins = {}
+
     if alignment_inputs is None:
         new_op_space_splits, new_tensors, work_division_remap = align_tensors(
             it_space,
@@ -1721,6 +2062,7 @@ def simplify_op_spec(
             ],
             indirect_sizes,
             repeat_info=repeat_info,
+            synthetic_axis_origins=synthetic_axis_origins,
         )
     else:
         if alignment_inputs.iteration_space != it_space:
@@ -1728,8 +2070,113 @@ def simplify_op_spec(
                 "captured alignment iteration space changed before codegen"
             )
         new_op_space_splits, new_tensors, work_division_remap = align_tensors_pure(
-            alignment_inputs
+            alignment_inputs,
+            synthetic_axis_origins=synthetic_axis_origins,
         )
+
+    if op_spec.op in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
+        _refine_matmul_output_factorization(
+            op_spec,
+            it_space,
+            new_op_space_splits,
+            work_division_remap,
+        )
+        # Rank expansion changes canonical labels, so refresh static-unit role
+        # incidence before assigning normalization placeholders.
+        matmul_unit_role_incidence = _matmul_unit_role_incidence(op_spec)
+
+        # normalize_coordinates represents a constant, non-stick physical axis
+        # wider than one with a synthetic one-trip loop variable.  That variable
+        # is useful while align_tensors makes every tensor's physical rank agree,
+        # but it is not a logical matmul iteration role.  Keeping it in the
+        # OpSpec makes codegen either mislabel it as a squeezed B/M/N/K role or
+        # (correctly) reject an apparent extra contraction axis.
+        #
+        # Distinguish these placeholders by explicit normalization provenance,
+        # not their ``zN`` name or their post-alignment tensor incidence.  Keep
+        # non-unit factorization symbols visible to SuperDSC's strict role check.
+        assert synthetic_axis_origins is not None
+        synthetic_unit_symbols = {
+            symbol
+            for symbol, origins in synthetic_axis_origins.items()
+            if origins
+            and symbol in new_op_space_splits
+            and sympy.simplify(sympy.sympify(new_op_space_splits[symbol][0]) - 1) == 0
+        }
+        if synthetic_unit_symbols:
+            assert matmul_unit_role_incidence is not None
+            available_roles = dict(matmul_unit_role_incidence)
+            placeholder_roles: dict[
+                sympy.Symbol, tuple[sympy.Symbol, frozenset[int]]
+            ] = {}
+            padding_only_symbols: set[sympy.Symbol] = set()
+            constant_axis_counts = tuple(
+                _constant_nonstick_axis_count(arg) for arg in op_spec.args
+            )
+            for symbol in sorted(synthetic_unit_symbols, key=str):
+                origins = synthetic_axis_origins[symbol]
+                origin_tensors = frozenset(origin[0] for origin in origins)
+                constant_ordinals = {origin[2] for origin in origins}
+                if len(constant_ordinals) != 1:
+                    candidates = []
+                    support_tensors = origin_tensors
+                else:
+                    (constant_ordinal,) = constant_ordinals
+                    support_tensors = frozenset(
+                        tensor_index
+                        for tensor_index, count in enumerate(constant_axis_counts)
+                        if count > constant_ordinal
+                    )
+                    candidates = [
+                        role
+                        for role, role_incidence in available_roles.items()
+                        if support_tensors <= role_incidence
+                    ]
+                    exact_candidates = [
+                        role
+                        for role in candidates
+                        if available_roles[role] == support_tensors
+                    ]
+                    if exact_candidates:
+                        candidates = exact_candidates
+                if not candidates and not matmul_unit_role_incidence:
+                    # ``normalize_coordinates`` also materializes one-trip
+                    # symbols for purely physical padding/gap axes.  When the
+                    # logical matmul has no static-unit role, such a symbol
+                    # cannot carry operation semantics.  Its only value is
+                    # zero, so erase it from coordinates along with the
+                    # synthetic iteration axis while retaining device_size.
+                    padding_only_symbols.add(symbol)
+                    continue
+                if len(candidates) != 1:
+                    raise Unsupported(
+                        f"{op_spec.op}: cannot map synthetic unit axis {symbol} "
+                        f"from tensor(s) {sorted(origin_tensors)!r}, constant-axis "
+                        f"support {sorted(support_tensors)!r}, to a unique static-unit "
+                        "logical role; candidates are "
+                        f"{sorted(map(str, candidates))!r}"
+                    )
+                role = candidates[0]
+                placeholder_roles[symbol] = (role, available_roles[role])
+                del available_roles[role]
+
+            new_op_space_splits = {
+                symbol: value
+                for symbol, value in new_op_space_splits.items()
+                if symbol not in synthetic_unit_symbols
+            }
+            for tensor_index, tensor in enumerate(new_tensors):
+                replacements = {
+                    symbol: (role if tensor_index in role_incidence else sympy.S.Zero)
+                    for symbol, (role, role_incidence) in placeholder_roles.items()
+                }
+                replacements.update(
+                    {symbol: sympy.S.Zero for symbol in padding_only_symbols}
+                )
+                tensor["coordinates"] = [
+                    coordinate.xreplace(replacements)
+                    for coordinate in tensor["coordinates"]
+                ]
     op_spec.iteration_space = new_op_space_splits
 
     for arg, t in zip(op_spec.args, new_tensors):

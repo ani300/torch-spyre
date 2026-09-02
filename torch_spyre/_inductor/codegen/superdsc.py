@@ -17,12 +17,11 @@ import math
 from collections import Counter
 from typing import Any
 
-from sympy import Expr, Integer, Symbol
+from sympy import Expr, Integer, Symbol, simplify
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
-from torch_spyre._C import ElementArrangement
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     CONV2D_FWD_OP,
@@ -34,6 +33,7 @@ from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
+    KEEP_BY_INDEX_OP,
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
@@ -43,7 +43,6 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     RESTICKIFY_OP,
     TOPK_OPS,
-    KEEP_BY_INDEX_OP,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.indirect_access import (
@@ -533,6 +532,145 @@ def _align_pool_dim_labels(node_output_ranges, ndim: int) -> list[str]:
             "are out of sync with the emitted iteration space"
         )
     return labels
+
+
+def _matmul_role_shapes(matmul_operand_shapes, matmul_operand_batch_dim_owners=None):
+    """Return canonical iteration and per-operand semantic role/size pairs."""
+    if len(matmul_operand_shapes) != 3:
+        raise ValueError(
+            "matmul_operand_shapes must contain [lhs, rhs, output], got "
+            f"{matmul_operand_shapes!r}"
+        )
+    lhs_shape, rhs_shape, output_shape = matmul_operand_shapes
+    output_rank = len(output_shape)
+    full_labels = MATMUL_DIM_LABELS[-(output_rank + 1) :]
+    if len(full_labels) != output_rank + 1 or output_rank < 2:
+        raise ValueError(
+            f"matmul output rank {output_rank} exceeds supported role labels"
+        )
+    if len(lhs_shape) < 2 or len(rhs_shape) < 2:
+        raise ValueError(
+            f"matmul operands must have rank >= 2, got {matmul_operand_shapes!r}"
+        )
+
+    def same_shape(first, second):
+        return len(first) == len(second) and all(
+            simplify(a - b) == 0 for a, b in zip(first, second)
+        )
+
+    # Spyre's matmul reductions currently model an lhs-shaped output batch
+    # prefix and either a shared rank-2 rhs or an rhs with that exact prefix.
+    # Reject contradictory typed metadata here as well as at lowering: OpSpecs
+    # survive serialization and may be constructed independently in tests or
+    # tooling, so codegen must enforce its own semantic boundary.
+    valid_contract = (
+        len(lhs_shape) == output_rank
+        and len(rhs_shape) in (2, output_rank)
+        and same_shape(output_shape[:-2], lhs_shape[:-2])
+        and (len(rhs_shape) == 2 or same_shape(rhs_shape[:-2], lhs_shape[:-2]))
+        and same_shape(output_shape[-2:-1], lhs_shape[-2:-1])
+        and same_shape(output_shape[-1:], rhs_shape[-1:])
+        and same_shape(lhs_shape[-1:], rhs_shape[-2:-1])
+    )
+    if not valid_contract:
+        raise ValueError(
+            f"invalid matmul operand/output contract {matmul_operand_shapes!r}"
+        )
+
+    output_roles = tuple(full_labels[:-1])
+    batch_roles = output_roles[:-2]
+    m_role, n_role = output_roles[-2:]
+    k_role = full_labels[-1]
+
+    if matmul_operand_batch_dim_owners is None:
+        matmul_operand_batch_dim_owners = tuple(
+            (True,) * (len(shape) - 2) for shape in (lhs_shape, rhs_shape)
+        )
+    if (
+        not isinstance(matmul_operand_batch_dim_owners, (list, tuple))
+        or len(matmul_operand_batch_dim_owners) != 2
+        or any(
+            not isinstance(owners, (list, tuple))
+            for owners in matmul_operand_batch_dim_owners
+        )
+        or tuple(len(owners) for owners in matmul_operand_batch_dim_owners)
+        != (len(lhs_shape) - 2, len(rhs_shape) - 2)
+        or any(
+            type(owner) is not bool
+            for owners in matmul_operand_batch_dim_owners
+            for owner in owners
+        )
+    ):
+        raise ValueError(
+            "invalid matmul operand batch-dimension ownership "
+            f"{matmul_operand_batch_dim_owners!r} for shapes "
+            f"{matmul_operand_shapes!r}"
+        )
+
+    def operand_role_shapes(shape, tail_roles, owners):
+        batch_rank = len(shape) - 2
+        if batch_rank > len(batch_roles):
+            raise ValueError(
+                f"matmul operand rank {len(shape)} exceeds output rank {output_rank}"
+            )
+        owned_batch_roles = batch_roles[-batch_rank:] if batch_rank else ()
+        batch_role_shapes = tuple(
+            (role, size)
+            for role, size, owned in zip(owned_batch_roles, shape[:-2], owners)
+            if owned
+        )
+        return batch_role_shapes + tuple(zip(tail_roles, shape[-2:]))
+
+    lhs_role_shapes = operand_role_shapes(
+        lhs_shape,
+        (m_role, k_role),
+        matmul_operand_batch_dim_owners[0],
+    )
+    rhs_role_shapes = operand_role_shapes(
+        rhs_shape,
+        (k_role, n_role),
+        matmul_operand_batch_dim_owners[1],
+    )
+
+    iteration_role_shapes = tuple(zip(output_roles, output_shape)) + (
+        (k_role, lhs_shape[-1]),
+    )
+    argument_role_shapes = (
+        lhs_role_shapes,
+        rhs_role_shapes,
+        tuple(zip(output_roles, output_shape)),
+    )
+    return iteration_role_shapes, argument_role_shapes
+
+
+def _align_matmul_dim_labels(matmul_operand_shapes, iteration_space) -> list[str]:
+    """Align surviving matmul loops with semantic B/M/N/K roles.
+
+    ``Reduction`` creates its loop variables from ``[output ranges, reduction
+    ranges]``.  Inductor's ``index_vars_squeeze`` removes every static unit
+    range while preserving the order of all remaining ranges, so the only
+    valid live sequence is the canonical output+K role sequence with static
+    unit roles deleted.  Physical loop extents are deliberately not consulted:
+    later tiling may reduce a non-unit logical role's per-tile extent to one.
+
+    Requiring this exact ordered subsequence is also a useful semantic guard.
+    An extra live symbol means that a logical matmul role was factorized across
+    multiple iteration axes, which the backend cannot represent as one SDSC
+    dimension and must not be hidden by guessing a label.
+    """
+    # Per-operand batch ownership changes tensor layouts, not the operation's
+    # canonical output+K iteration roles, so no ownership mask is needed here.
+    iteration_role_shapes, _ = _matmul_role_shapes(matmul_operand_shapes)
+    surviving_labels = [
+        label for label, size in iteration_role_shapes if not _is_static_one(size)
+    ]
+    if len(iteration_space) != len(surviving_labels):
+        raise ValueError(
+            "matmul iteration space must contain exactly the ordered non-unit "
+            f"logical roles {surviving_labels!r}; got ranges "
+            f"{list(iteration_space.values())!r} for {matmul_operand_shapes!r}"
+        )
+    return surviving_labels
 
 
 def _arg_stick_symbol(arg) -> Symbol | None:
@@ -1167,6 +1305,40 @@ def _create_sdsc_tensors(
                 arg, symbol_mapping, op_spec, tensor_position=i
             )
 
+        matmul_unit_dims = injected_dims.get("matmul_unit_dims", frozenset())
+        matmul_arg_dims = injected_dims.get("matmul_arg_dims")
+        matmul_stick_dims = injected_dims.get("matmul_stick_dims")
+        if matmul_arg_dims is not None:
+            if len(op_spec.args) != 3:
+                raise ValueError(
+                    f"{op_spec.op}: expected [INPUT, KERNEL, OUTPUT], got "
+                    f"{len(op_spec.args)} tensors"
+                )
+            missing_non_unit = [
+                dim
+                for dim in matmul_arg_dims[i]
+                if dim not in matmul_unit_dims and dim not in dim_order
+            ]
+            if missing_non_unit:
+                raise ValueError(
+                    f"{op_spec.op} argument {i} is missing non-unit semantic "
+                    f"role(s) {missing_non_unit}; logical shapes are "
+                    f"{op_spec.matmul_operand_shapes!r}"
+                )
+
+            # Physical layouts are left-padded, while _get_device_dim_order
+            # walks them from inner to outer.  Append squeezed unit roles in
+            # reverse logical-axis order to preserve that physical ordering.
+            for unit_dim in reversed(matmul_arg_dims[i]):
+                if unit_dim in matmul_unit_dims and unit_dim not in dim_order:
+                    dim_order.append(unit_dim)
+
+            # Stick roles are operation semantics, not a property to infer
+            # from a surviving physical coordinate: lhs sticks on K, while
+            # rhs and output stick on N even when either logical extent is 1.
+            assert matmul_stick_dims is not None
+            stick_dim = matmul_stick_dims[i][-1]
+
         # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
         # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
         # advance, stamped by coarse_tile._propagate_tiled_op (host-stride
@@ -1219,7 +1391,7 @@ def _create_sdsc_tensors(
                 dim_order = dim_order + reduced_dims
 
         # Step 3: Handle missing stick dimension — skip for index tensors.
-        if op_stick_dim is None:
+        if op_stick_dim is None and matmul_arg_dims is None:
             if not (has_indirect_access and i in index_tensor_indices):
                 stick_dim = next(d for d in dims if d not in op_dim_order)
                 # The chosen dim is absent from the *op*'s dim_order, but an
@@ -1394,10 +1566,35 @@ def _create_sdsc_tensors(
         if is_fp8_mm_kernel_arg:
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
             layout_stick_size = [2, dtype_stick_size // 2]
-            # Use the last two dimensions from dim_order for 2D stick
-            effective_stick = dim_order[-2:]
+            if matmul_stick_dims is not None and i == 1:
+                assert matmul_arg_dims is not None
+                # QFP8WT weight sticks are semantically ordered [K, N].
+                # This order is format-defined and must not depend on which
+                # unit axes survived in the physical coordinate expressions.
+                effective_stick = [
+                    matmul_arg_dims[i][-2],
+                    matmul_arg_dims[i][-1],
+                ]
+            else:
+                # Non-matmul QFP8WT users retain the physical inference.
+                effective_stick = dim_order[-2:]
 
-        if has_indirect_access:
+        if not has_indirect_access and (
+            _is_matmul(op_spec.op) or op_spec.op == CONV2D_FWD_OP
+        ):
+            # Matmul tensor roles are semantic and positional: lowering and
+            # SpyreKernel always build [INPUT, KERNEL, OUTPUT].  Do not infer
+            # them by deduplicating physical layouts.  With squeezed unit M/N
+            # dimensions two roles can have identical dim/stick geometry; if
+            # they share a label, DeepTools assigns the later tensor the wrong
+            # DsType (for example a unit-N kernel becomes a second INPUT).
+            label = MATMUL_LAYOUT_LABELS[i]
+            layouts[label] = {
+                "dim_order": dim_order,
+                "stick_dim_order": effective_stick,
+                "stick_size": layout_stick_size,
+            }
+        elif has_indirect_access:
             label = get_indirect_layout_label(
                 i,
                 index_tensor_indices,
@@ -1545,7 +1742,7 @@ def _round_up_to_stick(
 def _extend_matmul_k_to_padded(
     op_spec: OpSpec,
     sdsc_iteration_space: dict,
-    symbol_mapping: dict,
+    _symbol_mapping: dict,
 ) -> None:
     """Extend sdsc_iteration_space[K] to K_padded for matmul ops.
 
@@ -1559,43 +1756,19 @@ def _extend_matmul_k_to_padded(
     - Strides are computed against K_padded → correct for K_padded-extended iteration.
     - _get_padded_iteration_space becomes a no-op for K (already aligned).
 
-    K is identified as the symbol that appears in y's (non-stick) device_coordinates
-    but NOT in the output's device_coordinates.  This is the reduction symbol and is
-    layout-position agnostic: it works regardless of how MATMUL_DIM_LABELS maps the
-    iteration symbols for this particular ndim.
+    K comes from the authoritative logical matmul metadata.  Inferring it from
+    physical coordinates is ambiguous when K is squeezed or factorized.
     """
-    # y is always args[1]; output is always args[-1] for matmul.
+    if op_spec.matmul_operand_shapes is None:
+        raise ValueError(f"{op_spec.op} is missing logical operand shapes")
     y_arg = op_spec.args[1]
-    out_arg = op_spec.args[-1]
-
-    # Collect non-stick symbols in y's device_coordinates (after symbol_mapping).
-    y_dim_order, y_stick_dim = _get_device_dim_order(y_arg, symbol_mapping)
-    # y_stick_dim is the within-stick symbol; the remaining dims include K.
-    y_non_stick_syms: set = set(y_dim_order) - ({y_stick_dim} if y_stick_dim else set())
-
-    # Collect all symbols in the output's device_coordinates.
-    out_dim_order, _ = _get_device_dim_order(out_arg, symbol_mapping)
-    out_syms: set = set(out_dim_order)
-
-    # K is in y but not in the output (it's reduced).
-    k_candidates = y_non_stick_syms - out_syms
-    if not k_candidates:
-        logger.warning(
-            "_extend_matmul_k_to_padded: could not identify K symbol "
-            "(y_non_stick=%s, out_syms=%s), skipping",
-            y_non_stick_syms,
-            out_syms,
-        )
-        return
-    k_sym = next(iter(k_candidates))
+    k_sym = Symbol(MATMUL_DIM_LABELS[-1])
 
     if k_sym not in sdsc_iteration_space:
-        logger.warning(
-            "_extend_matmul_k_to_padded: K symbol %s not in sdsc_iteration_space %s, skipping",
-            k_sym,
-            list(sdsc_iteration_space.keys()),
+        raise ValueError(
+            f"{op_spec.op} canonical K role {k_sym} is absent from iteration "
+            f"space {list(sdsc_iteration_space)!r}"
         )
-        return
 
     # Compute K_padded by rounding K up to the next stick boundary.
     # Reading K_padded from y_arg.device_size would be wrong when y is a view
@@ -1726,6 +1899,17 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_restickify = op_spec.op == RESTICKIFY_OP
     is_pool = _is_pool(op_spec.op)
     is_conv = _is_conv(op_spec.op)
+    has_matmul_shapes = op_spec.matmul_operand_shapes is not None
+    has_matmul_owners = op_spec.matmul_operand_batch_dim_owners is not None
+    if is_matmul and not (has_matmul_shapes and has_matmul_owners):
+        raise ValueError(
+            f"{op_spec.op} requires authoritative matmul_operand_shapes and "
+            "matmul_operand_batch_dim_owners"
+        )
+    if not is_matmul and (has_matmul_shapes or has_matmul_owners):
+        raise ValueError(
+            f"{op_spec.op} carries matmul operand metadata but is not a matmul"
+        )
     ndim = len(op_spec.iteration_space)
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
@@ -1754,6 +1938,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # correct because pool is a single-input reduction with a fixed
         # iteration-space order.
         dim_labels = _align_pool_dim_labels(op_spec.node_output_ranges, ndim)
+    elif is_matmul:
+        assert op_spec.matmul_operand_shapes is not None
+        dim_labels = _align_matmul_dim_labels(
+            op_spec.matmul_operand_shapes, op_spec.iteration_space
+        )
     else:
         dim_labels = _get_op_dim_labels(ndim, is_matmul, is_conv2d)
         # Depthwise conv2d (#3510): size-based label matching. Forward conv2d is
@@ -1825,6 +2014,53 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         symbol_mapping[sym]: expression
         for sym, expression in op_spec.core_id_to_work_slice.items()
     }
+
+    matmul_unit_dims: frozenset[Symbol] = frozenset()
+    matmul_arg_dims: tuple[tuple[Symbol, ...], ...] | None = None
+    matmul_stick_dims: tuple[tuple[Symbol, ...], ...] | None = None
+    if is_matmul:
+        assert op_spec.matmul_operand_shapes is not None
+        assert op_spec.matmul_operand_batch_dim_owners is not None
+        iteration_role_shapes, argument_role_shapes = _matmul_role_shapes(
+            op_spec.matmul_operand_shapes,
+            op_spec.matmul_operand_batch_dim_owners,
+        )
+        canonical_dims = tuple(Symbol(role) for role, _size in iteration_role_shapes)
+        present_dims = set(sdsc_iteration_space)
+        matmul_unit_dims = frozenset(
+            Symbol(role) for role, size in iteration_role_shapes if _is_static_one(size)
+        )
+
+        missing_non_unit = [
+            dim
+            for dim, (_role, size) in zip(canonical_dims, iteration_role_shapes)
+            if not _is_static_one(size) and dim not in present_dims
+        ]
+        if missing_non_unit:
+            raise ValueError(
+                f"matmul non-unit role(s) {missing_non_unit} are absent from "
+                f"iteration space for {op_spec.matmul_operand_shapes!r}"
+            )
+
+        # Reconstitute the complete output-order + K semantic space.  Missing
+        # roles are necessarily static one, so they do not alter execution.
+        sdsc_iteration_space = {
+            dim: sdsc_iteration_space.get(dim, 1) for dim in canonical_dims
+        }
+        dim_splits = {dim: dim_splits.get(dim, 1) for dim in canonical_dims}
+        work_slices = {dim: work_slices.get(dim, 1) for dim in canonical_dims}
+
+        matmul_arg_dims = tuple(
+            tuple(Symbol(role) for role, _size in role_shapes)
+            for role_shapes in argument_role_shapes
+        )
+        reduction_dim = canonical_dims[-1]
+        output_dim = canonical_dims[-2]
+        matmul_stick_dims = (
+            (reduction_dim,),
+            (output_dim,),
+            (output_dim,),
+        )
 
     # Inject implicit kernel dimensions for conv2d when kernel_size=1. This is
     # the depthwise-conv (#3510) path only: forward conv2d (#3284) sources its
@@ -1913,7 +2149,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                     _stick_label,
                 )
 
-    if op_stick_dim is None:
+    if op_stick_dim is None and matmul_arg_dims is None:
         if is_pool or _is_depthwise_conv(op_spec.op):
             # Pool/depthwise-conv op where C fits in one stick (e.g. C=1): the
             # "out" (channel) dimension was dropped from the iteration space
@@ -1990,6 +2226,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     # For topk: if all output dims are in the input, add a missing dimension.
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
+    if matmul_arg_dims is not None:
+        injected_dims["matmul_unit_dims"] = matmul_unit_dims
+        injected_dims["matmul_arg_dims"] = matmul_arg_dims
+        injected_dims["matmul_stick_dims"] = matmul_stick_dims
     if index_stick_syms:
         injected_dims["index_stick_syms"] = index_stick_syms
     if _is_topk(op_spec.op) and len(op_spec.args) >= 2:

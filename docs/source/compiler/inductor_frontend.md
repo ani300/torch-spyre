@@ -22,7 +22,7 @@ At import time the Spyre backend registers three components with Inductor. Toget
 | `SpyrePythonWrapperCodegen` | [`wrapper.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wrapper.py) | Inductor wrapper-codegen class. Generates the Python wrapper that allocates tiled buffers via `spyre_empty_with_layout()` and dispatches kernels via `async_compile.sdsc()`. |
 | `SpyreDeviceOpOverrides` | [`device/op_overrides.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/device/op_overrides.py) | Device-specific op overrides surfaced to Inductor. |
 
-The Spyre-specific Inductor configuration (decompositions, lowerings, the `mm_to_bmm_pass` that rewrites 2D matmul into 3D bmm for better core utilization, fusion heuristics, and dataflow-friendly Inductor config overrides) is activated through a single context manager:
+The Spyre-specific Inductor configuration (decompositions, lowerings, the `mm_to_bmm_pass` that restores flattened 3D-by-2D matmul to Spyre's native batched-matmul contract, fusion heuristics, and dataflow-friendly Inductor config overrides) is activated through a single context manager:
 
 ```python
 from torch_spyre._inductor.patches import enable_spyre_context
@@ -43,7 +43,7 @@ points, all registered in
 |----------------|-------|---------|
 | `CustomPreGradPasses` | Pre-grad FX graph | Reserved for graph rewrites before autograd partitioning. The pipeline is empty today. |
 | `CustomPrePasses` | Post-grad FX graph (early) | `collect_spyre_hints` snapshots `spyre_hint` annotations so they survive AOT re-tracing. |
-| `CustomPostPasses` | Post-grad FX graph (late) | Late post-grad rewrites: `recover_spyre_hints`, `decompose_addmm`, `mm_to_bmm_pass`, `mark_direct_unit_bmm_pass`, `bmm_unflatten_pass`. |
+| `CustomPostPasses` | Post-grad FX graph (late) | Late post-grad rewrites: `recover_spyre_hints`, `decompose_addmm`, `mm_to_bmm_pass`, `shared_rhs_bmm_pass`, `bmm_unflatten_pass`. |
 | `CustomPreFusionPasses` | LoopLevelIR (pre-fusion) | Pre-fusion scheduler passes: `propagate_mutation_layouts`, `align_lx_producer_loop_order`, `build_loop_scheduler_nodes`. |
 | `CustomPostFusionPasses` | LoopLevelIR (post-fusion) | Post-fusion scheduler passes: `demote_incoherent_lx_buffers`, `hbm_pool_planning`, `spyre_fuse_nodes`. |
 | `CustomPreSchedulingPasses` | LoopLevelIR (pre-scheduler) | The pre-scheduling pipeline that runs immediately before the Scheduler is constructed (wired in via a `GraphLowering._update_scheduler` monkey-patch in [`patches.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/patches.py)). The full step list is in [LoopLevelIR Passes](#looplevelir-passes) below. |
@@ -54,7 +54,8 @@ Transformations on the FX Graph tend to be simpler to implement, but happen befo
 layout of intermediate Tensors in device memory has been computed.  Therefore they need to be layout-agnostic.
 Some examples of passes that are appropriate to perform at this level are:
 + replacing constants with size 1 tensors
-+ normalizing 2D `mm` into 3D `bmm` (`mm_to_bmm_pass`)
++ restoring flattened 3D-by-2D `mm` as `spyre.batched_matmul` (`mm_to_bmm_pass`)
++ recovering a structurally broadcast rank-2 right-hand-side matrix from `bmm` (`shared_rhs_bmm_pass`)
 
 ### LoopLevelIR Passes
 
@@ -266,7 +267,7 @@ The headline modules above are the ones a contributor reaches for first. The fro
 | Module | Purpose |
 |---|---|
 | [`passes.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) | The six extension-point classes. It renders the LoopLevelIR before and after the pre-scheduling pipeline via `format_operations` (defined in `pass_utils.py`). |
-| [`temp_passes.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/temp_passes.py) | Transitional FX-graph rewrites registered in `CustomPostPasses`: `decompose_addmm`, `mm_to_bmm_pass`, `mark_direct_unit_bmm_pass`, and `bmm_unflatten_pass`. The "temp" name reflects the plan to retire them as upstream Inductor evolves. |
+| [`temp_passes.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/temp_passes.py) | Transitional FX-graph rewrites registered in `CustomPostPasses`: `decompose_addmm`, `mm_to_bmm_pass`, `shared_rhs_bmm_pass`, and `bmm_unflatten_pass`. The "temp" name reflects the plan to retire them as upstream Inductor evolves. |
 | [`propagate_layouts.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/propagate_layouts.py) | `propagate_spyre_tensor_layouts` and `propagate_mutation_layouts`. Assigns `FixedTiledLayout` to every `ComputedBuffer`. |
 | [`split_multi_ops.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/split_multi_ops.py) | `split_multi_ops` and `validate_ops`. Splits multi-op loop bodies into single-op buffers (materializing constant args as `SpyreConstantFallback`) and validates that op inputs share the same `ElementArrangement`. |
 | [`optimize_restickify.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/optimize_restickify.py) | Optimizes restickify operations inserted by layout propagation. |

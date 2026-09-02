@@ -341,6 +341,24 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   uint64_t job_bin_ptr =
       safe_stoull(job_bin_ptr_str, "ComputeOnDevice job_bin_ptr");
 
+  bool wait_for_completion = false;
+  if (cmd.contains("wait_for_completion")) {
+    const auto& wait = cmd["wait_for_completion"];
+    if (wait.is_boolean()) {
+      wait_for_completion = wait.get<bool>();
+    } else {
+      TORCH_CHECK(wait.is_string(),
+                  "ComputeOnDevice 'wait_for_completion' must be a boolean "
+                  "or the string 'true'/'false'");
+      const std::string value = wait.get<std::string>();
+      TORCH_CHECK(value == "true" || value == "false",
+                  "ComputeOnDevice 'wait_for_completion' must be 'true' or "
+                  "'false', got '",
+                  value, "'");
+      wait_for_completion = value == "true";
+    }
+  }
+
   // Kernel name surfaces in profiler events (PendingRequest::node_name →
   // aiupti activity name, FLEX JSON CBName). Prefer an explicit name from
   // SpyreCode if present; otherwise fall back to
@@ -393,7 +411,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
 
   return std::make_unique<JobPlanStepCompute>(
       std::move(program_address), bind_io_addresses_, bootstrap_offset,
-      std::move(name));
+      std::move(name), wait_for_completion);
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(

@@ -403,6 +403,10 @@ class JobPlan:
         """Get the type of step at the given index (H2D, D2H, Compute, or HostCompute)"""
         ...
 
+    def get_step_wait_for_completion(self, idx: int) -> bool:
+        """Get whether a compute step synchronizes before the next step."""
+        ...
+
     def get_step_name(self, idx: int) -> str | None:
         """Get the profiler-visible name for a compute step, or None"""
         ...

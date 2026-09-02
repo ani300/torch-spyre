@@ -29,13 +29,13 @@ from torch._inductor.ir import (
 )
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
-from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
     CONV2D_FWD_OP,
     DEPTHWISE_CONV2D_OP,
 )
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.pass_utils import SchedNodeArg
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
@@ -43,13 +43,16 @@ from torch_spyre._inductor.scratchpad.allocator import (
 )
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivisionBuffer
 from torch_spyre._inductor.work_division import (
+    MAX_SPAN_BYTES,
     TensorDep,
     _cost_model_matmul_planner,
     _default_split,
     enumerate_work_division_candidates,
-    work_division_splits_are_legal,
+    get_per_core_span,
     multi_dim_iteration_space_split,
+    must_split_vars,
     span_reduction_pass,
+    work_division_splits_are_legal,
 )
 from torch_spyre._inductor.work_division_constraints import (
     ConstraintResult,
@@ -521,6 +524,82 @@ class TestCostModelConstraints(unittest.TestCase):
 
         self.assertGreater(unrestricted[batch], 1)
         self.assertEqual(restricted[batch], 1)
+
+
+class TestPerCoreSpan(unittest.TestCase):
+    @staticmethod
+    def _granite_embedding_output_dep(d0, d1):
+        """Return the physical layout produced by Granite's 32K embedding."""
+        shape = (1, 32768, 4096)
+        stride = (134217728, 4096, 1)
+        device_layout = SpyreTensorLayout(
+            shape,
+            stride,
+            torch.bfloat16,
+            [1, 0, 2],
+        )
+        layout = FixedTiledLayout(
+            "spyre:0", torch.bfloat16, shape, stride, device_layout
+        )
+        dep = MemoryDep(
+            "buf0",
+            4096 * d0 + d1,
+            (d0, d1),
+            (32768, 4096),
+        )
+        return TensorDep(dep=dep, layout=layout)
+
+    def test_trailing_bare_symbol_split_reduces_span(self):
+        d0, d1 = (_isym(name) for name in ("d0", "d1"))
+        td = self._granite_embedding_output_dep(d0, d1)
+        it_space = {d0: 32768, d1: 4096}
+
+        self.assertEqual(
+            td.device_coords,
+            [
+                sympy.Integer(0),
+                sympy.floor(d1 / 64),
+                d0,
+                sympy.Mod(d1, 64),
+            ],
+        )
+        self.assertEqual(get_per_core_span(td, {}, it_space, {}), 268435456)
+        self.assertEqual(
+            get_per_core_span(td, {d0: 32, d1: 1}, it_space, {}),
+            264372224,
+        )
+        self.assertLessEqual(
+            get_per_core_span(td, {d0: 32, d1: 1}, it_space, {}),
+            MAX_SPAN_BYTES,
+        )
+        self.assertEqual(
+            must_split_vars(
+                [td],
+                it_space,
+                {d0: 32768, d1: 64},
+                {d1: 64},
+                32,
+                {},
+                blocked={d1},
+            ),
+            {d0: 2},
+        )
+
+    def test_outer_split_retains_full_complex_trailing_extent(self):
+        d0, d1 = (_isym(name) for name in ("d0", "d1"))
+        td = self._granite_embedding_output_dep(d0, d1)
+
+        # Mod(d1, 64) is deliberately kept at its full physical extent.  This
+        # therefore matches the historical outer-coordinate-only result.
+        self.assertEqual(
+            get_per_core_span(
+                td,
+                {d0: 1, d1: 2},
+                {d0: 32768, d1: 4096},
+                {},
+            ),
+            134217728,
+        )
 
 
 class TestCoordinateMaskBlockedVars(unittest.TestCase):

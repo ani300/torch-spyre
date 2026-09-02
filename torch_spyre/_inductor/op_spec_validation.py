@@ -30,10 +30,10 @@ Invariants checked:
 from __future__ import annotations
 
 import ast
-from collections.abc import Sequence
 import functools
 import inspect
 import textwrap
+from collections.abc import Sequence
 
 import regex
 import sympy
@@ -421,8 +421,41 @@ def _check_allocation(op_spec: OpSpec, arg: TensorArg, idx: int, stage: str) -> 
 
 
 def _check_symbol_consistency(op_spec: OpSpec, stage: str) -> None:
-    """OS-5: Free symbols in device_coordinates must reference iteration_space keys."""
+    """OS-5: Coordinates reference live loops or owned static-unit matmul roles."""
     it_space_syms = set(op_spec.iteration_space.keys())
+    implicit_unit_roles: tuple[frozenset[sympy.Symbol], ...] = ()
+    if (
+        stage in {"after_simplification", "before_bundle_generation"}
+        and op_spec.op in MATMUL_OPS
+        and op_spec.matmul_operand_shapes is not None
+        and op_spec.matmul_operand_batch_dim_owners is not None
+        and len(op_spec.args) == 3
+    ):
+        # Static-unit matmul dimensions are intentionally absent from the live
+        # iteration space, but simplification may preserve their canonical
+        # symbols in coordinates to describe a real physical padding slot.
+        # Derive the allowed symbols from the same authoritative contract used
+        # by SuperDSC, including per-operand batch ownership; a role is never
+        # accepted merely because its name looks canonical.
+        from .codegen.superdsc import _matmul_role_shapes
+
+        try:
+            _iteration_roles, argument_roles = _matmul_role_shapes(
+                op_spec.matmul_operand_shapes,
+                op_spec.matmul_operand_batch_dim_owners,
+            )
+            implicit_unit_roles = tuple(
+                frozenset(
+                    sympy.Symbol(role)
+                    for role, size in roles
+                    if sympy.simplify(sympy.sympify(size) - 1) == 0
+                )
+                for roles in argument_roles
+            )
+        except (IndexError, TypeError, ValueError, sympy.SympifyError):
+            # Op-specific validation/codegen reports malformed authoritative
+            # metadata.  OS-5 must not broaden the symbol allowance for it.
+            implicit_unit_roles = ()
 
     for i, arg in enumerate(op_spec.args):
         for coord_idx, coord in enumerate(arg.device_coordinates):
@@ -438,6 +471,8 @@ def _check_symbol_consistency(op_spec: OpSpec, stage: str) -> None:
             invalid_syms = {
                 s for s in invalid_syms if not regex.fullmatch(r"indirect\d+", str(s))
             }
+            if implicit_unit_roles:
+                invalid_syms -= implicit_unit_roles[i]
             if invalid_syms:
                 raise OpSpecValidationError(
                     op_spec,

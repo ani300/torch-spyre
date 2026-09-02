@@ -396,6 +396,12 @@ def _bmm_op_spec(op: str) -> OpSpec:
         {mb: (512, 2), out: (12800, 4), reduction: (4096, 4)},
         args,
         {},
+        matmul_operand_shapes=(
+            (sympy.Integer(512), sympy.Integer(4096)),
+            (sympy.Integer(4096), sympy.Integer(12800)),
+            (sympy.Integer(512), sympy.Integer(12800)),
+        ),
+        matmul_operand_batch_dim_owners=((), ()),
     )
 
 

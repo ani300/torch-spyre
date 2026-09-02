@@ -16,7 +16,7 @@
 import inspect
 import logging
 import time
-from typing import Optional, Any, Callable
+from typing import Any, Callable, Optional
 
 import torch
 import torch.fx.graph
@@ -35,73 +35,75 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
-from .logging_utils import get_inductor_logger
-from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
-
-from .padding import insert_bmm_padding, insert_restickify_padding
-from .temp_passes import (
-    bmm_unflatten_pass,
-    decompose_addmm,
-    mm_to_bmm_pass,
-)
-from .wsr.coarse_tile import validate_coarse_tile_groups
-from .wsr.coarse_tile_span_overflow import span_overflow_groups
-from .wsr.coarse_tile_hints import (
-    hints_to_coarse_tile_groups,
-    reorder_unhinted_interlopers,
-)
 from . import config
-from .propagate_hints import (
-    collect_spyre_hints,
-)
-from .wsr.propagate_named_dims import (
-    propagate_named_dims,
-    validate_named_dims,
-    assign_dim_hints,
-)
-from .propagate_layouts import (
-    propagate_mutation_layouts,
-    propagate_spyre_tensor_layouts,
-)
-from .optimize_restickify import optimize_restickify_locations
+
+# The module as well as the names: ``LAST_REPORT`` is per-thread storage resolved
+# through a module ``__getattr__``, so it has to be read as an attribute at call time.
+# ``from .cost_model_pass import LAST_REPORT`` would bind one thread's value forever.
+from . import cost_model_pass as cost_model_pass_module
+from .constants import DEVICE_NAME
+from .cost_model_pass import CostReport, cost_model_pass
+from .deadcode_elimination import deadcode_elimination
+from .dedup_constants import dedup_and_promote_constants
+from .dump_cost_model import dump_cost_model
+from .enforce_indirect_access_layout import enforce_indirect_access_layout
+from .fusion import spyre_fuse_nodes
+from .hbm_pool_planning import hbm_pool_planning
 from .insert_restickify import (
     finalize_layouts,
     insert_post_mutation_restickify,
     insert_restickify,
     validate_no_restickify_on_mutation_targets,
 )
-from .enforce_indirect_access_layout import enforce_indirect_access_layout
-from .hbm_pool_planning import hbm_pool_planning
-from .work_division import (
-    span_reduction,
-    work_distribution,
-    cost_model_matmul_division,
+from .logging_utils import get_inductor_logger
+from .optimize_restickify import optimize_restickify_locations
+from .padding import insert_bmm_padding, insert_restickify_padding
+from .pass_utils import finalize_work_division_for_scheduler, format_operations
+from .propagate_hints import (
+    collect_spyre_hints,
 )
-from .pass_utils import format_operations, finalize_work_division_for_scheduler
-from .scratchpad.allocator import (
-    scratchpad_planning,
+from .propagate_layouts import (
+    propagate_mutation_layouts,
+    propagate_spyre_tensor_layouts,
 )
-from .fusion import spyre_fuse_nodes
+from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
+from .read_copy_elision import elide_proven_read_copies
 from .scheduler import (
     align_lx_producer_loop_order,
     build_loop_scheduler_nodes,
     demote_incoherent_lx_buffers,
     verify_carried_reduction_ownership,
 )
-from .constants import DEVICE_NAME
-from .deadcode_elimination import deadcode_elimination
-from .dedup_constants import dedup_and_promote_constants
-from .read_copy_elision import elide_proven_read_copies
-from .wsr.coarse_tile import coarse_tile_post_stickify, coarse_tile_pre_stickify
-from .dump_cost_model import dump_cost_model
-
-# The module as well as the names: ``LAST_REPORT`` is per-thread storage resolved
-# through a module ``__getattr__``, so it has to be read as an attribute at call time.
-# ``from .cost_model_pass import LAST_REPORT`` would bind one thread's value forever.
-from . import cost_model_pass as cost_model_pass_module
-from .cost_model_pass import CostReport, cost_model_pass
+from .scratchpad.allocator import (
+    scratchpad_planning,
+)
 from .split_multi_ops import split_multi_ops, validate_ops
-
+from .temp_passes import (
+    bmm_unflatten_pass,
+    decompose_addmm,
+    mm_to_bmm_pass,
+    shared_rhs_bmm_pass,
+)
+from .work_division import (
+    cost_model_matmul_division,
+    span_reduction,
+    work_distribution,
+)
+from .wsr.coarse_tile import (
+    coarse_tile_post_stickify,
+    coarse_tile_pre_stickify,
+    validate_coarse_tile_groups,
+)
+from .wsr.coarse_tile_hints import (
+    hints_to_coarse_tile_groups,
+    reorder_unhinted_interlopers,
+)
+from .wsr.coarse_tile_span_overflow import span_overflow_groups
+from .wsr.propagate_named_dims import (
+    assign_dim_hints,
+    propagate_named_dims,
+    validate_named_dims,
+)
 
 logger = get_inductor_logger("passes")
 
@@ -246,6 +248,7 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 # falling back to extern_kernels.addmm.
                 decompose_addmm,
                 mm_to_bmm_pass.apply,
+                shared_rhs_bmm_pass.apply,
                 bmm_unflatten_pass.apply,
             ]
         )

@@ -16,11 +16,11 @@
 import builtins
 import dataclasses
 import itertools
-import sympy
 import logging
 import math
 from collections.abc import Callable
 
+import sympy
 from sympy import Expr, Integer, Symbol, divisors
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -54,6 +54,7 @@ from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
     SchedNodeArg,
+    commit_iteration_space_ownership,
     compute_granularity,
     compute_max_size,
     concretize_expr,
@@ -61,7 +62,6 @@ from .pass_utils import (
     finite_upper_or_none,
     get_mem_deps_from_rw,
     iteration_space_from_op,
-    commit_iteration_space_ownership,
     op_read_writes,
 )
 from .propagate_hints import get_op_hints
@@ -504,7 +504,49 @@ def get_per_core_span(
         per_core_size = per_core_max - per_core_min + 1
         if per_core_size > 1:
             stride_elems = math.prod(device_size[d + 1 :])
-            return per_core_size * stride_elems * itemsize
+            # The first varying coordinate determines the coarse physical
+            # stride, but a split on a physically trailing bare-symbol
+            # coordinate can still shorten the address range within its final
+            # outer-coordinate slice.  This matters for layouts such as
+            # [B, H_sticks, L, stick], where work division splits L while the
+            # first varying coordinate is H_sticks.
+            #
+            # Start with the full trailing span used by the historical
+            # calculation, then narrow only dimensions whose coordinate is a
+            # bare split symbol.  Keep the declared physical extent for
+            # constants and complex expressions (floor/mod/add): shrinking
+            # those without proving their extrema could underestimate the
+            # hardware-visible address span.
+            inner_span_elems = stride_elems
+            # The final device coordinate is the within-stick coordinate (the
+            # final two for QFP8WT).  Work division treats sticks as atomic, so
+            # they must retain their full physical extents even if an expression
+            # happens to be a bare symbol.
+            num_stick_dims = (
+                2
+                if getattr(td.layout.device_layout, "element_arrangement", None)
+                == ElementArrangement.QFP8WT
+                else 1
+            )
+            for inner_d in range(d + 1, len(device_size) - num_stick_dims):
+                inner_coord = td.device_coords[inner_d]
+                if not inner_coord.is_Symbol:
+                    continue
+                split = splits.get(inner_coord, 1)
+                if split <= 1:
+                    continue
+                full_extent = int(device_size[inner_d])
+                logical_extent = _effective_size(
+                    inner_coord, it_space_orig, symbol_meta
+                )
+                per_core_extent = min(
+                    full_extent, (logical_extent + split - 1) // split
+                )
+                inner_stride_elems = math.prod(device_size[inner_d + 1 :])
+                inner_span_elems -= (full_extent - per_core_extent) * inner_stride_elems
+
+            span_elems = (per_core_size - 1) * stride_elems + inner_span_elems
+            return span_elems * itemsize
     return itemsize
 
 
@@ -592,14 +634,13 @@ def must_split_vars(
             split_vars = [
                 v
                 for v in coord.free_symbols
-                if _effective_size(v, it_space_orig, symbol_meta) > 1
+                if v not in blocked
+                and _effective_size(v, it_space_orig, symbol_meta) > 1
             ]
             if not split_vars:
                 continue
 
             def valid_splits(v: Symbol) -> list[int]:
-                if v in blocked:
-                    return [1]
                 current_min = accumulated_splits.get(v, 1)
                 if v in symbol_meta:
                     basis = symbol_meta[v][1]

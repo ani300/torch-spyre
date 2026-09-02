@@ -18,12 +18,9 @@ import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import sympy
-
-from .logging_utils import get_inductor_logger
-
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -32,7 +29,10 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
+
 from torch_spyre._C import SpyreTensorLayout
+
+from .logging_utils import get_inductor_logger
 from .pass_utils import (
     compute_restickify_needed,
     device_coordinates,
@@ -59,12 +59,16 @@ class EdgeCostMap:
         target_layouts: list,
         target_dep: "MemoryDep",
         op,
+        force_target_layout: Callable[[SpyreTensorLayout], bool] | None = None,
+        exact_target: bool = False,
     ):
         self.dep = dep
         self._op = op
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
+        self._force_target_layout = force_target_layout
+        self._exact_target = exact_target
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
 
@@ -95,8 +99,30 @@ class EdgeCostMap:
           SpyreTensorLayout  — feasible restickify target layout
         """
         needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
+            in_stl,
+            self._dep_layout,
+            self.dep,
+            target_stl,
+            self._target_dep,
+            self._op,
+            exact_target=self._exact_target,
         )
+        if (
+            (tgt is not None or not needed)
+            and in_stl != target_stl
+            and self._force_target_layout is not None
+            and self._force_target_layout(in_stl)
+        ):
+            # Some hardware ops constrain more than the within-stick variable.
+            # Use their exact target after the ordinary feasibility check has
+            # proved both endpoints representable.  Ordinary stick analysis
+            # may synthesize a weaker target which only moves the within-stick
+            # variable; that is insufficient for constraints such as collapsing
+            # a factorized matmul dimension.  Keep an infeasible ``(True,
+            # None)`` result authoritative.  The predicate is evaluated per
+            # input candidate; applying one selected candidate's property to
+            # the whole edge makes layout choice depend on candidate ordering.
+            needed, tgt = True, target_stl
         if not needed:
             cost = 0.0
             self._layout[in_stl][target_stl] = None
@@ -141,6 +167,17 @@ class RestickNodeCost(abc.ABC):
 
     def __init__(self, edge_costs):
         self.edge_costs = edge_costs
+
+    def _layouts_by_edge(
+        self, in_layouts: "list[SpyreTensorLayout]"
+    ) -> "list[SpyreTensorLayout]":
+        """Validate the optimizer supplied one layout per semantic edge."""
+        if len(in_layouts) != len(self.edge_costs):
+            raise ValueError(
+                "input-layout cardinality does not match semantic edges: "
+                f"layouts={len(in_layouts)}, edges={len(self.edge_costs)}"
+            )
+        return in_layouts
 
     @abc.abstractmethod
     def cost(
@@ -228,10 +265,14 @@ class AllSameNode(RestickNodeCost):
     def cost(
         self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
+        edge_layouts = self._layouts_by_edge(in_layouts)
+        co_offset = len(self._input_edge_costs)
         input_cost = sum(
-            ec.cost(lk, out_stl)
-            for ec, lk in zip(
-                self._input_edge_costs, in_layouts[: len(self._input_edge_costs)]
+            ec.cost(layout, out_stl)
+            for ec, layout in zip(
+                self._input_edge_costs,
+                edge_layouts[:co_offset],
+                strict=True,
             )
         )
         if input_cost >= INF:
@@ -239,9 +280,12 @@ class AllSameNode(RestickNodeCost):
         # Co-output edges: the shared buffer must have the exact same STL as this op's
         # output. Any mismatch means two mutation ops write the same buffer with different
         # layouts, which is always wrong — cost INF, not a restickify.
-        co_offset = len(self._input_edge_costs)
-        for ec, lk in zip(self._output_edge_costs, in_layouts[co_offset:]):
-            if lk is not None and lk != out_stl:
+        for _ec, layout in zip(
+            self._output_edge_costs,
+            edge_layouts[co_offset:],
+            strict=True,
+        ):
+            if layout is not None and layout != out_stl:
                 return INF
         return input_cost
 
@@ -249,18 +293,21 @@ class AllSameNode(RestickNodeCost):
         return [(ec, out_stl) for ec in self._input_edge_costs]
 
     def min_input_cost(self, dep_name, in_stl, out_stl):
-        # next() takes the first match; if dep_name appears twice (x+x), both edges
-        # are identical so the cost is the same either way.
-        ec = next(e for e in self.edge_costs if e.dep.name == dep_name)
-        edge_c = ec.cost(in_stl, out_stl)
-        if edge_c == INF:
+        # One producer may occupy multiple operand positions (for example
+        # x+x).  The backward DP knows the producer layout once, so account for
+        # every matching edge rather than silently taking the first by name.
+        matches = [e for e in self.edge_costs if e.dep.name == dep_name]
+        if not matches:
+            return INF
+        edge_costs = [e.cost(in_stl, out_stl) for e in matches]
+        if any(edge_c == INF for edge_c in edge_costs):
             return INF
         other_ok = all(
             any(e.cost(other_c, out_stl) < INF for other_c in e._in_layouts)
             for e in self.edge_costs
             if e.dep.name != dep_name
         )
-        return edge_c if other_ok else INF
+        return sum(edge_costs) if other_ok else INF
 
 
 class FixedInOutNode(RestickNodeCost):
@@ -279,11 +326,43 @@ class FixedInOutNode(RestickNodeCost):
         self.required_in_stls = required_in_stls
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op):
+    def from_args(
+        cls,
+        args,
+        out_stl,
+        req_stls,
+        op,
+        force_target_layouts=None,
+        exact_target_layouts=None,
+    ):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
+        assert len(args) == len(req_stls), (
+            "FixedInOutNode.from_args requires one target per semantic edge: "
+            f"args={len(args)}, targets={len(req_stls)}"
+        )
+        if force_target_layouts is None:
+            force_target_layouts = [None] * len(args)
+        assert len(force_target_layouts) == len(args)
+        if exact_target_layouts is None:
+            exact_target_layouts = [False] * len(args)
+        assert len(exact_target_layouts) == len(args)
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
-            for arg, req in zip(args, req_stls)
+            EdgeCostMap(
+                arg.dep,
+                arg.layouts,
+                [req],
+                arg.dep,
+                op,
+                force_target_layout=force_target,
+                exact_target=exact_target,
+            )
+            for arg, req, force_target, exact_target in zip(
+                args,
+                req_stls,
+                force_target_layouts,
+                exact_target_layouts,
+                strict=True,
+            )
         ]
         return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
 
@@ -292,13 +371,19 @@ class FixedInOutNode(RestickNodeCost):
     ) -> float:
         if out_stl != self.required_out_stl:
             return INF
+        edge_layouts = self._layouts_by_edge(in_layouts)
         return sum(
             ec.cost(lk, rk)
-            for ec, lk, rk in zip(self.edge_costs, in_layouts, self.required_in_stls)
+            for ec, lk, rk in zip(
+                self.edge_costs,
+                edge_layouts,
+                self.required_in_stls,
+                strict=True,
+            )
         )
 
     def required_input_stls(self, out_stl):
-        return list(zip(self.edge_costs, self.required_in_stls))
+        return list(zip(self.edge_costs, self.required_in_stls, strict=True))
 
     def min_input_cost(self, dep_name, in_stl, out_stl):
         if out_stl != self.required_out_stl:
@@ -710,12 +795,16 @@ def beam_global_min_cost(operations: list) -> None:
             f"op {op.get_name()} has layouts but no restick_cost_fn"
         )
         cost_fn = op.restick_cost_fn
-        deps = [ec.dep for ec in op.restick_cost_fn.edge_costs]
 
         op_future = future_min_cost.get(op.get_name(), {})
         next_states = []
         for state in frontier.states:
-            in_layouts = [frontier.input_stl(state, dep.name) for dep in deps]
+            # Follow the semantic cost edges, not raw ReadWrites cardinality.
+            # This both excludes unconstrained reads and restores exact-alias
+            # operand multiplicity by repeating the producer assignment.
+            in_layouts = [
+                frontier.input_stl(state, edge.dep.name) for edge in cost_fn.edge_costs
+            ]
 
             for candidate_stl in op.layouts:
                 extra_cost = cost_fn.cost(in_layouts, candidate_stl)

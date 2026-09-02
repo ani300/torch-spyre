@@ -15,15 +15,16 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 import dataclasses
 import threading
+from collections import OrderedDict
 from typing import Any, Literal, Sequence
 
-from sympy import Symbol, Expr, Function, sympify
-from torch_spyre._C import DataFormats, ElementArrangement
 import torch
+from sympy import Expr, Function, Symbol, sympify
+
 from torch_spyre import _C
+from torch_spyre._C import DataFormats, ElementArrangement
 
 from .constants import IDENTITY_OP
 
@@ -313,6 +314,22 @@ class OpSpec:
     # these live ranges rather than a lowering-time size snapshot.  None when the
     # node exposes no data.ranges.
     node_output_ranges: tuple[Expr, ...] | None = None
+    # Exact logical [lhs, rhs, output] shapes for matmul reductions.  These
+    # preserve operand rank and static unit dimensions after Inductor removes
+    # them from dependency expressions, so codegen can distinguish a shared
+    # rank-2 weight from a genuinely batched rank-3 weight and can restore
+    # squeezed B/M/N/K roles without inspecting physical layout accidents.
+    matmul_operand_shapes: (
+        tuple[tuple[Expr, ...], tuple[Expr, ...], tuple[Expr, ...]] | None
+    ) = None
+    # Per-operand ownership of each leading logical batch axis.  A False entry
+    # denotes an expanded/broadcast axis whose extent appears in the operand's
+    # logical shape but is absent from its storage access.  This keeps shared
+    # weights distinct from genuinely batched weights without relying on buffer
+    # names or physical-layout accidents.
+    matmul_operand_batch_dim_owners: (
+        tuple[tuple[bool, ...], tuple[bool, ...]] | None
+    ) = None
     debug_handle: DebugHandle | None = None
 
 

@@ -125,6 +125,11 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
   params->pipeline_barrier = pipeline_barrier_;
   stream.launchCompute(params);
   flex::destroyComputeParams(params);
+  // pipeline_barrier only orders this compute against earlier operations. It
+  // does not prevent a dependent same-pipeline compute from being submitted
+  // before this one's response arrives, so compiler-marked correction passes
+  // need an explicit host-observed completion boundary.
+  if (wait_for_completion_) stream.synchronize();
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
@@ -134,6 +139,8 @@ void JobPlanStepCompute::write(std::ostream& os) const {
   os << "    Bind I/O addresses: " << (bind_io_addresses_ ? "yes" : "no")
      << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
+     << "\n";
+  os << "    Wait for completion: " << (wait_for_completion_ ? "yes" : "no")
      << "\n";
 }
 

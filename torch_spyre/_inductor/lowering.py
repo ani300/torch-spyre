@@ -13,45 +13,46 @@
 # limitations under the License.
 
 
+import logging
+import threading
 from contextlib import contextmanager
+from typing import Any, Callable, Union
 from warnings import warn
 
 import sympy
 import torch
-
-from torch._inductor.ir import Reduction, Pointwise, StorageBox
-import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
-from typing import Any, Callable, Union
+import torch._inductor.lowering as lowering
+from torch._inductor.ir import Pointwise, Reduction, StorageBox
+from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 
+import torch_spyre._inductor.customops  # noqa: F401
+import torch_spyre._inductor.distributed.spyre_library  # noqa: F401
+from torch_spyre._C import get_elem_in_stick
+from torch_spyre.ops.fallbacks import fallback_ops
+
+from . import config
 from .constants import (
     AVGPOOL2D_OP,
+    BATCH_MATMUL_FP8_OP,
     BATCH_MATMUL_OP,
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
-    BATCH_MATMUL_FP8_OP,
     DEPTHWISE_CONV2D_OP,
+    MATMUL_OPERANDS_INFO_KEY,
 )
-from . import config
-import torch_spyre._inductor.customops  # noqa: F401
-import torch_spyre._inductor.distributed.spyre_library  # noqa: F401
-from torch_spyre.ops.fallbacks import fallback_ops
+from .errors import Unsupported
 from .ir import (
-    SpyreReduction,
-    SpyreConstantFallback,
-    SpyreEmptyFallback,
-    BroadcastAsyncFallback,
-    WaitWorkFallback,
     AllGatherAsyncFallback,
     AllReduceAsyncFallback,
+    BroadcastAsyncFallback,
+    SpyreConstantFallback,
+    SpyreEmptyFallback,
+    SpyreReduction,
+    WaitWorkFallback,
 )
-from torch_spyre._C import get_elem_in_stick
-from torch._inductor.virtualized import V
-from torch.utils._ordered_set import OrderedSet
-from .errors import Unsupported
-import threading
 from .logging_utils import get_inductor_logger
-import logging
 
 logger = get_inductor_logger("lowering")
 
@@ -325,6 +326,129 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     buf.origins = OrderedSet([fx_node])
 
 
+def _matmul_batch_dim_owners(operand, shape) -> tuple[bool, ...]:
+    """Return which leading matmul axes are physically owned by ``operand``.
+
+    An expanded shared weight has a logical ``[B, K, N]`` shape but no storage
+    dependence on ``B``.  Preserve that distinction while lowering can still
+    see the view's strides and underlying storage rank.  The storage-rank check
+    also catches ``unsqueeze(...).expand(1, ...)``: no stride becomes zero when
+    the requested extent is already one, but the complete rank-2 storage shape
+    remains an exact suffix of the rank-3 view.
+    """
+    shape = tuple(shape)
+    batch_rank = max(0, len(shape) - 2)
+    if batch_rank == 0:
+        return ()
+
+    owners: list[bool | None] = [None] * batch_rank
+    try:
+        strides = tuple(operand.get_stride())
+    except (AttributeError, NotImplementedError, TypeError):
+        strides = None
+    if strides is not None:
+        if len(strides) != len(shape):
+            raise Unsupported(
+                "cannot determine matmul batch-dimension ownership: "
+                f"shape rank {len(shape)} does not match stride rank "
+                f"{len(strides)} for shape {shape!r} and strides {strides!r}"
+            )
+        for dim in range(batch_rank):
+            # Expanded axes have a literal zero stride in Inductor IR.  A
+            # symbolic nonzero expression still denotes an owned axis: its
+            # runtime value may depend on dynamic extents, but it is not an
+            # expand/broadcast stride.
+            owners[dim] = sympy.simplify(strides[dim]) != 0
+
+    # TensorBox -> StorageBox -> BaseView is the ordinary representation of an
+    # unsqueeze/expand passed to a lowering.  ReinterpretView unwraps nested
+    # views, leaving the original storage rank observable through ``data``.
+    node = getattr(operand, "data", None)
+    if isinstance(node, StorageBox):
+        node = node.data
+    if isinstance(node, ir.BaseView):
+        base = getattr(node, "data", None)
+        if base is None:
+            base_shape = None
+        else:
+            try:
+                base_shape = tuple(base.get_size())
+            except (AttributeError, NotImplementedError, TypeError):
+                base_shape = None
+        if base_shape is None:
+            raise Unsupported(
+                "cannot determine matmul batch-dimension ownership: "
+                f"unable to inspect the base shape for view {type(node).__name__}"
+            )
+        inserted = len(shape) - len(base_shape)
+        if (
+            0 < inserted <= batch_rank
+            and len(shape[inserted:]) == len(base_shape)
+            and all(
+                sympy.simplify(a - b) == 0 for a, b in zip(shape[inserted:], base_shape)
+            )
+        ):
+            owners[:inserted] = [False] * inserted
+
+    unresolved = [dim for dim, owner in enumerate(owners) if owner is None]
+    if unresolved:
+        raise Unsupported(
+            "cannot determine matmul batch-dimension ownership: "
+            f"unresolved batch axes {unresolved} for shape {shape!r}"
+        )
+    return tuple(owner for owner in owners if owner is not None)
+
+
+def _matmul_operands_info(
+    lhs, rhs, lhs_shape, rhs_shape, output_shape
+) -> dict[str, Any]:
+    """Preserve matmul semantics while lowering can still inspect its views.
+
+    The current Spyre matmul reductions support an lhs-shaped batch prefix and
+    either a shared rank-2 rhs or an rhs with that same batch prefix.  Validate
+    the contract here, before malformed metadata can become a schedulable IR
+    node and be mistaken for a physical-layout problem later in codegen.
+    """
+    lhs_shape = tuple(lhs_shape)
+    rhs_shape = tuple(rhs_shape)
+    output_shape = tuple(output_shape)
+
+    def same_shape(first, second):
+        return len(first) == len(second) and all(
+            sympy.simplify(a - b) == 0 for a, b in zip(first, second)
+        )
+
+    valid = (
+        len(lhs_shape) >= 2
+        and len(output_shape) == len(lhs_shape)
+        and len(rhs_shape) in (2, len(lhs_shape))
+        and same_shape(output_shape[:-2], lhs_shape[:-2])
+        and (len(rhs_shape) == 2 or same_shape(rhs_shape[:-2], lhs_shape[:-2]))
+        and same_shape(output_shape[-2:-1], lhs_shape[-2:-1])
+        and same_shape(output_shape[-1:], rhs_shape[-1:])
+        and same_shape(lhs_shape[-1:], rhs_shape[-2:-1])
+    )
+    if not valid:
+        raise Unsupported(
+            "invalid matmul contract: "
+            f"lhs={lhs_shape!r}, rhs={rhs_shape!r}, output={output_shape!r}"
+        )
+
+    return {
+        MATMUL_OPERANDS_INFO_KEY: {
+            "shapes": (
+                lhs_shape,
+                rhs_shape,
+                output_shape,
+            ),
+            "batch_dim_owners": (
+                _matmul_batch_dim_owners(lhs, lhs_shape),
+                _matmul_batch_dim_owners(rhs, rhs_shape),
+            ),
+        }
+    }
+
+
 @register_spyre_lowering(torch.ops.spyre.scaled_mm.default)
 def lower_scaled_mm(
     mat1,
@@ -384,7 +508,7 @@ def lower_scaled_mm(
             f"_scaled_mm with shapes {mat1_size} and {mat2_size} not supported"
         )
 
-    result = Reduction.create(
+    result = SpyreReduction.create(
         reduction_type=BATCH_MATMUL_FP8_OP,
         input_node=[mat1, mat2],
         device=mat1.get_device(),
@@ -393,6 +517,7 @@ def lower_scaled_mm(
         inner_fn=inner_fn,
         ranges=ranges,
         reduction_ranges=[reduction_numel],
+        op_info=_matmul_operands_info(mat1, mat2, mat1_size, mat2_size, ranges),
     )
 
     result.realize()
@@ -447,7 +572,7 @@ def lower_mm(x, y):
         # Reduction degenerates to a pointwise mul
         result = lowering.mul(x, y)
     else:
-        result = Reduction.create(
+        result = SpyreReduction.create(
             reduction_type=BATCH_MATMUL_OP,
             input_node=[x, y],
             device=x.get_device(),
@@ -456,6 +581,7 @@ def lower_mm(x, y):
             inner_fn=inner_fn,
             ranges=ranges,
             reduction_ranges=[reduction_numel],
+            op_info=_matmul_operands_info(x, y, x_size, y_size, ranges),
         )
 
     result.realize()
@@ -519,7 +645,7 @@ def lower_bmm(x, y):
         # Reduction degenerates to a pointwise mul
         result = lowering.mul(x, y)
     else:
-        result = Reduction.create(
+        result = SpyreReduction.create(
             reduction_type=BATCH_MATMUL_OP,
             input_node=[x, y],
             device=x.get_device(),
@@ -528,6 +654,7 @@ def lower_bmm(x, y):
             inner_fn=inner_fn,
             ranges=ranges,
             reduction_ranges=[reduction_numel],
+            op_info=_matmul_operands_info(x, y, x_size, y_size, ranges),
         )
 
     result.realize()

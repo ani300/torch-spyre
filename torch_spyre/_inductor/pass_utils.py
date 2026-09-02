@@ -19,9 +19,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, Optional, Sequence, TypeVar, Union
 
 import regex
-import torch
 import sympy
+import torch
 from sympy import Expr, Symbol
+from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep, is_indirect
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
@@ -34,21 +36,20 @@ from torch._inductor.ir import (
 )
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
-from torch._inductor.graph import GraphLowering
-from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep, is_indirect
 from torch._inductor.virtualized import V
+
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorWorkDivision
 
 from . import config
-from .core_mapping import core_to_slice_mapping
 from .constants import (
     ELIDED_COPY_BACK_ATTR,
     KEEP_BY_INDEX_OP,
     MATMUL_REDUCTION_OPS,
     TOPK_OPS,
 )
+from .core_mapping import core_to_slice_mapping
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
@@ -1852,6 +1853,11 @@ def compute_restickify_target_layout(
     """Compute the target STL that results from moving stl's stick to target_stick_expr.
     Returns None if the restickify is infeasible.
     """
+    # A zero/symbol-free stick has no host dimension to move onto.  FixedInOut
+    # exact-target edges handle explicit sparse layouts directly; all general
+    # edges must report this target as infeasible instead of raising StopIteration.
+    if not target_stick_expr.free_symbols:
+        return None
     new_sd = matching_dim(ic, target_stick_expr)
     if new_sd is None:
         return None
@@ -1921,6 +1927,8 @@ def compute_restickify_needed(
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
+    *,
+    exact_target: bool = False,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
@@ -1929,6 +1937,9 @@ def compute_restickify_needed(
 
     op: when provided, index-role deps (gather indices) are never stick-constrained
     and always return (False, None).
+    exact_target: permits a fixed-layout consumer to request a symbol-free
+    target explicitly.  This is intentionally not inferred from dependency
+    object identity.
 
     Returns:
       (False, None)   — stick-compatible: no restickify needed
@@ -1959,6 +1970,13 @@ def compute_restickify_needed(
         return False, None
     ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]
+
+    if target_stick == sympy.S.Zero and exact_target:
+        # A sparse required STL deliberately has no symbol on its stick, so
+        # ordinary symbol-based restickification cannot synthesize it.  Both
+        # endpoint coordinate systems were validated above; materialize the
+        # specified target only when the caller explicitly requires it.
+        return True, out_stl
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
         # No output dim carries the input's stick var, so compute_restickify_target_layout

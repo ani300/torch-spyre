@@ -516,6 +516,17 @@ PYBIND11_MODULE(_C, m) {
           py::arg("idx"),
           "Get the pipeline_barrier flag for the step at the given index")
       .def(
+          "get_step_wait_for_completion",
+          [](const spyre::JobPlan& plan, size_t idx) {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            const auto* compute =
+                dynamic_cast<const spyre::JobPlanStepCompute*>(
+                    plan.steps[idx].get());
+            return compute != nullptr && compute->getWaitForCompletion();
+          },
+          py::arg("idx"),
+          "Get whether a compute step synchronizes before the next step")
+      .def(
           "get_step_stream_role",
           [](const spyre::JobPlan& plan, size_t idx) {
             TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");

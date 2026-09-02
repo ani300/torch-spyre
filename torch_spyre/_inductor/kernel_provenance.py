@@ -50,7 +50,6 @@ from torch_spyre._inductor.op_spec import (
     TensorWorkDivision,
 )
 
-
 # Bump this only when existing v1 identities would be reinterpreted, or when the
 # key width changes. New optional fields may extend identity without a bump when
 # they are omitted for all previously representable bundles.
@@ -70,6 +69,8 @@ _EXPECTED_OP_SPEC_SCHEMA = {
     "tiled_symbol_trip_counts": "dict[Symbol, int]",
     "symbolic_dim_bounds": "dict[str, tuple[int, int]]",
     "node_output_ranges": "tuple[Expr, ...] | None",
+    "matmul_operand_shapes": "tuple[tuple[Expr, ...], tuple[Expr, ...], tuple[Expr, ...]] | None",
+    "matmul_operand_batch_dim_owners": "tuple[tuple[bool, ...], tuple[bool, ...]] | None",
     "debug_handle": "DebugHandle | None",
 }
 _EXPECTED_TENSOR_ARG_SCHEMA = {
@@ -276,6 +277,16 @@ def _canonical_spec(spec: object) -> object:
         ):
             result["core_id_to_work_slice"] = _canonical_value(
                 spec.core_id_to_work_slice
+            )
+        # Preserve all existing v1 identities for non-matmul specs while making
+        # logical operand semantics part of a matmul bundle's cache identity.
+        if spec.matmul_operand_shapes is not None:
+            result["matmul_operand_shapes"] = _canonical_value(
+                spec.matmul_operand_shapes
+            )
+        if spec.matmul_operand_batch_dim_owners is not None:
+            result["matmul_operand_batch_dim_owners"] = _canonical_value(
+                spec.matmul_operand_batch_dim_owners
             )
         return result
     if isinstance(spec, LoopSpec):

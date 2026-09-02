@@ -23,6 +23,7 @@ import tempfile
 
 import pytest
 import torch
+
 import torch_spyre
 
 
@@ -218,6 +219,43 @@ class TestPrepareKernel:
 
             # First step should be ComputeSpecialize
             assert job_plan.get_step_type(0) == "Compute"
+
+    @pytest.mark.parametrize(
+        ("encoded", "expected"),
+        [(True, True), ("true", True), (False, False), ("false", False)],
+    )
+    def test_compute_wait_for_completion_is_opt_in(self, encoded, expected):
+        """Parse an explicit completion boundary without changing defaults."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir,
+                exec_properties={
+                    "job_bin_ptr": "120259084288",
+                    "wait_for_completion": encoded,
+                },
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_wait_for_completion(0) is expected
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_wait_for_completion(0) is False
+
+    def test_compute_wait_for_completion_rejects_invalid_value(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir,
+                exec_properties={
+                    "job_bin_ptr": "120259084288",
+                    "wait_for_completion": "eventually",
+                },
+            )
+
+            with pytest.raises(RuntimeError, match="wait_for_completion.*true.*false"):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
 
     def test_profiler_name_overrides_spyrecode_name_and_adds_step_suffix(self):
         """Compiler provenance name identifies every device-compute step."""

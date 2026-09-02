@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+
 from torch_spyre._C import ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
@@ -112,6 +113,13 @@ COPY_BACK_CANDIDATE_ATTR = "_spyre_copy_back_candidate"
 # writes a graph input directly. Downstream passes use this to distinguish a
 # compute mutation op from a pure-copy mutation op.
 ELIDED_COPY_BACK_ATTR = "_spyre_writes_copy_back_target"
+
+# Ordered logical operand semantics for matmul reductions. Lowering attaches
+# shapes and batch-axis ownership to ``SpyreReduction.op_info``. SpyreKernel
+# carries those semantic fields into a typed OpSpec so codegen does not infer
+# them from physical-layout accidents.
+MATMUL_OPERANDS_INFO_KEY = "matmul_operands"
+
 
 SEGMENT_OFFSETS = [
     0x0,

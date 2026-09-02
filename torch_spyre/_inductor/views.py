@@ -14,13 +14,13 @@
 
 # Helper methods to handle views
 
-from dataclasses import dataclass, astuple
 import math
-import sympy
+from dataclasses import astuple, dataclass
 from typing import Callable, Dict, Optional, Sequence, Tuple, cast
-from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
+import sympy
 from torch._inductor.virtualized import V
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from .errors import Unsupported
 
@@ -783,13 +783,19 @@ def _concrete_alignment_value(expr: sympy.Expr) -> int | float:
 
 def align_tensors_pure(
     inputs: AlignmentInputs,
+    *,
+    synthetic_axis_origins: "dict[sympy.Symbol, list[tuple[int, int, int]]] | None" = None,
 ) -> tuple[
     dict[sympy.Symbol, tuple[sympy.Expr, int]],
     list[dict[str, list]],
     dict[sympy.Symbol, tuple[tuple[sympy.Symbol, int], ...]],
 ]:
-    """
-    Transform tensor coordinates using only the supplied immutable snapshot.
+    """Transform tensor coordinates using only the supplied immutable snapshot.
+
+    When ``synthetic_axis_origins`` is provided, populate it with the source
+    tensor, physical dimension, and constant-axis ordinal for each placeholder
+    created by coordinate normalization.  This is captured before missing
+    placeholders are broadcast to the other tensors.
     """
 
     # Concretize range values for the algorithm: align_tensors performs
@@ -825,16 +831,54 @@ def align_tensors_pure(
     stick_dim = []  # stick var for each tensor
     stick_size = []  # stick size for each tensor
 
-    for tensor in tensors:
+    for tensor_index, tensor in enumerate(tensors):
         _synthetic_var_idx = 0  # reuse synthetic_var across tensors
+        tensor_synthetic_vars: list[sympy.Symbol] = []
+
+        if synthetic_axis_origins is not None:
+            constant_axis_indices = [
+                dim_index
+                for dim_index, coordinate in enumerate(tensor["coordinates"][:-1])
+                if not sympy.sympify(coordinate)
+                .replace(sympy.floor, lambda value: value)
+                .free_symbols
+            ]
+            synthesized_axis_indices = [
+                dim_index
+                for dim_index in constant_axis_indices
+                if tensor["size"][dim_index] > 1
+            ]
+
+            def tensor_synthetic_var():
+                var = synthetic_var()
+                tensor_synthetic_vars.append(var)
+                return var
+
+            synthetic_var_fn = tensor_synthetic_var
+        else:
+            synthetic_var_fn = synthetic_var
+
         terms = normalize_coordinates(
             var_ranges,
             tensor["size"],
             tensor["coordinates"],
-            synthetic_var,
+            synthetic_var_fn,
             indirect_sizes,
             _concrete_alignment_value,
         )
+        if synthetic_axis_origins is not None:
+            if len(tensor_synthetic_vars) != len(synthesized_axis_indices):
+                raise Unsupported(
+                    "coordinate normalization lost synthetic-axis provenance"
+                )
+            constant_axis_ordinals = {
+                dim_index: ordinal
+                for ordinal, dim_index in enumerate(constant_axis_indices)
+            }
+            for var, dim_index in zip(tensor_synthetic_vars, synthesized_axis_indices):
+                synthetic_axis_origins.setdefault(var, []).append(
+                    (tensor_index, dim_index, constant_axis_ordinals[dim_index])
+                )
         stick_dim.append(terms[-1].var)
         stick_size.append(terms[-1].dim_size)
         all_terms.append(terms)
@@ -1063,6 +1107,8 @@ def align_tensors(
     tensors: list[Dict[str, list[sympy.Expr]]],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
     repeat_info: "dict[sympy.Symbol, dict] | None" = None,
+    *,
+    synthetic_axis_origins: "dict[sympy.Symbol, list[tuple[int, int, int]]] | None" = None,
 ) -> tuple[
     dict[sympy.Symbol, tuple[sympy.Expr, int]],
     list[dict[str, list]],
@@ -1071,7 +1117,8 @@ def align_tensors(
     """Build explicit alignment inputs, then run the pure implementation."""
 
     return align_tensors_pure(
-        build_alignment_inputs(iteration_space, tensors, indirect_sizes, repeat_info)
+        build_alignment_inputs(iteration_space, tensors, indirect_sizes, repeat_info),
+        synthetic_axis_origins=synthetic_axis_origins,
     )
 
 

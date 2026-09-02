@@ -86,9 +86,9 @@ def _hint_key(op: Operation) -> frozenset | None:
 
 
 def _is_movable_interloper(op: Operation) -> bool:
-    """True if op is eligible to be relocated by reorder_unhinted_interlopers.
+    """True if an op is safe for dependency-checked relocation.
 
-    Either an unhinted ComputedBuffer, or a seed-allocator fallback
+    A ComputedBuffer, or a seed-allocator fallback
     (SpyreConstantFallback/SpyreEmptyFallback) — a one-time scalar/buffer
     materialization with no per-iteration significance. A general
     FallbackKernel is deliberately excluded: it may carry real data-flow
@@ -121,11 +121,30 @@ def _no_dep_conflict(op: Operation, others: list[Operation]) -> bool:
     op_written = _written_names(op)
     op_needs = op.get_read_names() | set(op.get_mutation_names())
     for other in others:
-        if not isinstance(other, ComputedBuffer):
-            continue
-        if op_written & other.get_read_names():
+        if not _is_movable_interloper(other):
+            hints_logger.debug(
+                "cannot move %s across opaque op %s",
+                op.get_name(),
+                other.get_name(),
+            )
             return False
-        if _written_names(other) & op_needs:
+        later_reads = op_written & other.get_read_names()
+        if later_reads:
+            hints_logger.debug(
+                "cannot move %s across %s: crossed op reads %s",
+                op.get_name(),
+                other.get_name(),
+                sorted(later_reads),
+            )
+            return False
+        earlier_writes = _written_names(other) & op_needs
+        if earlier_writes:
+            hints_logger.debug(
+                "cannot move %s across %s: candidate reads/mutates %s",
+                op.get_name(),
+                other.get_name(),
+                sorted(earlier_writes),
+            )
             return False
     return True
 
@@ -163,13 +182,47 @@ def _can_move_after(
     return _no_dep_conflict(op, ops[start + 1 : end])
 
 
-def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
-    """Move unhinted ComputedBuffer ops that interrupt hint-group runs.
+def _unhinted_predecessor_closure(
+    op: Operation,
+    ops: list[Operation],
+    start: int,
+    end: int,
+) -> list[Operation] | None:
+    """Return movable unhinted producers that ``op`` needs in ``ops[start:end]``.
 
-    ``hints_to_coarse_tile_groups`` treats unhinted ops as run-breakers.
-    This pass attempts to move each such op either just before the run it
-    splits or just after the last same-key op in the remainder, so the run
-    becomes contiguous.
+    The returned operations are in their original order.  ``None`` means the
+    dependency closure reaches another hint scope or an opaque operation and
+    therefore cannot be hoisted safely by this pass.
+    """
+    needed = op.get_read_names() | set(op.get_mutation_names())
+    predecessors: list[Operation] = []
+    for candidate in reversed(ops[start:end]):
+        written = _written_names(candidate)
+        if not written & needed:
+            continue
+        if _hint_key(candidate) is not None or not _is_movable_interloper(candidate):
+            return None
+        predecessors.append(candidate)
+        needed.update(candidate.get_read_names())
+        needed.update(candidate.get_mutation_names())
+    predecessors.reverse()
+    return predecessors
+
+
+def _index_by_identity(ops: list[Operation], target: Operation) -> int:
+    return next(i for i, op in enumerate(ops) if op is target)
+
+
+def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
+    """Make each hint-scope run contiguous when dependencies permit.
+
+    ``hints_to_coarse_tile_groups`` treats both unhinted ops and a different
+    hint key as run-breakers.  For an unhinted interloper, this pass attempts
+    to move the interloper before or after the run.  For a different hint key,
+    it instead pulls later ops from the current run left across that key when
+    doing so is dependency-safe.  The latter matters for branched recurrences:
+    Inductor may schedule all main branches first and their independent
+    denominator branches later, fragmenting every otherwise-valid hint scope.
 
     Algorithm — two-cursor scan over ops:
 
@@ -185,8 +238,10 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
         torch.zeros(...) that seeds an online-softmax recurrence) →
         interloper; try to relocate (see below).
       - Any other non-ComputedBuffer op (e.g. a general FallbackKernel,
-        which may carry real data-flow side effects) or differently-hinted
-        op → hard stop; break.
+        which may carry real data-flow side effects) → hard stop; break.
+      - Differently-hinted op → find the next op with the current key and
+        pull it before the different-key run when dependency-safe.  Otherwise
+        stop and let ``validate_coarse_tile_groups`` report the fragmentation.
       - Interloper → one of three outcomes:
           (a) Move before: insert at run_start, run_start += 1, j stays
               (the rotate shifts subsequent ops left so ops[j] is fresh).
@@ -231,7 +286,66 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
             if ckey == key:
                 j += 1
                 continue
-            if not _is_movable_interloper(candidate) or ckey is not None:
+            if ckey is not None:
+                next_same_key = next(
+                    (k for k in range(j + 1, len(ops)) if _hint_key(ops[k]) == key),
+                    None,
+                )
+                if next_same_key is None:
+                    break
+                if any(
+                    not _is_movable_interloper(crossed)
+                    for crossed in ops[j:next_same_key]
+                ):
+                    # Never reorder around an opaque fallback or another
+                    # operation whose effects are not represented completely
+                    # by get_read_names()/get_mutation_names().
+                    break
+                same_key_op = ops[next_same_key]
+                if _can_move_before(same_key_op, ops, j, next_same_key):
+                    ops.insert(j, ops.pop(next_same_key))
+                    j += 1
+                    continue
+
+                # The hinted op may only be blocked by an independently
+                # scheduled unhinted seed chain.  Hoist that chain before the
+                # current run, then retry the same pull.  This is the shape of
+                # online softmax after Inductor schedules denominator=zeros
+                # just before the deferred denominator-update branch.
+                predecessors = _unhinted_predecessor_closure(
+                    same_key_op, ops, j, next_same_key
+                )
+                if predecessors:
+                    trial_ops = list(ops)
+                    trial_run_start = run_start
+                    can_hoist = True
+                    for predecessor in predecessors:
+                        predecessor_idx = _index_by_identity(trial_ops, predecessor)
+                        if not _can_move_before(
+                            predecessor,
+                            trial_ops,
+                            trial_run_start,
+                            predecessor_idx,
+                        ):
+                            can_hoist = False
+                            break
+                        trial_ops.insert(
+                            trial_run_start, trial_ops.pop(predecessor_idx)
+                        )
+                        trial_run_start += 1
+                    if can_hoist:
+                        ops[:] = trial_ops
+                        run_start = trial_run_start
+                        j = _index_by_identity(ops, candidate)
+                        continue
+                hints_logger.debug(
+                    "cannot pull hinted op %s into scope %s across [%s]",
+                    same_key_op.get_name(),
+                    sorted(key),
+                    ", ".join(op.get_name() for op in ops[j:next_same_key]),
+                )
+                break
+            if not _is_movable_interloper(candidate):
                 break
             # candidate is an unhinted ComputedBuffer, or a seed-allocator
             # fallback, interrupting the run.

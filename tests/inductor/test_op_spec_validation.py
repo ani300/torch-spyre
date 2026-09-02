@@ -25,6 +25,7 @@ import sympy
 from sympy import Integer, Symbol
 
 from torch_spyre._C import DataFormats
+from torch_spyre._inductor.constants import KEEP_BY_INDEX_OP
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.op_spec_validation import (
     BINARY_OPS,
@@ -34,7 +35,6 @@ from torch_spyre._inductor.op_spec_validation import (
     _is_unimplemented_op,
     validate_op_specs,
 )
-from torch_spyre._inductor.constants import KEEP_BY_INDEX_OP
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -247,6 +247,36 @@ class TestValidateOpSpecsErrors(unittest.TestCase):
         with self.assertRaises(OpSpecValidationError) as ctx:
             validate_op_specs([op], stage="test")
         self.assertIn("symbols not in iteration_space", str(ctx.exception))
+
+    def test_matmul_implicit_unit_role_must_belong_to_operand(self):
+        op = _make_matmul_op_spec()
+        op.matmul_operand_shapes = (
+            tuple(map(Integer, (2, 1, 128))),
+            tuple(map(Integer, (2, 128, 64))),
+            tuple(map(Integer, (2, 1, 64))),
+        )
+        op.matmul_operand_batch_dim_owners = ((True,), (True,))
+        # mb is the static-unit M role for these shapes.  It belongs to
+        # lhs/output, never rhs, so its use by argument 1 must remain invalid.
+        op.args[1].device_coordinates[0] = Symbol("mb")
+
+        with self.assertRaises(OpSpecValidationError) as ctx:
+            validate_op_specs([op], stage="after_simplification")
+        self.assertIn("symbols not in iteration_space", str(ctx.exception))
+
+    def test_matmul_implicit_unit_role_is_only_valid_after_simplification(self):
+        op = _make_matmul_op_spec()
+        op.matmul_operand_shapes = (
+            tuple(map(Integer, (2, 1, 128))),
+            tuple(map(Integer, (2, 128, 64))),
+            tuple(map(Integer, (2, 1, 64))),
+        )
+        op.matmul_operand_batch_dim_owners = ((True,), (True,))
+        op.args[0].device_coordinates[0] = Symbol("mb")
+
+        with self.assertRaises(OpSpecValidationError):
+            validate_op_specs([op], stage="after_creation_loop_wrapping")
+        validate_op_specs([op], stage="after_simplification")
 
     def test_indirect_symbol_allowed_before_simplification(self):
         """Raw indirect0 symbol passes before IndirectAccess wrapping."""

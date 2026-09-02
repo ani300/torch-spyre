@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import unittest
 import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import sympy
 import torch
 from torch import fx
@@ -32,6 +32,10 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
+from utils_inductor import (
+    ParameterizedTestMeta,
+    cached_randn,
+)
 
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
@@ -39,10 +43,6 @@ from torch_spyre._inductor.pass_utils import (
     compute_granularity,
     compute_max_size,
     compute_symbolic_bounds,
-)
-from utils_inductor import (
-    ParameterizedTestMeta,
-    cached_randn,
 )
 
 
@@ -97,6 +97,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 67, 256), dtype=torch.float16).to("spyre"),
                     cached_randn((256, 128), dtype=torch.float16).to("spyre"),
                 ),
+                "4d_2d": (
+                    cached_randn((1, 32, 1, 128), dtype=torch.float16).to("spyre"),
+                    cached_randn((128, 4096), dtype=torch.float16).to("spyre"),
+                ),
                 "3d_3d": (
                     cached_randn((2, 67, 256), dtype=torch.float16).to("spyre"),
                     cached_randn((2, 256, 128), dtype=torch.float16).to("spyre"),
@@ -127,11 +131,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_linear_decomposition_graph(
         self, x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None
     ):
+        import torch._inductor.config as config
         from torch._dynamo.testing import (
             InductorAndRecordGraphs,
             normalize_gm,
         )
-        import torch._inductor.config as config
 
         config.force_disable_caches = True
 
@@ -153,8 +157,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "Expected aten.mm.default in 2D linear decomposition graph"
             )
         elif x.dim() == 3:
-            assert "aten.bmm.default" in inductor_graph_str, (
-                "Expected aten.bmm.default in 3D linear decomposition graph"
+            assert "spyre.batched_matmul.default" in inductor_graph_str, (
+                "Expected shared-weight batched_matmul in 3D linear decomposition graph"
+            )
+            assert "aten.bmm.default" not in inductor_graph_str, (
+                "The synthetic RHS batch axis should have been removed"
             )
         assert "aten.addmm" not in inductor_graph_str, (
             "Custom linear decomp should avoid addmm"
@@ -165,11 +172,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         "ignore::UserWarning"
     )  # because of forced cache disabling
     def test_unflatten_bmm_pass_graph(self, x: torch.Tensor, w: torch.Tensor):
+        import torch._inductor.config as config
         from torch._dynamo.testing import (
             InductorAndRecordGraphs,
             normalize_gm,
         )
-        import torch._inductor.config as config
 
         config.force_disable_caches = True
 
@@ -185,16 +192,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         inductor_graph_str = normalize_gm(
             backend.inductor_graphs[0].print_readable(print_output=False)
         )
-        has_batched_matmul = (
-            "aten.bmm.default" in inductor_graph_str
-            or "spyre.batched_matmul" in inductor_graph_str
-        )
-        assert has_batched_matmul, (
-            "Expected aten.bmm.default or spyre.batched_matmul after passes"
-        )
-        assert "aten.mm.default" not in inductor_graph_str, (
-            "aten.mm.default should be replaced by bmm/batched_matmul after passes"
-        )
+        if x.dim() > 3 and w.dim() == 2:
+            assert "aten.mm.default" in inductor_graph_str, (
+                "A rank-4 lhs with a shared 2D weight must retain its flattened "
+                "mm; rewriting it directly to batched_matmul changes its semantics"
+            )
+            assert "spyre.batched_matmul" not in inductor_graph_str
+        elif x.dim() == 3 and w.dim() == 2:
+            assert "spyre.batched_matmul" in inductor_graph_str, (
+                "A rank-3 lhs with a shared 2D weight should use the backend's "
+                "native 3D-by-2D batched matmul contract"
+            )
+            assert "aten.mm.default" not in inductor_graph_str
+            assert "aten.bmm.default" not in inductor_graph_str
+        else:
+            has_batched_matmul = (
+                "aten.bmm.default" in inductor_graph_str
+                or "spyre.batched_matmul" in inductor_graph_str
+            )
+            assert has_batched_matmul, (
+                "Expected aten.bmm.default or spyre.batched_matmul after passes"
+            )
+            assert "aten.mm.default" not in inductor_graph_str, (
+                "aten.mm.default should be replaced by bmm/batched_matmul after passes"
+            )
 
     def test_mixed_device_seq(self):
         model = torch.compile(torch.sin)

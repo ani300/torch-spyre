@@ -20,6 +20,7 @@ from torch._inductor.scheduler import (
     FusedSchedulerNode,
     SchedulerNode,
 )
+
 from . import config
 from .constants import DEVICE_NAME
 from .scheduler import CountedLoopSchedulerNode
@@ -93,12 +94,28 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         # exceed that slot count, so disable fusion when symbolic args are off.
         return nodes
 
-    # One bundle per maximal contiguous run of fusable nodes; a boundary node
+    # Start from maximal contiguous runs of fusable nodes. A boundary node
     # comes back as a single-element run, and ``_make_fused`` returns it
-    # unchanged, so this preserves the previous behaviour exactly.
+    # unchanged. Scheduler fusion further subdivides a Spyre run before every
+    # CountedLoopSchedulerNode after the first so distinct coarse-tile loops
+    # cannot be recombined into one oversized backend bundle.
     fused_nodes: list[BaseSchedulerNode] = []
     for group in group_contiguous_fusable(nodes, _is_fusable_node):
-        if fused := _make_fused(group):
+        if not _is_fusable_node(group[0]):
+            fused_nodes.extend(group)
+            continue
+
+        cur_nodes: list[SchedulerNode | CountedLoopSchedulerNode] = []
+        cur_has_counted_loop = False
+        for node in group:
+            if isinstance(node, CountedLoopSchedulerNode) and cur_has_counted_loop:
+                if fused := _make_fused(cur_nodes):
+                    fused_nodes.append(fused)
+                cur_nodes = []
+            cur_nodes.append(node)
+            cur_has_counted_loop |= isinstance(node, CountedLoopSchedulerNode)
+
+        if fused := _make_fused(cur_nodes):
             fused_nodes.append(fused)
     return fused_nodes
 

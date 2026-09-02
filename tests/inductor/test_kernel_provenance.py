@@ -20,7 +20,6 @@ import types
 from unittest.mock import patch
 
 import pytest
-
 import torch  # noqa: F401
 from sympy import Integer, Symbol, sympify
 from torch._inductor.utils import IndentedBuffer
@@ -28,7 +27,15 @@ from torch._inductor.utils import IndentedBuffer
 from torch_spyre._C import (
     DataFormats,
     ElementArrangement,
+)
+from torch_spyre._C import (
     extract_kernel_provenance_key as extract_kernel_provenance_key_cpp,
+)
+from torch_spyre._inductor.kernel_provenance import (
+    KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
+    KERNEL_PROVENANCE_KEY_VERSION,
+    KernelProvenanceDescriptor,
+    build_kernel_provenance_descriptor,
 )
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
@@ -38,12 +45,6 @@ from torch_spyre._inductor.op_spec import (
     SourceLoc,
     TensorArg,
     TensorWorkDivision,
-)
-from torch_spyre._inductor.kernel_provenance import (
-    build_kernel_provenance_descriptor,
-    KernelProvenanceDescriptor,
-    KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
-    KERNEL_PROVENANCE_KEY_VERSION,
 )
 from torch_spyre._inductor.profiler_event import (
     extract_kernel_provenance_key,
@@ -81,6 +82,8 @@ def _op(
     tiled_symbol_trip_counts=None,
     symbolic_dim_bounds=None,
     node_output_ranges=None,
+    matmul_operand_shapes=None,
+    matmul_operand_batch_dim_owners=None,
 ) -> OpSpec:
     return OpSpec(
         op=op,
@@ -96,6 +99,8 @@ def _op(
             {} if symbolic_dim_bounds is None else symbolic_dim_bounds
         ),
         node_output_ranges=node_output_ranges,
+        matmul_operand_shapes=matmul_operand_shapes,
+        matmul_operand_batch_dim_owners=matmul_operand_batch_dim_owners,
         debug_handle=handle,
     )
 
@@ -374,6 +379,45 @@ class TestKernelProvenanceDescriptor:
 
         assert original is not None
         assert reconstructed == original
+
+    def test_matmul_operand_semantics_roundtrip_and_affect_identity(self):
+        shapes = (
+            (Integer(1), Integer(4), Integer(128)),
+            (Integer(128), Integer(64)),
+            (Integer(1), Integer(4), Integer(64)),
+        )
+        owners = ((True,), ())
+        spec = _op(
+            _handle(10),
+            op="batchmatmul",
+            matmul_operand_shapes=shapes,
+            matmul_operand_batch_dim_owners=owners,
+        )
+
+        reconstructed = _generated_wrapper_roundtrip([spec])[0]
+        assert reconstructed.matmul_operand_shapes == shapes
+        assert reconstructed.matmul_operand_batch_dim_owners == owners
+        assert build_kernel_provenance_descriptor(
+            [reconstructed]
+        ) == build_kernel_provenance_descriptor([spec])
+
+        changed = dataclasses.replace(
+            spec,
+            matmul_operand_shapes=(shapes[0], (Integer(1), *shapes[1]), shapes[2]),
+        )
+        assert (
+            build_kernel_provenance_descriptor([changed]).key
+            != build_kernel_provenance_descriptor([spec]).key
+        )
+
+        changed_owners = dataclasses.replace(
+            spec,
+            matmul_operand_batch_dim_owners=((False,), ()),
+        )
+        assert (
+            build_kernel_provenance_descriptor([changed_owners]).key
+            != build_kernel_provenance_descriptor([spec]).key
+        )
 
     @pytest.mark.parametrize(
         "changed_schema", [OpSpec, TensorArg, TensorWorkDivision, LoopSpec]

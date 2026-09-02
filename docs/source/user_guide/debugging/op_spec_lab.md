@@ -198,6 +198,8 @@ capture time, so `KERNEL ARGS` shows them in the frozen header but not under
 | `debug_handle` | Provenance: `aten_op`, `source` file/line, and `fused_from` when an op fuses several origins. A null `aten_op` on a fused op is normal. |
 | `tiled_symbols` | Per-level tile-advance symbols, innermost level first. Only present under coarse tiling. |
 | `tiled_symbol_trip_counts` | `{symbol: count}` for the above. |
+| `matmul_operand_shapes` | Exact logical `(lhs, rhs, output)` shapes for a matmul. Codegen uses them to restore unit B/M/N/K roles that disappeared from physical coordinate expressions. |
+| `matmul_operand_batch_dim_owners` | One boolean tuple per input's batch prefix. `False` marks a broadcast/expanded axis that is logical but not owned by that operand's storage. |
 
 ### `TensorArg`
 

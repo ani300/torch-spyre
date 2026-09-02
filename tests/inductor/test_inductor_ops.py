@@ -15,29 +15,29 @@
 import functools
 import math
 import sys
-import pytest
 import unittest
+from unittest import mock
+
+import pytest
 import torch
 import torch.nn.functional as F
-
-
+import utils_inductor
+from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
 from utils_inductor import (
     ParameterizedTestMeta,
     _compile_and_run,
     cached_randn,
     cached_xavier,
     compare_with_cpu,
-    make_param_dict,
-    unique_randn_along_dim,
-    shapes2key,
     compare_with_pytorch,
+    make_param_dict,
+    shapes2key,
+    unique_randn_along_dim,
 )
-import utils_inductor
-from unittest import mock
+
 from torch_spyre._inductor import config as inductor_config
-from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
-from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import IDENTITY_OP
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
@@ -959,6 +959,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     # issue 1349
                     ((44, 1, 2880), (44, 2880, 2880)),
                     ((256, 1, 128), (256, 128, 512)),
+                    # Decode attention: N=1 is simplified out of both y and
+                    # output dependencies, but remains the semantic stick dim.
+                    ((32, 1, 128), (32, 128, 1)),
                 ],
                 rand_type="xavier",
             ),
@@ -3277,13 +3280,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "mha_prefill": (
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=1, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=2, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
                     None,
                     False,
@@ -3291,13 +3294,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "mha_prefill_causal": (
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=1, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=2, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
                     None,
                     True,
@@ -3305,16 +3308,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "mha_prefill_mask": (
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=1, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=2, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
                     torch.triu(
-                        torch.ones((256, 256), dtype=torch.float16) * -float("inf"),
+                        torch.ones((128, 128), dtype=torch.float16) * -float("inf"),
                         diagonal=1,
                     ),
                     False,
@@ -3322,13 +3325,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "gqa_prefill": (
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=1, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 8, 128), differentiation=2, dtype=torch.float16
+                        (2, 128, 8, 128), differentiation=2, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 8, 128), differentiation=3, dtype=torch.float16
+                        (2, 128, 8, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
                     None,
                     False,
@@ -3336,27 +3339,83 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "gqa_prefill_causal": (
                     cached_randn(
-                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                        (2, 128, 32, 128), differentiation=1, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 8, 128), differentiation=2, dtype=torch.float16
+                        (2, 128, 8, 128), differentiation=2, dtype=torch.float16
                     ).transpose(1, 2),
                     cached_randn(
-                        (2, 256, 8, 128), differentiation=3, dtype=torch.float16
+                        (2, 128, 8, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
                     None,
                     True,
                     True,
+                ),
+                "mha_prefill_8k": (
+                    cached_randn(
+                        (1, 512, 8, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (1, 8192, 8, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (1, 8192, 8, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    None,
+                    False,
+                    False,
+                ),
+                "gqa_prefill_8k": (
+                    cached_randn(
+                        (1, 512, 8, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (1, 8192, 2, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (1, 8192, 2, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    None,
+                    False,
+                    True,
+                ),
+                "mha_prefill_kv_tail": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 130, 32, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 130, 32, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    None,
+                    False,
+                    False,
+                ),
+                "mha_prefill_kv_tail_causal": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 130, 32, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 130, 32, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    None,
+                    True,
+                    False,
                 ),
                 "mha_decode": (
                     cached_randn(
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
                     ),
                     cached_randn(
-                        (2, 257, 32, 128), differentiation=2, dtype=torch.float16
+                        (2, 129, 32, 128), differentiation=2, dtype=torch.float16
                     ),
                     cached_randn(
-                        (2, 257, 32, 128), differentiation=3, dtype=torch.float16
+                        (2, 129, 32, 128), differentiation=3, dtype=torch.float16
                     ),
                     False,
                     False,
@@ -3366,15 +3425,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
                     ),
                     cached_randn(
-                        (2, 257, 8, 128), differentiation=2, dtype=torch.float16
+                        (2, 129, 8, 128), differentiation=2, dtype=torch.float16
                     ),
                     cached_randn(
-                        (2, 257, 8, 128), differentiation=3, dtype=torch.float16
+                        (2, 129, 8, 128), differentiation=3, dtype=torch.float16
                     ),
                     False,
                     True,
                 ),
             },
+            # mha_decode/gqa_decode still fail post-KV-loop: unrelated to KV
+            # tiling (decode inputs are not transposed; layout path differs).
             "expect_fail": ["mha_decode", "gqa_decode"],
         },
         ("test_split", "test_split_cpu"): {
@@ -6841,13 +6902,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         must still yield clone's standard row-major layout, matching a real
         aten.clone on the same input.
         """
+        import torch._inductor.lowering as inductor_lowering
+        from torch._inductor.utils import fresh_cache
+
         from torch_spyre._inductor.lowering import (
             clone as spyre_clone_lowering,
+        )
+        from torch_spyre._inductor.lowering import (
             register_spyre_lowering,
             spyre_lowerings,
         )
-        import torch._inductor.lowering as inductor_lowering
-        from torch._inductor.utils import fresh_cache
 
         lib = torch.library.Library("spyre_test", "FRAGMENT")
         lib.define("clone_identity(Tensor x) -> Tensor")
@@ -8069,8 +8133,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         #  - ragged input width under stride, (W_in - kW) % sW != 0 (the fp16
         #    opfunc tiles the output width and mis-accumulates the dangling
         #    column; a ragged height is untiled and harmless).
-        from torch_spyre._inductor.decompositions import _is_direct_conv_supported
         from torch_spyre._C import get_elem_in_stick
+        from torch_spyre._inductor.decompositions import _is_direct_conv_supported
 
         eps = get_elem_in_stick(torch.float16)  # 64 at fp16
         common = dict(

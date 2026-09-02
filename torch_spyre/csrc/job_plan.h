@@ -479,18 +479,27 @@ class JobPlanStepCompute final : public JobPlanStep {
    * ComputeParams::kernel_name; surfaces in profiler events
    * (PendingRequest::node_name, aiupti activity name, FLEX JSON CBName).
    * Empty string ("") preserves the old behavior (no name).
+   * @param wait_for_completion If true, synchronously wait for this compute's
+   * response before the next dependent JobPlan step is submitted. This is
+   * stronger than a same-pipeline barrier.
    */
   explicit JobPlanStepCompute(flex::CompositeAddress program_address,
                               bool bind_io_addresses,
                               uint64_t bootstrap_offset = 0,
-                              std::string name = "")
+                              std::string name = "",
+                              bool wait_for_completion = false)
       : program_address_(std::move(program_address)),
         bind_io_addresses_(bind_io_addresses),
         bootstrap_offset_(bootstrap_offset),
-        name_(std::move(name)) {}
+        name_(std::move(name)),
+        wait_for_completion_(wait_for_completion) {}
 
   const std::string& getName() const {
     return name_;
+  }
+
+  bool getWaitForCompletion() const {
+    return wait_for_completion_;
   }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
@@ -502,6 +511,7 @@ class JobPlanStepCompute final : public JobPlanStep {
   bool bind_io_addresses_;
   uint64_t bootstrap_offset_;
   std::string name_;
+  bool wait_for_completion_;
 };
 
 /**

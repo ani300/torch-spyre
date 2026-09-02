@@ -58,7 +58,6 @@ this file's rewrite sites depend on.
 
 from __future__ import annotations
 
-
 import collections
 import dataclasses
 import enum
@@ -66,13 +65,10 @@ import logging
 from typing import NamedTuple
 
 import sympy
-from sympy import Expr
-
 import torch
+from sympy import Expr
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
-from torch._inductor.utils import sympy_index_symbol, sympy_subs
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -88,6 +84,8 @@ from torch._inductor.ir import (
     StorageBox,
     TensorBox,
 )
+from torch._inductor.ops_handler import WrapperHandler
+from torch._inductor.utils import sympy_index_symbol, sympy_subs
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
@@ -96,39 +94,40 @@ from torch_spyre._C import SpyreTensorLayout
 from .. import config
 from ..constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OPS
 from ..errors import Unsupported
+from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
 from ..logging_utils import get_inductor_logger
 from ..loop_info import (
     CarriedReductionRecord,
     CarriedReductionSpec,
     CoarseTileInfo,
     PropagationPlan,
-    ReadCopyEntry,
     ReadCopyElisionRecord,
+    ReadCopyEntry,
     ReadCopyPlan,
     ReductionPlan,
     copy_op_metadata,
 )
-from ..propagate_hints import get_op_hints
 from ..pass_utils import (
-    op_out_coords,
     host_coordinates,
     identify_matmul_inputs,
     indirect_sizes_from_op,
     invalidate_op_read_writes,
     iteration_space_from_op,
+    op_out_coords,
 )
-from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
+from ..propagate_hints import get_op_hints
 from .tile import compute_tile_index, compute_tile_stride, decompose_index_for_tiling
 
 logger = get_inductor_logger("coarse_tile")
 
 
 class _RetiledBufferInfo(NamedTuple):
-    """Host strides before and after a buffer is resized for a coarse tile."""
+    """Host shape/strides before and after a coarse-tile resize."""
 
     old_stride: tuple[Expr, ...]
     new_stride: tuple[Expr, ...]
     old_size: tuple[Expr, ...]
+    new_size: tuple[Expr, ...]
 
 
 class _ReadCopyHoistDecision(enum.Enum):
@@ -2122,7 +2121,7 @@ def _divide_ranges(
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
     retiled_info = (
-        _RetiledBufferInfo(old_stride, tuple(layout.stride), old_size)
+        _RetiledBufferInfo(old_stride, tuple(layout.stride), old_size, tuple(new_size))
         if tiled_dims and old_stride != tuple(layout.stride)
         else None
     )
@@ -2274,7 +2273,10 @@ def _apply_plan(
                 prior = retiled_infos.get(name)
                 retiled_infos[name] = (
                     _RetiledBufferInfo(
-                        prior.old_stride, retiled_info.new_stride, prior.old_size
+                        prior.old_stride,
+                        retiled_info.new_stride,
+                        prior.old_size,
+                        retiled_info.new_size,
                     )
                     if prior is not None
                     else retiled_info
@@ -3023,7 +3025,10 @@ def _propagate_tiled_op(
     # Patch outside consumers and graph outputs to read full_buf.
     full_name = full_buf.get_name()
     retile_info = _RetiledBufferInfo(
-        old_stride, tuple(full_buf.layout.stride), old_size
+        old_stride,
+        tuple(full_buf.layout.stride),
+        old_size,
+        tuple(full_buf.layout.size),
     )
     _patch_consumers(
         outside_consumers, read_lookup_name, full_name, operations, retile_info
@@ -3591,21 +3596,26 @@ class _NameSwapHandler(WrapperHandler):
     def __init__(
         self,
         inner,
-        name_map: dict[str, tuple[str, list[Expr], list[Expr]]],
+        name_map: dict[str, tuple[str, list[Expr], list[Expr], Expr]],
     ):
         super().__init__(inner)
         self._name_map = name_map
 
     def load(self, name, index):
         if name in self._name_map:
-            new_name, full_strides, tile_strides = self._name_map[name]
-            new_index = _rescale_index(index, full_strides, tile_strides)
+            new_name, full_strides, tile_strides, base_offset = self._name_map[name]
+            new_index = _rescale_index(
+                index, full_strides, tile_strides, base_offset=base_offset
+            )
             return super().load(new_name, new_index)
         return super().load(name, index)
 
 
 def _rescale_index(
-    index: Expr, full_strides: list[Expr], tile_strides: list[Expr]
+    index: Expr,
+    full_strides: list[Expr],
+    tile_strides: list[Expr],
+    base_offset: Expr = sympy.S.Zero,
 ) -> Expr:
     """Rescale an affine index's per-dimension coefficients.
 
@@ -3692,9 +3702,14 @@ def _rescale_index(
             full_stride if is_concrete else sympy.Integer(0),
         )
 
+    # A slice/storage offset selects the copied window's base in the source
+    # buffer.  Remove it before matching and rescaling per-dimension terms so a
+    # symbolic offset cannot be mistaken for another loop dimension.  The copy
+    # buffer itself is tile-local, hence starts at offset zero.
+    relative_index = index - base_offset
     remaining = sorted(zip(full_strides, tile_strides), key=_sort_key, reverse=True)
     new_index: Expr = sympy.Integer(0)
-    for term in sympy.Add.make_args(index):
+    for term in sympy.Add.make_args(relative_index):
         if term.is_number:
             new_index += term
             continue
@@ -3709,7 +3724,7 @@ def _rescale_index(
                 f"_rescale_index: no matching full_stride for term {term} "
                 f"in index {index}; full_strides={full_strides}"
             )
-    return new_index
+    return sympy.expand(new_index)
 
 
 def _insert_one_read_copy(
@@ -4491,8 +4506,9 @@ def _patch_consumer_to_read_copy(
     tile_strides.extend(
         sympy.Integer(0) for _ in range(len(full_strides) - len(tile_strides))
     )
-    name_map: dict[str, tuple[str, list[Expr], list[Expr]]] = {
-        dep.name: (copy_name, full_strides, tile_strides)
+    base_offset = dep.index.xreplace({var: 0 for var in dep.var_names})
+    name_map: dict[str, tuple[str, list[Expr], list[Expr], Expr]] = {
+        dep.name: (copy_name, full_strides, tile_strides, base_offset)
     }
 
     # Patch consumer's inner_fn once with the one-entry name_map (wrap, not
@@ -5536,6 +5552,7 @@ def _propagate_tiled_reduction_op(
         tuple(op.layout.stride),
         tuple(accum_full.layout.stride),
         op_size,
+        tuple(accum_full.layout.size),
     )
     _patch_consumers(all_consumers, buf_name, accum_name, operations, retile_info)
     if is_graph_output:
@@ -5660,6 +5677,19 @@ def _patch_consumers(
         if not hasattr(new_consumer, "loop_info"):
             continue
         new_loop_info = new_consumer.loop_info  # type: ignore[attr-defined]
+
+        # A Pass-1 read-copy is different from the original logical
+        # consumers covered below.  _insert_one_read_copy already builds its
+        # tiled_dims_per_read (and squeezed_advance_per_read) as an advancing
+        # read of the full logical source; Pass 3 is only making that source
+        # concrete by renaming the tile-local producer to its full copy-out.
+        # Keep that metadata verbatim.  Recomputing it from the copy op's own
+        # ranges is also structurally invalid when its dependency iteration
+        # space is squeezed relative to the sizing op whose raw dim numbers
+        # loop_tiled_dims retains (for example [[1], [2]] with a rank-2 copy).
+        if new_consumer.get_name().startswith("coarse_tile_read_copy_"):
+            continue
+
         new_reads = [
             r for r in new_consumer.get_read_writes().reads if isinstance(r, MemoryDep)
         ]
@@ -5715,30 +5745,56 @@ def _squeezed_retile_dims(
     derived against this buffer's (by-then tile-local, size-1) layout, so
     ``compute_tile_index``/``_retile_load_index`` has no atom to rescale for
     that dim: rescaling can only touch coefficients already present in the
-    incoming index (see ``_retile_load_index``'s docstring). Restricted to
-    dims where ``new_stride[d] != 0`` -- a dim that stays size-1 (or
-    genuinely strideless) in the new buffer too contributes nothing and
-    needs no term.
+    incoming index (see ``_retile_load_index``'s docstring).
 
-    Also restricted to dims where the *consumer's own* output is non-unit
-    for that raw dim (``consumer.data.ranges[d] != 1``). When the consumer's
-    own output dim is unit-size too (e.g. a coarse-tiled dim of extent 1,
-    such as B=1 when only H is tiled), there is no real loop variable for it
-    anywhere in this trace -- the consumer's own write index squeezes it out
-    exactly like the read did, so its only valid coordinate is the constant
-    0, not a symbol. Minting one anyway causes a name collision with an
-    unrelated, already-present symbol in the same dense numbering scheme
-    (both derived independently, so nothing stops them picking the same
-    name for two different logical slots), silently corrupting that other
-    symbol's coefficient instead of erroring.
+    A nonzero stride does *not* prove that a dimension became real: ordinary
+    contiguous tensors retain nonzero strides on size-one dimensions.  Add a
+    term only for an actual extent transition from one in the tile-local
+    buffer to non-one in the full buffer.  In particular, decode attention's
+    ``[B,H,Lq,D]`` output has ``Lq == 1`` in both buffers; treating its Lq
+    stride as evidence of growth aliases the flattened projection's output-N
+    loop onto Lq and turns a 4K read into a bogus 16M read.
+
+    Re-minting uses a raw producer dimension as a positional consumer output
+    dimension.  That mapping is valid only when the complete shapes agree.
+    Rank-changing or shape-changing views need semantic view metadata to
+    recover a missing coordinate; guessing positionally would silently read
+    the wrong dimension, so reject such a true-growth case explicitly.
     """
-    return [
+    grown_dims = [
         d
         for d in range(len(info.old_size))
         if info.old_size[d] == 1
+        and info.new_size[d] != 1
         and info.new_stride[d] != sympy.S.Zero
-        and int(consumer.data.ranges[d]) != 1
     ]
+    if not grown_dims:
+        return []
+
+    consumer_ranges = tuple(consumer.data.ranges)
+    if len(consumer_ranges) != len(info.new_size):
+        raise Unsupported(
+            "coarse_tile: cannot restore dimensions squeezed from a retiled "
+            "producer through a rank-changing consumer view; "
+            f"producer old_size={info.old_size}, new_size={info.new_size}, "
+            f"consumer ranges={consumer_ranges}, grown_dims={grown_dims}"
+        )
+
+    # A unit consumer axis selects coordinate zero and needs no symbol.  For
+    # every axis that does need a symbol, require the complete output shape to
+    # match the producer shape before treating raw positions as identities.
+    result = [d for d in grown_dims if int(consumer_ranges[d]) != 1]
+    if result and any(
+        sympy.simplify(actual - expected) != 0
+        for actual, expected in zip(consumer_ranges, info.new_size)
+    ):
+        raise Unsupported(
+            "coarse_tile: cannot restore dimensions squeezed from a retiled "
+            "producer through a shape-changing consumer view; "
+            f"producer old_size={info.old_size}, new_size={info.new_size}, "
+            f"consumer ranges={consumer_ranges}, grown_dims={grown_dims}"
+        )
+    return result
 
 
 def _index_var_prefix(free_symbols: "OrderedSet[Expr] | set[Expr]") -> str:
@@ -5851,13 +5907,22 @@ def _retile_load_index(
     index: Expr,
     info: _RetiledBufferInfo,
     consumer: "ComputedBuffer | None" = None,
+    preserve_target_stride_atoms: bool = False,
 ) -> Expr:
     """Rewrite a load index using compute_tile_index.  Raises Unsupported if
     the index cannot be decomposed (non-affine, or stride not in info.old_stride).
 
     Used by _RetileLoadIndexHandler and _NameAndIndexSwapHandler during real
-    codegen.  In both cases the incoming index has coefficients equal to
-    info.old_stride and the call rewrites them to info.new_stride.
+    codegen.  Most incoming index coefficients are expressed in
+    ``info.old_stride`` and are rewritten to ``info.new_stride``.  An outside
+    view can, however, derive some coefficients from the full destination
+    layout before its producer is redirected.  In the tile-to-full direction,
+    ``preserve_target_stride_atoms`` keeps an atom whose coefficient exactly
+    matches an unambiguous regular ``new_stride`` entry and exceeds the source
+    tile's maximum physical offset (proving that it cannot be source-local).
+    Remaining atoms still use ``compute_tile_index`` so view-combined
+    tile-local coefficients retain the general decomposition supported by that
+    helper.
 
     When ``consumer`` is given AND has no loop_info of its own (i.e. it is an
     "outside" consumer with no enclosing coarse-tile loop nest), any dim
@@ -5897,7 +5962,9 @@ def _retile_load_index(
     loop_syms = index.free_symbols
     if not loop_syms:
         new_index = index
-    elif _index_already_at_new_scale(index, loop_syms, info):
+    elif not preserve_target_stride_atoms and _index_already_at_new_scale(
+        index, loop_syms, info
+    ):
         # This consumer's index was traced *after* the producer's layout was
         # already mutated to new_stride (e.g. built/retraced during Pass
         # 1/2/3, from a same-name replacement object resynced into group_ops
@@ -5908,13 +5975,49 @@ def _retile_load_index(
         # issue found via test_copy_running_max_4d_H4_Lq4.
         new_index = index
     else:
+        index_to_retile = index
+        preserved_index = sympy.S.Zero
+        if preserve_target_stride_atoms:
+            source_max_offset = sympy.simplify(
+                sum(
+                    (old_size - 1) * old_stride
+                    for old_size, old_stride in zip(info.old_size, info.old_stride)
+                    if old_size != 1 and old_stride != sympy.S.Zero
+                )
+            )
+            regular_source_strides = {
+                sympy.simplify(old_stride)
+                for old_size, old_stride in zip(info.old_size, info.old_stride)
+                if old_size != 1 and old_stride != sympy.S.Zero
+            }
+            regular_target_strides = {
+                sympy.simplify(new_stride)
+                for new_size, new_stride in zip(info.new_size, info.new_stride)
+                if new_size != 1
+                and new_stride != sympy.S.Zero
+                and sympy.simplify(new_stride) not in regular_source_strides
+            }
+            for term in index.as_ordered_terms():
+                term_syms = term.free_symbols & loop_syms
+                if len(term_syms) != 1:
+                    continue
+                sym = next(iter(term_syms))
+                coeff = sympy.simplify(term.coeff(sym))
+                exceeds_source_span = sympy.simplify(
+                    coeff - source_max_offset
+                ).is_positive
+                if coeff in regular_target_strides and exceeds_source_span is True:
+                    preserved_index += term
+            index_to_retile = sympy.expand(index - preserved_index)
+
         new_index = compute_tile_index(
-            index,
+            index_to_retile,
             {sym: 1 for sym in loop_syms},
             info.old_size,
             info.old_stride,
             info.new_stride,
         )
+        new_index += preserved_index
 
     if consumer is not None:
         for d in _squeezed_retile_dims(info, consumer):
@@ -5992,7 +6095,11 @@ class _NameAndIndexSwapHandler(WrapperHandler):
     def load(self, name, index):
         if name in self._infos_by_old_name:
             index = _retile_load_index(
-                name, index, self._infos_by_old_name[name], self._consumer
+                name,
+                index,
+                self._infos_by_old_name[name],
+                self._consumer,
+                preserve_target_stride_atoms=True,
             )
         return super().load(self._name_map.get(name, name), index)
 

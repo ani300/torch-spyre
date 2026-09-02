@@ -13,6 +13,7 @@
 # limitations under the License.
 import pytest
 import torch
+from torch._inductor.utils import run_and_get_code
 from utils_inductor import compare_with_cpu
 
 
@@ -93,3 +94,23 @@ class TestMatmulOps:
         _compare_modes(
             execution_mode, fn, *(eye, a) if left else (a, eye), atol=atol, rtol=rtol
         )
+
+
+@pytest.mark.parametrize("rows", [64, 8, 1], ids=["prefill", "short", "decode"])
+def test_linear_shared_weight_unit_batch(rows):
+    """Linear's inserted B=1 weight axis must remain a shared KERNEL axis."""
+    torch.manual_seed(0)
+    x = torch.randn(1, rows, 4096, dtype=torch.float16) * 0.01
+    weight = torch.randn(1024, 4096, dtype=torch.float16) * 0.01
+    expected = torch.nn.functional.linear(x, weight)
+
+    torch.compiler.reset()
+    actual, source_codes = run_and_get_code(
+        torch.compile(torch.nn.functional.linear, dynamic=False),
+        x.to("spyre"),
+        weight.to("spyre"),
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
+    source = "\n".join(source_codes)
+    assert "matmul_operand_batch_dim_owners=((True,), ())" in source
