@@ -21,9 +21,6 @@ import torch
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import FixedLayout
 from torch._inductor.virtualized import V
-from torch.testing._internal.common_utils import TestCase, run_tests
-from torch.utils._sympy.functions import FloorDiv, ModularIndexing
-
 from torch_spyre._C import (
     DataFormats,
     ElementArrangement,

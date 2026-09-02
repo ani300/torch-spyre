@@ -17,6 +17,7 @@
 from math import prod
 
 import torch
+from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch._inductor.pattern_matcher import (
     Arg,
     CallFunction,
@@ -59,6 +60,22 @@ def _node_shape(node: torch.fx.Node) -> tuple | None:
 mm_to_bmm_pass = PatternMatcherPass(pass_name="unflatten_mm_to_bmm")
 shared_rhs_bmm_pass = PatternMatcherPass(pass_name="unexpand_shared_rhs_bmm")
 bmm_unflatten_pass = PatternMatcherPass(pass_name="unflatten_bmm_batch_dims")
+
+
+def _node_shape(node: torch.fx.Node) -> tuple | None:
+    """Return an FX node's fake/meta shape, if one is available."""
+    if not isinstance(node, torch.fx.Node):
+        return None
+    val = node.meta.get("val")
+    shape = getattr(val, "shape", None)
+    return tuple(shape) if shape is not None else None
+
+
+def _shapes_statically_equal(lhs, rhs) -> bool:
+    """Whether two shape sequences are provably equal without adding guards."""
+    return len(lhs) == len(rhs) and statically_known_true(
+        sym_eq(tuple(lhs), tuple(rhs))
+    )
 
 
 @register_graph_pattern(

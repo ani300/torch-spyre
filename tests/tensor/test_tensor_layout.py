@@ -583,14 +583,7 @@ class TestSpyreTensorLayout(TestCase):
 
     @parametrize("H,N_KV,LQ", [(4, 2, 8), (32, 8, 1)])
     def test_sdpa_output_feeds_linear_in_same_graph(self, H, N_KV, LQ):
-        """A fused SDPA -> BL(H*D) view -> linear gets one contraction dim.
-
-        Unlike the boundary-materialized regression above, the input buffer to
-        the linear retains its four-dimensional ``[B,L,H,D]`` producer layout.
-        The consumer's flattened ``H*D`` variable therefore appears as the
-        adjacent mixed-radix coordinates ``floor(K/D), Mod(K,D)`` and must be
-        collapsed by layout propagation before batchmatmul codegen.
-        """
+        """A fused SDPA -> BL(H*D) view -> linear gets one contraction dim."""
         B, LK, D = 1, 64, 128
         hidden = H * D
         q = torch.randn(B, H, LQ, D, dtype=torch.float16)
