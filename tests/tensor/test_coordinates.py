@@ -23,7 +23,12 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import FixedLayout
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, get_device_dtype
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    SpyreTensorLayout,
+    get_device_dtype,
+)
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_FP8_OP,
     BATCH_MATMUL_OP,
