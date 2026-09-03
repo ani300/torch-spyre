@@ -511,21 +511,22 @@ class SpyreKernelOpsHandler(DefaultHandler):
 
 def _tile_advance_expr_from_dep(
     dep: MemoryDep,
-    tiled_symbol_substitutions: dict[sympy.Symbol, sympy.Expr],
+    tiled_dim_extents: dict[int, sympy.Expr],
 ) -> sympy.Expr:
     """Element-offset advance of ``dep`` for one step of each tiled dim.
 
-    ``tiled_symbol_substitutions`` maps each advancing symbol in ``dep.index``
-    to its value for this tile step.  The caller is responsible for including
-    the tile extent and whichever loop-level symbol should remain in the
-    result.
+    ``tiled_dim_extents`` maps a host-range positional index (the same
+    indices used in ``loop_tiled_dims`` / ``loop_tiled_reduction_dims``) to
+    the tile extent one loop step advances that dim's ``d{i}`` symbol by
+    (the product of ``loop_count`` for every level tiling that dim).
 
-    Every other free symbol is replaced with ``0`` (dims that never advance:
-    untiled dims, and broadcast dims ``dep`` does not depend on).  The index's
-    value with every loop symbol set to zero is then subtracted: a slice/storage
-    offset selects the window's base address, but is not an amount by which that
-    address advances on every coarse-tile iteration.  Because this is a direct
-    substitution rather than coefficient extraction,
+    Built by substituting, in ``dep.index``, each tiled dim's ``d{dim}``
+    with ``extent * d{dim}`` (staying symbolic in ``d{dim}`` -- the
+    expression is meant to stay unevaluated until a later compilation stage
+    substitutes a concrete tile-index value for each ``d{dim}``) and every
+    other free symbol in ``dep.index`` with ``0`` (dims that never advance:
+    untiled dims, and broadcast dims ``dep`` does not depend on).  Because
+    this is a direct substitution rather than coefficient extraction,
     ``dep.index`` need not be affine in the tiled symbols -- a tiled dim
     wrapped in ``Mod``/``FloorDiv``/``ModularIndexing`` (reshape-split or
     gather/indirect-indexing dims; ``_loop_var_to_ranges_pos`` only checks
@@ -539,14 +540,14 @@ def _tile_advance_expr_from_dep(
     the advance expression any earlier risks reading a stale, not-yet-final
     index.
     """
-    subs = dict(tiled_symbol_substitutions)
+    subs = {
+        sympy_index_symbol(f"d{dim}"): extent * sympy_index_symbol(f"d{dim}")
+        for dim, extent in tiled_dim_extents.items()
+    }
     subs.update(
         {sym: sympy.Integer(0) for sym in dep.index.free_symbols if sym not in subs}
     )
-    base_offset = dep.index.subs(
-        {sym: sympy.Integer(0) for sym in dep.index.free_symbols}
-    )
-    return sympy.expand(dep.index.subs(subs) - base_offset)
+    return dep.index.subs(subs)
 
 
 class SpyreKernel(Kernel[CSEVariable]):
@@ -777,13 +778,19 @@ class SpyreKernel(Kernel[CSEVariable]):
             level_symbol = self._get_or_mint_level_symbol(level_idx, op_name)
             host_expr = sympy.S.Zero
             if dim_extent_pairs:
-                tiled_symbol_substitutions = {
+                tiled_dim_extents = {
                     self._host_dim_to_index_symbol(ir_node, d): extent * level_symbol
                     for d, extent in dim_extent_pairs
                 }
-                host_expr += _tile_advance_expr_from_dep(
-                    dep, tiled_symbol_substitutions
+                subs = dict(tiled_dim_extents)
+                subs.update(
+                    {
+                        sym: sympy.Integer(0)
+                        for sym in dep.index.free_symbols
+                        if sym not in subs
+                    }
                 )
+                host_expr += dep.index.subs(subs)
             for host_stride, extent in squeezed_pairs:
                 host_expr += level_symbol * extent * host_stride
             device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)

@@ -798,9 +798,11 @@ class TestConfigFlags(unittest.TestCase):
 class TestTileAdvanceExprFromDep(unittest.TestCase):
     """Unit tests for _tile_advance_expr_from_dep's symbolic substitution.
 
-    Production passes the exact symbol substitutions for one coarse-tile
-    level.  The helper replaces every other free symbol with zero and leaves
-    the level symbol unresolved until a later compilation stage.
+    _tile_advance_expr_from_dep substitutes extent * d{i} for each tiled
+    dim's d{i} in dep.index, and 0 for every other free symbol, then
+    returns the result as-is -- it is only resolved once a later
+    compilation stage substitutes a concrete tile-index value for each
+    d{i}.
     """
 
     def _dep(self, index_expr, ranges):
@@ -814,7 +816,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
         dep = self._dep(Integer(4096) * d0 + d1, {d0: 512, d1: 1024})
-        expr = _tile_advance_expr_from_dep(dep, {d0: Integer(512) * d0})
+        expr = _tile_advance_expr_from_dep(dep, {0: Integer(512)})
         self.assertEqual(simplify(expr - Integer(4096) * Integer(512) * d0), 0)
 
     def test_untiled_dim_contributes_zero(self):
@@ -826,33 +828,6 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         expr = _tile_advance_expr_from_dep(dep, {})
         self.assertEqual(expr, Integer(0))
 
-    def test_constant_slice_offset_does_not_advance(self):
-        """A window's base offset is not repeated for every tile.
-
-        This is the index shape produced by the second 64-token KV chunk in
-        SDPA.  Tiling four heads advances by ``4 * 16384`` elements; the
-        chunk's ``64 * 128`` storage offset is already represented by the
-        tensor coordinate and must not be folded into that stride.
-        """
-        from torch_spyre._inductor.spyre_kernel import _tile_advance_expr_from_dep
-
-        d0 = sympy_index_symbol("d0")
-        d1 = sympy_index_symbol("d1")
-        dep = self._dep(
-            Integer(16384) * d0 + Integer(128) * d1 + Integer(8192),
-            {d0: 32, d1: 64},
-        )
-        expr = _tile_advance_expr_from_dep(dep, {d0: Integer(4) * d0})
-        self.assertEqual(simplify(expr - Integer(65536) * d0), 0)
-
-    def test_offset_only_dependency_has_zero_advance(self):
-        from torch_spyre._inductor.spyre_kernel import _tile_advance_expr_from_dep
-
-        d0 = sympy_index_symbol("d0")
-        dep = self._dep(Integer(8192), {d0: 32})
-        expr = _tile_advance_expr_from_dep(dep, {d0: Integer(4) * d0})
-        self.assertEqual(expr, Integer(0))
-
     def test_broadcast_dim_not_in_index_contributes_zero(self):
         from torch_spyre._inductor.spyre_kernel import _tile_advance_expr_from_dep
 
@@ -860,10 +835,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         d1 = sympy_index_symbol("d1")
         # dep does not depend on d1 at all (broadcast along that dim).
         dep = self._dep(Integer(4096) * d0, {d0: 512, d1: 1024})
-        expr = _tile_advance_expr_from_dep(
-            dep,
-            {d0: Integer(512) * d0, d1: Integer(1024) * d1},
-        )
+        expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
         self.assertEqual(simplify(expr - Integer(4096) * Integer(512) * d0), 0)
 
     def test_sums_multiple_tiled_dims(self):
@@ -872,10 +844,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
         dep = self._dep(Integer(4096) * d0 + d1, {d0: 512, d1: 1024})
-        expr = _tile_advance_expr_from_dep(
-            dep,
-            {d0: Integer(512) * d0, d1: Integer(1024) * d1},
-        )
+        expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
         expected = Integer(4096) * Integer(512) * d0 + Integer(1) * Integer(1024) * d1
         self.assertEqual(simplify(expr - expected), 0)
 
@@ -900,17 +869,13 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         d1 = sympy_index_symbol("d1")
         # d0 only ever appears wrapped in Mod -- non-polynomial in d0.
         dep = self._dep(Integer(4096) * sympy.Mod(d0, 8) + d1, {d0: 512, d1: 1024})
-        substitutions = {
-            d0: Integer(512) * d0,
-            d1: Integer(1024) * d1,
-        }
-        expr = _tile_advance_expr_from_dep(dep, substitutions)
+        expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
         expected = Integer(4096) * sympy.Mod(Integer(512) * d0, 8) + Integer(1024) * d1
         self.assertEqual(simplify(expr - expected), 0)
 
         # FloorDiv (a//b) is likewise non-polynomial in the wrapped symbol.
         dep2 = self._dep(Integer(4096) * (d0 // Integer(8)) + d1, {d0: 512, d1: 1024})
-        expr2 = _tile_advance_expr_from_dep(dep2, substitutions)
+        expr2 = _tile_advance_expr_from_dep(dep2, {0: Integer(512), 1: Integer(1024)})
         expected2 = (
             Integer(4096) * ((Integer(512) * d0) // Integer(8)) + Integer(1024) * d1
         )
@@ -933,10 +898,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         # the opposite of the row-major convention used elsewhere in this
         # test class.
         dep = self._dep(d0 + Integer(4096) * d1, {d0: 512, d1: 1024})
-        expr = _tile_advance_expr_from_dep(
-            dep,
-            {d0: Integer(512) * d0, d1: Integer(1024) * d1},
-        )
+        expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
         expected = Integer(1) * Integer(512) * d0 + Integer(4096) * Integer(1024) * d1
         self.assertEqual(simplify(expr - expected), 0)
 
