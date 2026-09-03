@@ -165,8 +165,9 @@ class _ScatterScenarios:
         """
         Bn, H, L, D, M = 1, 8, 64, 256, 128
         dtype = torch.bfloat16
-        src = torch.randn(Bn, L, H, D, dtype=dtype)
-        freqs = torch.randn(Bn, L, 2, 2, D // 2, dtype=dtype)
+        generator = torch.Generator().manual_seed(0)
+        src = torch.randn(Bn, L, H, D, dtype=dtype, generator=generator)
+        freqs = torch.randn(Bn, L, 2, 2, D // 2, dtype=dtype, generator=generator)
         dst = torch.zeros(Bn, H, M, D, dtype=dtype)
         cache_layout = SpyreTensorLayout(
             device_size=[
@@ -204,19 +205,23 @@ class _ScatterScenarios:
         spyre_src = src.to("spyre")
         spyre_freqs = freqs.to("spyre")
         idx = torch.arange(L, dtype=torch.int64)
+        expected = kernel(dst.clone(), src, freqs, idx)
         actual = torch.compile(kernel, dynamic=False)(
             dst.to("spyre", device_layout=cache_layout),
             spyre_src,
             spyre_freqs,
             idx.to("spyre"),
         ).to("cpu")
-        expected = torch.compile(kernel_with_contiguous_source, dynamic=False)(
+        contiguous_actual = torch.compile(kernel_with_contiguous_source, dynamic=False)(
             dst.to("spyre", device_layout=cache_layout),
             spyre_src,
             spyre_freqs,
             idx.to("spyre"),
         ).to("cpu")
-        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual, contiguous_actual)
+        # CPU and Spyre may accumulate the two-term bf16 RoPE reduction in a
+        # different order; layout corruption is orders of magnitude larger.
+        torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.02)
 
     def test_index_put_p7(self):
         """y[idx] = src -- 1-D scatter with an odd (non-power-of-2) P=7."""

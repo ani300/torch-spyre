@@ -368,6 +368,10 @@ def _materialize_unaligned_scatter_source(
     not representable and used to truncate the index's outer-stick extent to
     zero.  Materialize just the direct source in a canonical dense DL16 layout;
     the destination and index layouts remain unchanged.
+
+    PyTorch lowering represents every ``Scatter`` as a ``ComputedBuffer`` with
+    a ``MutationLayoutSHOULDREMOVE`` target, which is the invariant required by
+    ``_resolve_mutation_target`` below.
     """
     alignment_inputs = _scatter_alignment_inputs(graph, op)
     if alignment_inputs is None:
@@ -384,6 +388,9 @@ def _materialize_unaligned_scatter_source(
     # tensors recovered directly from the Scatter closure so they are never
     # mistaken for a source candidate.
     index_names = index_names | _find_scatter_index_buf_names(op)
+    # A fused Scatter retains no distinguished source edge.  Its remaining
+    # direct reads are therefore candidates, not assumptions: accept one only
+    # when substituting its dense layout makes the complete alignment valid.
     direct_deps = [
         dep
         for dep in op.get_read_writes().reads
@@ -395,23 +402,51 @@ def _materialize_unaligned_scatter_source(
         source_buf = graph.get_buffer(dep.name)
         source_layout = _real_layout(source_buf)
         if not isinstance(source_layout, FixedTiledLayout):
+            logger.debug(
+                "enforce_indirect_access_layout: scatter source candidate %s "
+                "has non-tiled layout %s",
+                dep.name,
+                type(source_layout).__name__,
+            )
             continue
         # ReStickify cannot materialize a non-DL16 source.  It may be an
         # unrelated direct operand, so keep looking for a feasible candidate;
         # if none resolves the split, preserve the original alignment error.
         if source_layout.device_layout.device_dtype != DataFormats.SEN169_FP16:
+            logger.debug(
+                "enforce_indirect_access_layout: scatter source candidate %s "
+                "uses unsupported ReStickify format %s",
+                dep.name,
+                source_layout.device_layout.device_dtype,
+            )
             continue
         dense_stl = _dense_scatter_source_stl(source_layout)
         if dense_stl == source_layout.device_layout:
+            logger.debug(
+                "enforce_indirect_access_layout: scatter source candidate %s "
+                "is already dense",
+                dep.name,
+            )
             continue
         candidate_inputs = _scatter_alignment_inputs(
             graph, op, layout_overrides={dep.name: dense_stl}
         )
         if candidate_inputs is None:
+            logger.debug(
+                "enforce_indirect_access_layout: could not reconstruct alignment "
+                "inputs for scatter source candidate %s",
+                dep.name,
+            )
             continue
         try:
             align_tensors_pure(candidate_inputs)
-        except UnalignedStickSplit:
+        except UnalignedStickSplit as candidate_error:
+            logger.debug(
+                "enforce_indirect_access_layout: dense scatter source candidate "
+                "%s leaves alignment invalid: %s",
+                dep.name,
+                candidate_error,
+            )
             continue
 
         logger.info(

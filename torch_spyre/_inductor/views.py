@@ -916,6 +916,7 @@ def align_tensors_pure(
         zip(all_terms, stick_dim, stick_size)
     ):
         if var is None:
+            # A constant/broadcast innermost coordinate has no stick loop to split.
             continue
         has_outer_stick_coordinate = any(
             term.var == var and term.den == physical_stick_size for term in terms[:-1]
