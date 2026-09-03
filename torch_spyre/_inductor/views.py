@@ -902,17 +902,25 @@ def align_tensors_pure(
     # sort splits
     splits = {var: sorted(val) for var, val in splits.items()}
 
-    # Every interior boundary for a tensor's stick variable must fall between
-    # physical sticks.  A boundary inside a stick cannot be represented as a
-    # device dimension: the outer-stick adjustment below would truncate it to
-    # zero (for example 16 // 32), silently producing a size-0 dimension and
-    # corrupting the access.  The final boundary is the logical range endpoint,
-    # so a partial last stick (for example 7 int32 elements in a 32-element
-    # stick) remains valid.
-    for tensor_index, (var, physical_stick_size) in enumerate(
-        zip(stick_dim, stick_size)
+    # When a tensor has the canonical pair of an outer-stick coordinate and an
+    # innermost stick coordinate for the same variable, every interior boundary
+    # must fall between physical sticks.  A boundary inside a stick cannot be
+    # represented as a device dimension: the outer-stick adjustment below would
+    # truncate it to zero (for example 16 // 32), or to an incorrect nonzero
+    # extent (for example 48 // 32).  Do not apply this restriction merely
+    # because the innermost coordinate uses the variable: arbitrary coordinate
+    # expressions in preceding dimensions can legally split it at other points.
+    # The final boundary is the logical range endpoint, so a partial last stick
+    # (for example 7 int32 elements in a 32-element stick) remains valid.
+    for tensor_index, (terms, var, physical_stick_size) in enumerate(
+        zip(all_terms, stick_dim, stick_size)
     ):
         if var is None:
+            continue
+        has_outer_stick_coordinate = any(
+            term.var == var and term.den == physical_stick_size for term in terms[:-1]
+        )
+        if not has_outer_stick_coordinate:
             continue
         for boundary_expr in splits[var][1:-1]:
             boundary = _concrete_alignment_value(boundary_expr)

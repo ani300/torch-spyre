@@ -291,6 +291,21 @@ class TestCoordinates(TestCase):
                 tensors,
             )
 
+    def test_align_tensors_accepts_noncanonical_stick_variable_split(self):
+        """A shared variable need not describe canonical outer-stick tiling."""
+        entry = sympy.Symbol("entry", integer=True, nonnegative=True)
+        _, aligned, _ = align_tensors(
+            {entry: (4, 2)},
+            [
+                {
+                    "size": [2, 64],
+                    "coordinates": [sympy.floor(entry / 2), entry],
+                }
+            ],
+        )
+
+        self.assertTrue(all(size > 0 for tensor in aligned for size in tensor["size"]))
+
     def test_align_tensors_accepts_stick_aligned_source(self):
         """A dense scatter source contributes no sub-stick index boundary."""
         entry, head, width = sympy.symbols(
