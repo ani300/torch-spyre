@@ -2665,6 +2665,19 @@ class TestBuildLoopSchedulerNodes(unittest.TestCase):
         self.assertEqual(result, [copy, created[0]])
         self.assertEqual(created[0].snodes, [first, consumer])
 
+    def test_prescheduling_order_is_restored_after_inductor_toposort(self):
+        sched = _make_scheduler()
+        early_op = _make_ir_op((0,), Integer(4))
+        late_op = _make_ir_op((0,), Integer(4))
+        early_op._spyre_preschedule_order = 10
+        late_op._spyre_preschedule_order = 11
+        early = _make_snode(sched, early_op, "early")
+        late = _make_snode(sched, late_op, "late")
+
+        _result, created = self._run([late, early])
+
+        self.assertEqual(created[0].snodes, [early, late])
+
     def test_two_separate_groups(self):
         sched = _make_scheduler()
         g0a = _make_snode(sched, _make_ir_op((0,), Integer(4)), "g0a")
@@ -5643,6 +5656,7 @@ class TestReadCopyPlanDataclasses(unittest.TestCase):
         self.assertEqual(entry.consumer_op_names, ("op0", "op1"))
         self.assertEqual(entry.predivision_unit_steps, ())
         self.assertTrue(entry.loop_invariant)
+        self.assertIsNone(entry.hoist)
         with self.assertRaises(Exception):
             entry.copy_name = "other"  # frozen -> raises FrozenInstanceError
 
@@ -5650,6 +5664,40 @@ class TestReadCopyPlanDataclasses(unittest.TestCase):
         self.assertEqual(plan.entries, (entry,))
         with self.assertRaises(Exception):
             plan.entries = ()
+
+    def test_repeated_invariant_windows_are_sunk_into_the_loop(self):
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.loop_info import ReadCopyEntry
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _place_invariant_read_copies,
+        )
+
+        def entry(copy_name, source_name, offset=0, *, invariant=True):
+            return ReadCopyEntry(
+                copy_name=copy_name,
+                dep=MemoryDep(
+                    name=source_name,
+                    index=sympy.Integer(offset),
+                    var_names=(),
+                    size=(),
+                ),
+                insert_before_op_name="consumer",
+                sizing_op_name="consumer",
+                sizing_read_index=0,
+                consumer_op_names=("consumer",),
+                loop_invariant=invariant,
+            )
+
+        placed = _place_invariant_read_copies(
+            [
+                entry("mask0", "mask", 0),
+                entry("mask1", "mask", 256),
+                entry("weight", "weight"),
+                entry("advancing", "input", invariant=False),
+            ]
+        )
+
+        assert [item.hoist for item in placed] == [False, False, True, False]
 
 
 class TestReadCopyElisionProof(unittest.TestCase):
