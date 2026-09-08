@@ -147,7 +147,9 @@ def _rolled_reference(query, key, value, window_size, cache_seqlen, buffer_origi
     )
 
 
-def _reference_with_valid_start(query, key, value, window_size, valid_start):
+def _reference_with_valid_start(
+    query, key, value, window_size, valid_start, cache_seqlen=None
+):
     """``_rolled_reference`` for an exactly-full buffer, additionally excluding
     physical rows below ``valid_start`` -- the left-padding an offset-and-length
     window cannot express.
@@ -155,12 +157,17 @@ def _reference_with_valid_start(query, key, value, window_size, valid_start):
     One threshold per batch entry, so ``valid_start`` is a list even when uniform.
     """
     seqlen_q, capacity = query.size(2), key.size(2)
-    rows = torch.arange(seqlen_q) + (capacity - seqlen_q)
+    cache_seqlen = capacity if cache_seqlen is None else cache_seqlen
+    rows = torch.arange(seqlen_q) + (cache_seqlen - seqlen_q)
     columns = torch.arange(capacity)
     delta = rows.unsqueeze(-1) - columns.unsqueeze(0)
-    allowed = (delta >= 0) & (delta < window_size)
+    allowed = ((delta >= 0) & (delta < window_size)).unsqueeze(0)
     starts = torch.tensor(valid_start).view(-1, 1, 1)
-    allowed = allowed.unsqueeze(0) & (columns.view(1, 1, -1) >= starts)
+    row_grid = rows.view(1, -1, 1)
+    column_grid = columns.view(1, 1, -1)
+    allowed = (allowed & (column_grid >= starts)) | (
+        (row_grid < starts) & (column_grid == row_grid)
+    )
     mask = torch.zeros(allowed.shape, dtype=query.dtype)
     mask.masked_fill_(~allowed, float("-inf"))
     return F.scaled_dot_product_attention(
@@ -168,13 +175,14 @@ def _reference_with_valid_start(query, key, value, window_size, valid_start):
     )
 
 
-def _valid_start_attention(q, k, v, window_size, valid_start):
+def _valid_start_attention(q, k, v, window_size, valid_start, cache_seqlen=None):
     """The op with an explicit valid_start on spyre, the reference on CPU."""
+    cache_seqlen = k.size(2) if cache_seqlen is None else cache_seqlen
     if q.device.type == "spyre":
         return torch.ops.spyre.sliding_window_attention(
-            q, k, v, window_size, True, None, k.size(2), 0, valid_start
+            q, k, v, window_size, True, None, cache_seqlen, 0, valid_start
         )
-    return _reference_with_valid_start(q, k, v, window_size, valid_start)
+    return _reference_with_valid_start(q, k, v, window_size, valid_start, cache_seqlen)
 
 
 def _rolled_attention(q, k, v, window_size, cache_seqlen, buffer_origin=None):
@@ -411,6 +419,23 @@ class TestCompactCache(unittest.TestCase):
         query = cached_randn((1, 8, 64, 64), differentiation=1, dtype=torch.float16)
         compare_with_cpu(
             _valid_start_attention, query, key, value, 1024, [17], run_eager=False
+        )
+
+    def test_valid_start_prefill_padding_rows_stay_finite(self):
+        # The first 17 query rows are left padding. Each receives a harmless
+        # diagonal rather than an all--inf band, so it cannot poison later layers
+        # with NaN K/V values; callers discard or zero these query outputs.
+        key, value = _compact_kv(1, 8, 1088, 64)
+        query = cached_randn((1, 8, 64, 64), differentiation=1, dtype=torch.float16)
+        compare_with_cpu(
+            _valid_start_attention,
+            query,
+            key,
+            value,
+            1024,
+            [17],
+            64,
+            run_eager=False,
         )
 
     def test_valid_start_per_sequence(self):

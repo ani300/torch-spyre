@@ -1065,18 +1065,25 @@ def sliding_window_attention(  # type: ignore[empty-body]
     MUST pass its true origin, or every read lands past the data, in bounds
     and unmasked. See ``SlidingWindowPlan`` for both.
 
-    ``valid_start`` is one **logical** column coordinate per batch entry;
-    columns strictly below it are never attended, whatever the window says. It
-    exists for left-padded prompts, whose pad columns sit inside the window and
+    ``valid_start`` is one **logical** column coordinate per batch entry; valid
+    query rows never attend columns strictly below it, whatever the window says.
+    It exists for left-padded prompts, whose pad columns sit inside the window and
     which an offset-and-length window cannot otherwise exclude. ``None`` or
     all-zero costs nothing; a uniform threshold keeps the band broadcast over
     batch; only a ragged one widens it. Coordinates are logical, matching
     ``cache_seqlen``, so a caller passing ``buffer_origin=0`` passes physical
-    row indices.
+    row indices. Query rows below ``valid_start`` are padding; the implementation
+    gives each such row its diagonal to avoid an all-masked softmax. Compiler-added
+    front-padding rows whose logical coordinate predates the cache instead retain
+    the first resident column. These outputs are unspecified and callers discard
+    or zero them.
 
-    Allocation contract: ``Lk >= round_up_to_64(window_size + Lq - 1)`` for
-    the ``Lq`` of this call, so prefill long sequences in chunks;
-    ``rejection_reason`` names the required row count when ``Lk`` is short.
+    Allocation contract: each internally tiled query block needs
+    ``round_up_to_64(window_size + q_block - 1)`` rows (``q_block=64`` for
+    prefill and 1 for decode), and the allocation/origin pair must also contain
+    the logical rows through ``cache_seqlen - 1``. Long prefills are tiled by the
+    decomposition rather than requiring ``window_size + Lq`` physical rows;
+    ``rejection_reason`` names the exact failure when the cache is too short.
     Zero-fill the allocation -- a buffer may overshoot the written prefix,
     and though causal masking discards those scores the multiply still
     happens, and an additive ``-inf`` cannot rescue a ``NaN``.
@@ -1146,7 +1153,12 @@ def window_band_mask(
     today, would need one.
 
     ``valid_start``, if given, additionally excludes columns strictly below
-    its per-batch-entry threshold -- see ``sliding_window_attention``.
+    its per-batch-entry threshold -- see ``sliding_window_attention``. Query
+    rows below the same threshold are padding themselves; each keeps only its
+    causal diagonal so the softmax remains defined. Any compiler-added front-pad
+    row whose diagonal predates the resident buffer keeps its first column instead.
+    Callers discard or zero these query rows, but no row receives an all-``-inf``
+    score band.
 
     Built entirely on CPU so the in-place ops stay opaque to torch.compile,
     matching spyre.causal_mask's rationale.
@@ -1159,14 +1171,27 @@ def window_band_mask(
     else:
         allowed = delta.abs() < window_size
     effective = band_valid_start(valid_start)
-    if effective is None:
-        allowed = allowed.unsqueeze(0)
-    elif min(effective) == max(effective):
-        # Uniform threshold: still one broadcast row, not one per sequence.
-        allowed = (allowed & (column.unsqueeze(0) >= effective[0])).unsqueeze(0)
-    else:
-        starts = torch.tensor(effective, device="cpu").view(-1, 1, 1)
-        allowed = allowed.unsqueeze(0) & (column.view(1, 1, -1) >= starts)
+    allowed = allowed.unsqueeze(0)
+    if effective is not None:
+        # A uniform threshold remains one broadcast row. For a padded query row,
+        # retain its diagonal solely to avoid an undefined all-masked softmax;
+        # valid rows still exclude every column below valid_start.
+        starts = torch.tensor(
+            [effective[0]] if min(effective) == max(effective) else effective,
+            device="cpu",
+        ).view(-1, 1, 1)
+        rows = row.view(1, -1, 1)
+        columns = column.view(1, 1, -1)
+        allowed = (allowed & (columns >= starts)) | (
+            (rows < starts) & (columns == rows)
+        )
+    # A ragged query is front-padded to q_block by the decomposition. Its synthetic
+    # leading coordinates can predate physical row 0, so even the diagonal rule
+    # above has no matching column. Those outputs are sliced away, but keeping one
+    # zero-filled resident column avoids manufacturing NaNs inside the graph.
+    has_attendable_key = allowed.any(dim=-1, keepdim=True)
+    first_column = torch.arange(buffer_width, device="cpu").view(1, 1, -1) == 0
+    allowed = allowed | (~has_attendable_key & first_column)
     mask_cpu = torch.zeros(allowed.shape, dtype=dtype, device="cpu")
     mask_cpu.masked_fill_(~allowed, float("-inf"))
     return mask_cpu.unsqueeze(1).to(device=device)
