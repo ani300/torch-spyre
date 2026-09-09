@@ -241,13 +241,53 @@ def _select_sdpa_tiling(
     fallback_kv_blocks_per_loop_group = _kv_blocks_per_loop_group(
         fallback_num_q_tiles, fallback_num_kv_blocks
     )
+    score_bytes_per_core: int | None = None
+    estimated_live_bytes_per_core: int | None = None
+    selected_kv_block_size: int | None = None
+
+    # Decode has no useful query-axis parallelism.  Coarse head tiling repeats
+    # the online-softmax body and is substantially slower, while forcing a KV
+    # work split does not propagate through every operation in the
+    # decomposition.  Keep all heads together and let the ordinary scheduler
+    # divide each operation.  A full 512-token KV block wins for the Granite
+    # and Gemma decode geometries; with one query row its worst-case live
+    # footprint is also small enough to check conservatively as if all heads
+    # resided on one core.
+    if max_seqlen_q == 1:
+        selected_kv_block_size = min(max_seqlen_kv, _SDPA_MAX_SEQUENCE_TILE_SIZE)
+        selected_kv_block_size = max(64, selected_kv_block_size // 64 * 64)
+        score_bytes_per_core, estimated_live_bytes_per_core = (
+            _sdpa_estimated_live_bytes_per_core(
+                batch_size=batch_size,
+                heads_per_core=num_heads,
+                query_rows_per_core=1,
+                kv_block_size=min(selected_kv_block_size, max_seqlen_kv),
+                head_dim=head_dim,
+                element_size=element_size,
+            )
+        )
+        if estimated_live_bytes_per_core <= lx_budget_bytes:
+            num_kv_blocks = (
+                max_seqlen_kv + selected_kv_block_size - 1
+            ) // selected_kv_block_size
+            return _SDPATilingConfig(
+                strategy=("decode" if num_kv_blocks == 1 else "decode_tiled"),
+                reason="single-query decode",
+                kv_block_size=selected_kv_block_size,
+                num_kv_blocks=num_kv_blocks,
+                num_q_tiles=1,
+                q_tile_size=1,
+                num_head_tiles=1,
+                kv_blocks_per_loop_group=_kv_blocks_per_loop_group(1, num_kv_blocks),
+                work_div=None,
+                score_bytes_per_core=score_bytes_per_core,
+                estimated_live_bytes_per_core=estimated_live_bytes_per_core,
+                lx_budget_bytes=lx_budget_bytes,
+            )
 
     work_div = _sdpa_full_core_work_division(
         num_heads, num_kvheads, max_seqlen_q, num_cores
     )
-    score_bytes_per_core = None
-    estimated_live_bytes_per_core = None
-    selected_kv_block_size = None
     if work_div is not None and max_seqlen_q <= _SDPA_MAX_SEQUENCE_TILE_SIZE:
         heads_per_core = num_heads // work_div["num_heads"]
         query_rows_per_core = max_seqlen_q // work_div["max_seqlen_q"]

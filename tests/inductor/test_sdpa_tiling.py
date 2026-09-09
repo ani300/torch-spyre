@@ -124,6 +124,33 @@ class TestSDPATiling(unittest.TestCase):
                     {"num_heads": 8, "max_seqlen_q": 4, "max_seqlen_kv": 4},
                 )
 
+    def test_decode_uses_full_heads_and_512_kv_blocks(self):
+        cases = (
+            ("granite", 32, 8, 128, 82048),
+            ("gemma-local", 16, 8, 256, 49216),
+            ("gemma-global-12b", 16, 1, 512, 65600),
+            ("gemma-global-26b", 16, 2, 512, 65600),
+        )
+        for model, num_heads, num_kvheads, head_dim, expected_live_bytes in cases:
+            with self.subTest(model=model):
+                config = self._select(
+                    num_heads=num_heads,
+                    num_kvheads=num_kvheads,
+                    max_seqlen_q=1,
+                    max_seqlen_kv=8192,
+                    head_dim=head_dim,
+                )
+
+                self.assertEqual(config.strategy, "decode_tiled")
+                self.assertEqual(config.reason, "single-query decode")
+                self.assertEqual(config.kv_block_size, 512)
+                self.assertEqual(config.num_kv_blocks, 16)
+                self.assertEqual(config.num_head_tiles, 1)
+                self.assertIsNone(config.work_div)
+                self.assertEqual(
+                    config.estimated_live_bytes_per_core, expected_live_bytes
+                )
+
     def test_long_contexts_keep_blocking_and_loop_grouping(self):
         for sequence_length in (8 * 1024, 32 * 1024):
             with self.subTest(sequence_length=sequence_length):
