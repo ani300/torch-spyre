@@ -97,6 +97,26 @@ def _compact_kv(batch, kvheads, capacity, cache_seqlen, head_dim=64):
     return key, value
 
 
+def _to_cache_position_first(tensor):
+    """Move a KV cache with the device layout used by model cache updates."""
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+    batch, kvheads, capacity, head_dim = tensor.shape
+    eps = SpyreTensorLayout(list(tensor.shape), tensor.dtype).elems_per_stick()
+    layout = SpyreTensorLayout(
+        device_size=[capacity, kvheads, (head_dim + eps - 1) // eps, batch, eps],
+        stride_map=[
+            head_dim,
+            capacity * head_dim,
+            eps,
+            kvheads * capacity * head_dim,
+            1,
+        ],
+        device_dtype=get_device_dtype(tensor.dtype),
+    )
+    return tensor.to("spyre", device_layout=layout)
+
+
 def _compact_kv_at(batch, kvheads, capacity, buffer_origin, cache_seqlen, head_dim=64):
     """Like ``_compact_kv`` but for a buffer whose physical row 0 holds
     ``buffer_origin`` rather than the exactly-full ``cache_seqlen -
@@ -197,6 +217,39 @@ def _rolled_attention(q, k, v, window_size, cache_seqlen, buffer_origin=None):
     return _rolled_reference(q, k, v, window_size, cache_seqlen, buffer_origin)
 
 
+def _decode_mask(batch, capacity, write_row, window_size, valid_start, dtype):
+    """Fixed-shape runtime mask over physical rows of an anchored cache."""
+    columns = torch.arange(capacity).view(1, 1, 1, capacity)
+    starts = torch.tensor(valid_start).view(batch, 1, 1, 1)
+    allowed = (
+        (columns <= write_row)
+        & (columns > write_row - window_size)
+        & (columns >= starts)
+    )
+    mask = torch.zeros((batch, 1, 1, capacity), dtype=dtype)
+    return mask.masked_fill(~allowed, float("-inf"))
+
+
+def _runtime_mask_attention(q, k, v, window_size, scale, decode_mask):
+    """Dispatch the tensor-mask API on Spyre and masked SDPA on CPU."""
+    if q.device.type == "spyre":
+        return torch.ops.spyre.sliding_window_attention(
+            q,
+            k,
+            v,
+            window_size,
+            True,
+            scale,
+            None,
+            None,
+            None,
+            decode_mask,
+        )
+    return F.scaled_dot_product_attention(
+        q, k, v, attn_mask=decode_mask, scale=scale, enable_gqa=q.size(1) != k.size(1)
+    )
+
+
 class TestSlidingWindowAttention(unittest.TestCase):
     """Shapes the op supports, against the masked reference."""
 
@@ -216,6 +269,15 @@ class TestSlidingWindowAttention(unittest.TestCase):
     def test_prefill_gqa(self):
         # 8 query heads from 2 kv heads; the expand is inside the op.
         query, key, value = _inputs(1, 8, 2, 256, 256)
+        compare_with_cpu(_attention, query, key, value, 64, run_eager=False)
+
+    def test_prefill_transposed_query_view(self):
+        # Q projections arrive physically as [B, Lq, H, D] and are viewed as
+        # [B, H, Lq, D]. The tiled window must follow logical, not stride, axes.
+        query = cached_randn(
+            (1, 256, 8, 64), differentiation=1, dtype=torch.float16
+        ).transpose(1, 2)
+        _, key, value = _inputs(1, 8, 8, 256, 256)
         compare_with_cpu(_attention, query, key, value, 64, run_eager=False)
 
     def test_prefill_batch(self):
@@ -298,6 +360,68 @@ class TestSlidingWindowAttention(unittest.TestCase):
         # uses one or two, and kv_window hands back a transposed slice.
         query, key, value = _inputs(1, 16, 8, 512, 512, head_dim=256)
         compare_with_cpu(_attention, query, key, value, 1024, run_eager=False)
+
+    def test_prefill_reads_a_prefix_of_a_larger_cache(self):
+        # A short prefill can use the compact decode allocation already. Its KV
+        # slice has a larger backing stride than its 64-row logical width.
+        key, value = _compact_kv(1, 2, 1088, 64, head_dim=256)
+        query = cached_randn((1, 4, 64, 256), differentiation=1, dtype=torch.float16)
+        compare_with_cpu(
+            _rolled_attention, query, key, value, 1024, 64, 0, run_eager=False
+        )
+
+    def test_prefill_from_pinned_larger_cache_with_left_padding(self):
+        # Model caches pin the sequence dimension outermost for indirect writes.
+        # Exercise the fused recurrence with both the model's pinned cache layout
+        # and a load-bearing left-padding band at head_dim=256.
+        key, value = _compact_kv(1, 4, 256, 128, head_dim=256)
+        query = cached_randn((1, 4, 128, 256), differentiation=1, dtype=torch.float16)
+        expected = _valid_start_attention(query, key, value, 128, [17], 128)
+
+        compiled = torch.compile(_valid_start_attention, backend="inductor")
+        actual = compiled(
+            query.to("spyre"),
+            _to_cache_position_first(key),
+            _to_cache_position_first(value),
+            128,
+            [17],
+            128,
+        ).cpu()
+
+        torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.1)
+
+    def test_prefill_from_pinned_larger_cache_without_left_padding(self):
+        """Separate pinned-cache layout from the load-bearing padding band."""
+        key, value = _compact_kv(1, 4, 256, 128, head_dim=256)
+        query = cached_randn((1, 4, 128, 256), differentiation=1, dtype=torch.float16)
+        expected = _rolled_attention(query, key, value, 128, 128, 0)
+
+        compiled = torch.compile(_rolled_attention, backend="inductor")
+        actual = compiled(
+            query.to("spyre"),
+            _to_cache_position_first(key),
+            _to_cache_position_first(value),
+            128,
+            128,
+            0,
+        ).cpu()
+
+        torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.1)
+
+    def test_prefill_left_padding_head_dim_256(self):
+        """Separate the load-bearing padding band from the pinned-cache layout."""
+        key, value = _compact_kv(1, 4, 256, 128, head_dim=256)
+        query = cached_randn((1, 4, 128, 256), differentiation=1, dtype=torch.float16)
+        compare_with_cpu(
+            _valid_start_attention,
+            query,
+            key,
+            value,
+            128,
+            [17],
+            128,
+            run_eager=False,
+        )
 
 
 class TestCompactCache(unittest.TestCase):
@@ -411,6 +535,32 @@ class TestCompactCache(unittest.TestCase):
         compare_with_cpu(
             _rolled_attention, query, key, value, 1024, 1088, run_eager=False
         )
+
+    def test_runtime_decode_mask_reuses_one_graph_as_values_change(self):
+        """Position and padding travel as tensor data, never Python guards."""
+        batch, heads, kvheads, capacity, window = 2, 8, 2, 256, 128
+        query, key, value = _inputs(batch, heads, kvheads, 1, capacity)
+        masks = [
+            _decode_mask(batch, capacity, 128, window, [0, 17], query.dtype),
+            _decode_mask(batch, capacity, 191, window, [0, 3], query.dtype),
+            _decode_mask(batch, capacity, 255, window, [0, 0], query.dtype),
+        ]
+        expected = [
+            _runtime_mask_attention(query, key, value, window, 1.0, mask)
+            for mask in masks
+        ]
+
+        torch._dynamo.utils.counters.clear()
+        compiled = torch.compile(_runtime_mask_attention, backend="inductor")
+        device_args = [tensor.to("spyre") for tensor in (query, key, value)]
+        actual = [
+            compiled(*device_args, window, 1.0, mask.to("spyre")).cpu()
+            for mask in masks
+        ]
+
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == 1
+        for got, want in zip(actual, expected):
+            torch.testing.assert_close(got, want, atol=0.1, rtol=0.1)
 
     def test_valid_start_excludes_padded_columns(self):
         # 17 rows of left padding inside the window: without valid_start they are

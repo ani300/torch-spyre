@@ -27,6 +27,7 @@ registry; Spyre never mutates the global table.
 
 import math
 import threading
+from contextlib import nullcontext
 from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
@@ -772,6 +773,15 @@ def spyre_kv_window(
     k_win = key[:, :, read_start : read_start + buffer_width, :].transpose(-1, -2)
     v_win = value[:, :, read_start : read_start + buffer_width, :]
 
+    # A four-stick head dimension (Gemma 4 uses D=256) needs a materialized
+    # bounded window before the tiled matmuls. Keeping the source-cache strides
+    # there makes the layout solver bind a multi-stick head row as though it were
+    # the window axis. One- and two-stick rows retain the zero-copy view: forcing
+    # those through this clone currently regresses offset decode reads.
+    if key.size(3) > 128:
+        k_win = k_win.contiguous()
+        v_win = v_win.contiguous()
+
     expansion = num_heads // key.size(1)
     if expansion != 1:
         k_win = k_win.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
@@ -787,18 +797,39 @@ def _windowed_attention(
     scaling_factor: float,
     num_heads: int,
     valid_start: list[int] | None = None,
+    runtime_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """spyre__sdpa_overrideable's body, tiled over buffer_width not max_seqlen_kv.
+    """Blocked online attention over each query block's physical KV window.
 
-    The Python loop is unrolled at trace time, so every read offset is a
-    constant. Blocks share no softmax state; the accumulators are per
-    iteration and exist because the window_size hint may tile buffer_width
-    into partial softmaxes.
+    Both loops are unrolled at trace time, so every cache read is a bounded,
+    constant slice. Query blocks share no softmax state. Within one query block,
+    KV chunks use functional SSA carries, matching ``spyre__sdpa_overrideable``;
+    a mutation-based ``copy_forced`` carry is not tile-safe when the output row
+    spans multiple sticks (Gemma's head_dim=256).
     """
     batch_size = query.size(0)
     head_dim = query.size(3)
     q_block = plan.q_block
-    buffer_width = plan.buffer_width
+    # A runtime decode mask describes an anchored compact cache whose write
+    # cursor moves within the final stick. Read the complete compact allocation
+    # in that mode: the tensor mask selects the live W rows without turning its
+    # position into Python specialization state. Planned prefill still reads the
+    # smaller per-block slice.
+    buffer_width = key.size(2) if runtime_mask is not None else plan.buffer_width
+
+    # Attention projections commonly arrive as a [B, Lq, H, D] allocation viewed
+    # as [B, H, Lq, D]. Normalize that view before the tiled matmuls: physical
+    # stride order otherwise makes the tiler bind the logical head/query axes to
+    # the wrong loops. This is bounded to the query footprint and mirrors the
+    # full-SDPA fix in #4377; K/V remain windowed rather than copied wholesale.
+    query = query.contiguous()
+
+    # Bound each explicit KV block to the proven SDPA tile size. Unlike a coarse
+    # tile over the reduction dimension, explicit blocks make online-softmax
+    # state ordinary functional graph values. SWA already caps Q at 64 rows, so
+    # there is no need for full SDPA's additional approximately four-way split.
+    kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, buffer_width)
+    num_kv_blocks = (buffer_width + kv_block_size - 1) // kv_block_size
 
     out_blocks = []
     for block_index in range(plan.num_q_blocks):
@@ -809,95 +840,148 @@ def _windowed_attention(
             "should have rejected a query length that does not divide"
         )
 
-        read_start = plan.read_start(block_index)
-        k_win, v_win = torch.ops.spyre.kv_window(
-            key, value, read_start, buffer_width, num_heads
-        )
+        read_start = 0 if runtime_mask is not None else plan.read_start(block_index)
         # A valid_start that masks anything makes the band load-bearing even for a
         # block the window alone fully covers.
-        fully_attended = (
-            plan.block_is_fully_attended(block_index)
-            and band_valid_start(valid_start) is None
-        )
-        band = (
-            None
-            if fully_attended
-            else torch.ops.spyre.window_band_mask(
-                # Logical, not read_start: the row side of this op
-                # (q_row_origin) is a logical coordinate, and delta = row -
-                # column only means anything if both sides agree. Identical
-                # to read_start while buffer_origin is 0 -- a still-filling
-                # or exactly-full cache -- and diverges for a rolled buffer.
-                plan.read_start_logical(block_index),
-                q_block,
-                buffer_width,
-                plan.q_kv_offset + q_start,
-                plan.window_size,
-                plan.is_causal,
-                query.dtype,
-                query.device,
-                valid_start,
+        if runtime_mask is not None:
+            band = runtime_mask
+        else:
+            fully_attended = (
+                plan.block_is_fully_attended(block_index)
+                and band_valid_start(valid_start) is None
             )
-        )
+            band = (
+                None
+                if fully_attended
+                else torch.ops.spyre.window_band_mask(
+                    # Logical, not read_start: the row side of this op
+                    # (q_row_origin) is a logical coordinate, and delta = row -
+                    # column only means anything if both sides agree. Identical
+                    # to read_start while buffer_origin is 0 -- a still-filling
+                    # or exactly-full cache -- and diverges for a rolled buffer.
+                    plan.read_start_logical(block_index),
+                    q_block,
+                    buffer_width,
+                    plan.q_kv_offset + q_start,
+                    plan.window_size,
+                    plan.is_causal,
+                    query.dtype,
+                    query.device,
+                    valid_start,
+                )
+            )
+
+        # Keep the multi-output custom reads outside the coarse-tile scope.
+        # FallbackKernel/MultiOutput nodes do not carry named dimensions; putting
+        # them inside the scope can pull GQA expansion and batch dependencies into
+        # the wrong loop group (and, for batch > 1, leave a dangling scheduler
+        # dependency after grouping).
+        window_chunks = []
+        for kv_block in range(num_kv_blocks):
+            start = kv_block * kv_block_size
+            end = min(start + kv_block_size, buffer_width)
+            k_blk, v_blk = torch.ops.spyre.kv_window(
+                key,
+                value,
+                read_start + start,
+                end - start,
+                num_heads,
+            )
+            window_chunks.append((start, end, k_blk, v_blk))
+
         q_rows = query[:, :, q_start:q_end, :]
 
-        # SDPA's "sparse via reduction" construction. On a single pass M is
-        # -inf, so correction is exp(-inf) == 0 and the running terms drop out.
-        m_reduced = torch.full(
-            (batch_size, num_heads, q_block, 64),
-            float("-inf"),
-            device=query.device,
-            dtype=query.dtype,
-        )
-        running_max = m_reduced.amax(dim=-1)
+        with spyre_hint(named_dims=["_b", "num_heads", "q_block", "head_dim"]):
+            q_scaled = q_rows * scaling_factor
 
-        denominator_reduced = torch.zeros(
-            (batch_size, num_heads, q_block, 64),
-            device=query.device,
-            dtype=query.dtype,
-        )
-        denominator = denominator_reduced.amax(dim=-1)
+        if num_kv_blocks > 1:
+            # SDPA's sparse-via-reduction construction. Single-chunk windows do
+            # not need synthetic state; omitting it also avoids dead hinted ops
+            # retaining scheduler dependencies after DCE.
+            m_reduced = torch.full(
+                (batch_size, num_heads, q_block, 64),
+                float("-inf"),
+                device=query.device,
+                dtype=query.dtype,
+            )
+            with spyre_hint(named_dims=["_b", "num_heads", "q_block"]):
+                running_max = m_reduced.amax(dim=-1)
 
-        output = torch.zeros(
-            (batch_size, num_heads, q_block, head_dim),
-            device=query.device,
-            dtype=query.dtype,
-        )
+            denominator_reduced = torch.zeros(
+                (batch_size, num_heads, q_block, 64),
+                device=query.device,
+                dtype=query.dtype,
+            )
+            with spyre_hint(named_dims=["_b", "num_heads", "q_block"]):
+                denominator = denominator_reduced.amax(dim=-1)
 
-        with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
-            with spyre_hint(tiles={"num_heads": max(1, num_heads // 4)}):
-                with spyre_hint(tiles={"window_size": max(1, buffer_width // 64)}):
-                    with spyre_hint(work_div={"num_heads": 4, "window_size": 8}):
-                        # k_win arrives transposed.
-                        scores = torch.matmul(
-                            q_rows * scaling_factor, k_win * scaling_factor
-                        )  # batch, num_heads, q_block, buffer_width
+            with spyre_hint(named_dims=["_b", "num_heads", "q_block", "head_dim"]):
+                output = torch.zeros(
+                    (batch_size, num_heads, q_block, head_dim),
+                    device=query.device,
+                    dtype=query.dtype,
+                )
 
-                        if band is not None:
-                            scores = scores + band
+        # Do not create a one-tile hint group. Besides doing no useful work, that
+        # group can make post-layout restickify producers appear after their
+        # consumers for small batched MHA graphs.
+        num_head_tiles = _sdpa_num_head_tiles(num_heads)
+        with (
+            spyre_hint(tiles={"num_heads": num_head_tiles})
+            if num_head_tiles > 1
+            else nullcontext()
+        ):
+            for kv_block, (start, end, k_blk, v_blk) in enumerate(window_chunks):
+                # k_blk is already transposed to [B, Hq, D, block_width].
+                with spyre_hint(named_dims=["_b", "num_heads", "q_block", "kv_block"]):
+                    scores = torch.matmul(
+                        q_scaled, k_blk * scaling_factor
+                    )  # batch, num_heads, q_block, block_width
 
-                        block_max = torch.amax(scores, dim=-1)
-                        max_running = torch.maximum(running_max, block_max)
+                if band is not None:
+                    scores = scores + band[..., start:end]
 
-                        exp_scores = torch.exp(scores - max_running.unsqueeze(-1))
-                        correction = torch.exp(running_max - max_running)
+                block_max = torch.amax(scores, dim=-1)
+                if kv_block == 0:
+                    # Seed from real scores. Besides avoiding dead arithmetic,
+                    # this keeps the single-chunk decode case as the direct
+                    # stable-softmax formula instead of involving synthetic
+                    # -inf/zero accumulators.
+                    new_max = block_max
+                    exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+                    new_denominator = exp_scores.sum(dim=-1)
+                else:
+                    new_max = torch.maximum(running_max, block_max)
+                    exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+                    correction = torch.exp(running_max - new_max)
+                    new_denominator = denominator * correction + exp_scores.sum(dim=-1)
+                exp_scores = exp_scores.contiguous()
+                with spyre_hint(named_dims=["_b", "num_heads", "q_block", "head_dim"]):
+                    weighted = torch.matmul(exp_scores, v_blk)
+                new_output = (
+                    weighted
+                    if kv_block == 0
+                    else output * correction.unsqueeze(-1) + weighted
+                )
 
-                        denominator = torch.ops.spyre.copy_forced(
-                            denominator * correction + exp_scores.sum(dim=-1),
-                            denominator,
-                        )
-                        output = torch.ops.spyre.copy_forced(
-                            output * correction.unsqueeze(-1)
-                            + torch.matmul(exp_scores, v_win),
-                            output,
-                        )
-                        running_max = torch.ops.spyre.copy_forced(
-                            max_running, running_max
-                        )
+                if kv_block == num_kv_blocks - 1:
+                    # Keep the final divide in the same hint scope as its
+                    # producer, as full SDPA does for split-layout outputs.
+                    with spyre_hint(
+                        named_dims=[
+                            "_b",
+                            "num_heads",
+                            "q_block",
+                            "head_dim",
+                        ]
+                    ):
+                        output = new_output / new_denominator.unsqueeze(-1)
+                else:
+                    running_max = new_max
+                    denominator = new_denominator
+                    output = new_output
 
-        out_blocks.append(
-            torch.ops.spyre.copy_forced(output / denominator.unsqueeze(-1), output)
-        )
+        out_blocks.append(output)
 
     return torch.cat(out_blocks, dim=2)
 
@@ -913,6 +997,7 @@ def spyre_sliding_window_attention(
     cache_seqlen: int | None = None,
     buffer_origin: int | None = None,
     valid_start: list[int] | None = None,
+    decode_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sliding-window attention: each Q block attends only its own KV slice.
 
@@ -932,6 +1017,69 @@ def spyre_sliding_window_attention(
     seqlen_q = query.size(2)
     cache_capacity = key.size(2)
 
+    if scale is not None and scale < 0:
+        # math.sqrt would otherwise raise a bare ValueError in the planned path;
+        # keep the runtime-mask path on the same public contract.
+        raise Unsupported(
+            f"sliding_window_attention: scale={scale} must be non-negative"
+        )
+    if not is_causal:
+        raise Unsupported(
+            "sliding_window_attention: bidirectional windows are not implemented, "
+            "only causal ones"
+        )
+    if window_size <= 0:
+        raise Unsupported(
+            f"sliding_window_attention: window_size={window_size} must be positive"
+        )
+
+    if decode_mask is not None:
+        # This path deliberately has no Python position argument: the fixed-shape
+        # tensor carries all position-dependent state at runtime, which lets every
+        # anchored decode step reuse one graph.
+        if seqlen_q != 1:
+            raise Unsupported(
+                "sliding_window_attention: decode_mask requires a single query row"
+            )
+        if (
+            cache_seqlen is not None
+            or buffer_origin is not None
+            or valid_start is not None
+        ):
+            raise Unsupported(
+                "sliding_window_attention: decode_mask cannot be combined with "
+                "cache_seqlen, buffer_origin, or valid_start"
+            )
+        expected_shape = (batch_size, 1, 1, cache_capacity)
+        if tuple(decode_mask.shape) != expected_shape:
+            raise Unsupported(
+                "sliding_window_attention: decode_mask shape "
+                f"{tuple(decode_mask.shape)} must be {expected_shape}"
+            )
+        if decode_mask.dtype != query.dtype:
+            raise Unsupported(
+                "sliding_window_attention: decode_mask dtype "
+                f"{decode_mask.dtype} must match query dtype {query.dtype}"
+            )
+        if decode_mask.device != query.device:
+            raise Unsupported(
+                "sliding_window_attention: decode_mask device "
+                f"{decode_mask.device} must match query device {query.device}"
+            )
+
+        # Use fixed trace-time geometry for the anchored compact allocation.
+        # The runtime mask is consumed by the SWA recurrence below and carries
+        # the moving write position, padding boundary, and unwritten tail.
+        cache_seqlen = cache_capacity
+        buffer_origin = 0
+
+    # Split across query and key, not applied once to their product: keeps the
+    # intermediate in float16 range.
+    if scale is None:
+        scaling_factor = 1.0 / math.sqrt(math.sqrt(head_dim))
+    else:
+        scaling_factor = math.sqrt(scale)
+
     # The cache's position, not its allocation. None means "exactly full",
     # which is what reading key.size(2) as a position silently assumed.
     # Degenerate values (<= 0, either of them) need no check here:
@@ -943,19 +1091,6 @@ def spyre_sliding_window_attention(
     reason = check_valid_start(valid_start, batch_size, cache_seqlen)
     if reason is not None:
         raise Unsupported(f"sliding_window_attention: {reason}")
-
-    if scale is not None and scale < 0:
-        # math.sqrt would otherwise raise a bare ValueError.
-        raise Unsupported(
-            f"sliding_window_attention: scale={scale} must be non-negative"
-        )
-
-    # Split across query and key, not applied once to their product: keeps the
-    # intermediate in float16 range.
-    if scale is None:
-        scaling_factor = 1.0 / math.sqrt(math.sqrt(head_dim))
-    else:
-        scaling_factor = math.sqrt(scale)
 
     # Pad at the FRONT: row i sits at coordinate seqlen_kv - seqlen_q + i, so
     # once seqlen_q is the padded length the two shifts cancel and every real
@@ -1001,7 +1136,14 @@ def spyre_sliding_window_attention(
         )
 
     output = _windowed_attention(
-        query, key, value, plan, scaling_factor, num_heads, valid_start
+        query,
+        key,
+        value,
+        plan,
+        scaling_factor,
+        num_heads,
+        valid_start,
+        decode_mask,
     )
     return output[:, :, pad_rows:, :] if pad_rows else output
 

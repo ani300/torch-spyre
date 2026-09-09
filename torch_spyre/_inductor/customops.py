@@ -1047,6 +1047,7 @@ def sliding_window_attention(  # type: ignore[empty-body]
     cache_seqlen: Optional[int] = None,
     buffer_origin: Optional[int] = None,
     valid_start: Optional[list[int]] = None,
+    decode_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Sliding-window attention entry point.
@@ -1078,6 +1079,17 @@ def sliding_window_attention(  # type: ignore[empty-body]
     the first resident column. These outputs are unspecified and callers discard
     or zero them.
 
+    ``decode_mask`` is a runtime additive mask for anchored single-token decode.
+    Its fixed shape is ``[B, 1, 1, Lk]`` and it must share query's dtype and
+    device; zero keeps a physical cache column and a sufficiently negative
+    additive value excludes it. When it is present, the mask itself describes
+    the current write row, sliding window, unwritten rows, and left padding.
+    ``cache_seqlen``, ``buffer_origin``, and ``valid_start`` must therefore be
+    omitted. Unlike those Python geometry arguments, changing a tensor's contents
+    does not specialize the compiled graph, so every anchored decode position
+    reuses one SWA binary over the compact cache. Prefill should omit
+    ``decode_mask`` and uses the planned per-block window path.
+
     Allocation contract: each internally tiled query block needs
     ``round_up_to_64(window_size + q_block - 1)`` rows (``q_block=64`` for
     prefill and 1 for decode), and the allocation/origin pair must also contain
@@ -1106,6 +1118,7 @@ def _(
     cache_seqlen: Optional[int] = None,
     buffer_origin: Optional[int] = None,
     valid_start: Optional[list[int]] = None,
+    decode_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return query.new_empty(query.size())
 
