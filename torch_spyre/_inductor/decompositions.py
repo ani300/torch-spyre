@@ -59,8 +59,11 @@ logger = get_inductor_logger("decompositions")
 _SDPA_MAX_SEQUENCE_TILE_SIZE = 512
 _SDPA_MAX_TILE_PAIRS_PER_LOOP_GROUP = 16
 _SDPA_PREFERRED_HEADS_PER_TILE = (4, 2, 1)
-_SDPA_MAX_HEAD_WORK_DIVISION = 4
+_SDPA_MHA_MAX_HEAD_WORK_DIVISION = 4
+_SDPA_GQA_MAX_HEAD_WORK_DIVISION = 8
 _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE = 2
+_SDPA_LIVE_QUERY_BUFFER_ALLOWANCE = 2
+_SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,7 +80,8 @@ class _SDPATilingConfig:
     kv_blocks_per_loop_group: int
     work_div: dict[str, int] | None
     score_bytes_per_core: int | None
-    score_lx_budget_bytes: int
+    estimated_live_bytes_per_core: int | None
+    lx_budget_bytes: int
 
 
 def _sdpa_num_head_tiles(num_heads: int) -> int:
@@ -120,41 +124,87 @@ def _kv_blocks_per_loop_group(num_q_tiles: int, num_kv_blocks: int) -> int:
 
 def _sdpa_full_core_work_division(
     num_heads: int,
+    num_kvheads: int,
     max_seqlen_q: int,
-    max_seqlen_kv: int,
     num_cores: int,
 ) -> dict[str, int] | None:
-    """Find exact head/sequence splits that keep every core occupied.
+    """Find placeable head/query splits that keep every core occupied.
 
-    Query-shaped operations use the head and query splits, while K/V-only
-    operations use the head and KV splits. Keeping the two sequence split
-    counts equal gives both parts of the decomposition the same core mapping.
-    Prefer at most four head partitions, matching the previously proven SDPA
-    work division.
+    MHA can split its physical head dimension up to the previously proven
+    four-way partition. GQA expansion represents the logical head dimension as
+    ``[num_kvheads, expansion]``; only a split contained by the expansion axis
+    is reliably placeable. Cap that split at eight: Gemma global attention is
+    faster at 8x4 than at 16x2 even though both occupy all 32 cores.
     """
     if num_cores < 1:
         return None
 
-    max_head_split = min(_SDPA_MAX_HEAD_WORK_DIVISION, num_heads, num_cores)
+    if num_heads == num_kvheads:
+        max_head_split = _SDPA_MHA_MAX_HEAD_WORK_DIVISION
+    else:
+        if num_heads % num_kvheads:
+            return None
+        max_head_split = min(_SDPA_GQA_MAX_HEAD_WORK_DIVISION, num_heads // num_kvheads)
+    max_head_split = min(max_head_split, num_heads, num_cores)
     for head_split in range(max_head_split, 0, -1):
         if num_cores % head_split != 0 or num_heads % head_split != 0:
             continue
-        sequence_split = num_cores // head_split
-        if max_seqlen_q % sequence_split == 0 and max_seqlen_kv % sequence_split == 0:
-            return {
-                "num_heads": head_split,
-                "max_seqlen_q": sequence_split,
-                "max_seqlen_kv": sequence_split,
-            }
+        query_split = num_cores // head_split
+        if max_seqlen_q % query_split == 0:
+            return {"num_heads": head_split, "max_seqlen_q": query_split}
     return None
 
 
-def _sdpa_score_lx_budget_bytes() -> int:
-    """Reserve room for two score-sized values in frontend-managed LX."""
+def _sdpa_lx_budget_bytes() -> int:
+    """Return the frontend-managed portion of each core's LX."""
     # Import lazily to avoid pulling the scratchpad planner into eager startup.
     from .scratchpad.allocator import _lx_planning_size
 
-    return _lx_planning_size() // _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE
+    return _lx_planning_size()
+
+
+def _sdpa_kv_work_division(
+    *, head_split: int, query_split: int, kv_block_size: int, is_gqa: bool
+) -> int:
+    """Choose a useful, exact KV split without forcing maximum occupancy."""
+    preferred = query_split if not is_gqa else max(4, 16 // head_split)
+    preferred = min(preferred, kv_block_size)
+    for kv_split in range(preferred, 0, -1):
+        if kv_block_size % kv_split == 0:
+            return kv_split
+    return 1
+
+
+def _sdpa_estimated_live_bytes_per_core(
+    *,
+    batch_size: int,
+    heads_per_core: int,
+    query_rows_per_core: int,
+    kv_block_size: int,
+    head_dim: int,
+    element_size: int,
+) -> tuple[int, int]:
+    """Estimate the co-live, non-streamed values for one SDPA iteration.
+
+    K/V operands are streamed by the matmul implementation, so the hard LX
+    check covers the two score-sized values plus query/output-sized values and
+    the two scalar online-softmax accumulators. K/V bytes are handled
+    separately as a performance target, not incorrectly added as permanently
+    resident buffers.
+    """
+    score_bytes = (
+        batch_size * heads_per_core * query_rows_per_core * kv_block_size * element_size
+    )
+    query_bytes = (
+        batch_size * heads_per_core * query_rows_per_core * head_dim * element_size
+    )
+    accumulator_bytes = batch_size * heads_per_core * query_rows_per_core * element_size
+    estimated_live_bytes = (
+        _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE * score_bytes
+        + _SDPA_LIVE_QUERY_BUFFER_ALLOWANCE * query_bytes
+        + 2 * accumulator_bytes
+    )
+    return score_bytes, estimated_live_bytes
 
 
 def _select_sdpa_tiling(
@@ -164,22 +214,19 @@ def _select_sdpa_tiling(
     num_kvheads: int,
     max_seqlen_q: int,
     max_seqlen_kv: int,
+    head_dim: int,
     element_size: int,
     num_cores: int,
-    score_lx_budget_bytes: int,
+    lx_budget_bytes: int,
 ) -> _SDPATilingConfig:
-    """Choose between work division and the existing coarse-tiled SDPA path.
+    """Choose a work-divided tile when it is safe, otherwise use the fallback.
 
-    The work-divided path removes explicit online-softmax KV blocks and the
-    sequential coarse head loop. It is deliberately conservative: use it only
-    for ordinary MHA, when both sequence extents already fit the proven
-    per-block limit, exact splits occupy every core, and one per-core score
-    value consumes no more than half of frontend-managed LX. The other half is
-    left for the simultaneously live exponentiated scores and smaller
-    accumulators.
-
-    Every shape outside those constraints retains the post-#4259 decomposition
-    unchanged, including GQA and long-context loop grouping.
+    Capacity is a rejection constraint, not the objective. Among feasible
+    choices, target about 1 MiB of expanded K/V data per core; local sweeps show
+    that both smaller blocks (extra online-softmax iterations) and larger blocks
+    (more local pressure) lose. Keep Lq and heads in one coarse tile whenever a
+    placeable work division can use every core. Shapes outside the calibrated
+    Lq<=512 regime retain the post-#4259 decomposition.
     """
     quarter_kv_stick_aligned = max(64, ((max_seqlen_kv + 3) // 4 + 63) // 64 * 64)
     fallback_kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, quarter_kv_stick_aligned)
@@ -196,44 +243,80 @@ def _select_sdpa_tiling(
     )
 
     work_div = _sdpa_full_core_work_division(
-        num_heads, max_seqlen_q, max_seqlen_kv, num_cores
+        num_heads, num_kvheads, max_seqlen_q, num_cores
     )
     score_bytes_per_core = None
-    if work_div is not None:
-        score_bytes_per_core = (
-            batch_size
-            * (num_heads // work_div["num_heads"])
-            * (max_seqlen_q // work_div["max_seqlen_q"])
-            * max_seqlen_kv
-            * element_size
+    estimated_live_bytes_per_core = None
+    selected_kv_block_size = None
+    if work_div is not None and max_seqlen_q <= _SDPA_MAX_SEQUENCE_TILE_SIZE:
+        heads_per_core = num_heads // work_div["num_heads"]
+        query_rows_per_core = max_seqlen_q // work_div["max_seqlen_q"]
+        kv_bytes_per_token_per_core = (
+            batch_size * heads_per_core * head_dim * element_size
         )
+        target_kv_block_size = max(
+            64,
+            (_SDPA_TARGET_KV_BYTES_PER_CORE // kv_bytes_per_token_per_core // 64) * 64,
+        )
+        selected_kv_block_size = min(
+            max_seqlen_kv,
+            _SDPA_MAX_SEQUENCE_TILE_SIZE,
+            target_kv_block_size,
+        )
+        selected_kv_block_size = max(64, selected_kv_block_size // 64 * 64)
+        while selected_kv_block_size >= 64:
+            score_bytes_per_core, estimated_live_bytes_per_core = (
+                _sdpa_estimated_live_bytes_per_core(
+                    batch_size=batch_size,
+                    heads_per_core=heads_per_core,
+                    query_rows_per_core=query_rows_per_core,
+                    kv_block_size=min(selected_kv_block_size, max_seqlen_kv),
+                    head_dim=head_dim,
+                    element_size=element_size,
+                )
+            )
+            if estimated_live_bytes_per_core <= lx_budget_bytes:
+                break
+            selected_kv_block_size = selected_kv_block_size // 2 // 64 * 64
 
     reason = "eligible"
-    if num_heads != num_kvheads:
-        reason = "grouped-query attention"
-    elif (
-        max_seqlen_q > _SDPA_MAX_SEQUENCE_TILE_SIZE
-        or max_seqlen_kv > _SDPA_MAX_SEQUENCE_TILE_SIZE
-    ):
-        reason = "sequence extent exceeds the full-block limit"
+    if max_seqlen_q > _SDPA_MAX_SEQUENCE_TILE_SIZE:
+        reason = "query extent exceeds the calibrated work-divided limit"
     elif work_div is None:
         reason = "no exact full-core head/sequence work division"
-    elif score_bytes_per_core is None or score_bytes_per_core > score_lx_budget_bytes:
-        reason = "per-core score footprint exceeds the LX budget"
+    elif (
+        selected_kv_block_size is None
+        or selected_kv_block_size < 64
+        or estimated_live_bytes_per_core is None
+        or estimated_live_bytes_per_core > lx_budget_bytes
+    ):
+        reason = "estimated per-core live footprint exceeds the LX budget"
 
     if reason == "eligible":
+        assert work_div is not None
+        assert selected_kv_block_size is not None
+        num_kv_blocks = (
+            max_seqlen_kv + selected_kv_block_size - 1
+        ) // selected_kv_block_size
+        work_div["max_seqlen_kv"] = _sdpa_kv_work_division(
+            head_split=work_div["num_heads"],
+            query_split=work_div["max_seqlen_q"],
+            kv_block_size=selected_kv_block_size,
+            is_gqa=num_heads != num_kvheads,
+        )
         return _SDPATilingConfig(
-            strategy="work_divided",
+            strategy=("work_divided" if num_kv_blocks == 1 else "work_divided_tiled"),
             reason=reason,
-            kv_block_size=max_seqlen_kv,
-            num_kv_blocks=1,
+            kv_block_size=selected_kv_block_size,
+            num_kv_blocks=num_kv_blocks,
             num_q_tiles=1,
             q_tile_size=max_seqlen_q,
             num_head_tiles=1,
-            kv_blocks_per_loop_group=1,
+            kv_blocks_per_loop_group=_kv_blocks_per_loop_group(1, num_kv_blocks),
             work_div=work_div,
             score_bytes_per_core=score_bytes_per_core,
-            score_lx_budget_bytes=score_lx_budget_bytes,
+            estimated_live_bytes_per_core=estimated_live_bytes_per_core,
+            lx_budget_bytes=lx_budget_bytes,
         )
 
     return _SDPATilingConfig(
@@ -247,7 +330,8 @@ def _select_sdpa_tiling(
         kv_blocks_per_loop_group=fallback_kv_blocks_per_loop_group,
         work_div=None,
         score_bytes_per_core=score_bytes_per_core,
-        score_lx_budget_bytes=score_lx_budget_bytes,
+        estimated_live_bytes_per_core=estimated_live_bytes_per_core,
+        lx_budget_bytes=lx_budget_bytes,
     )
 
 
@@ -660,15 +744,17 @@ def spyre__sdpa_overrideable(
         num_kvheads=num_kvheads,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_kv=max_seqlen_kv,
+        head_dim=head_dim,
         element_size=query.dtype.itemsize,
         num_cores=config.sencores,
-        score_lx_budget_bytes=_sdpa_score_lx_budget_bytes(),
+        lx_budget_bytes=_sdpa_lx_budget_bytes(),
     )
     logger.debug(
         "SDPA tiling: strategy=%s reason=%s Lq=%s q_tiles=%s "
         "q_tile_size=%s Lk=%s kv_blocks=%s kv_block_size=%s "
         "head_tiles=%s kv_blocks_per_loop_group=%s work_div=%s "
-        "score_bytes_per_core=%s score_lx_budget_bytes=%s",
+        "score_bytes_per_core=%s estimated_live_bytes_per_core=%s "
+        "lx_budget_bytes=%s",
         tiling.strategy,
         tiling.reason,
         max_seqlen_q,
@@ -681,7 +767,8 @@ def spyre__sdpa_overrideable(
         tiling.kv_blocks_per_loop_group,
         tiling.work_div,
         tiling.score_bytes_per_core,
-        tiling.score_lx_budget_bytes,
+        tiling.estimated_live_bytes_per_core,
+        tiling.lx_budget_bytes,
     )
 
     with spyre_hint(named_dims=["_b", "num_heads", "max_seqlen_q", "head_dim"]):

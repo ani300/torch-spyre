@@ -20,7 +20,7 @@ from torch_spyre._inductor.decompositions import _select_sdpa_tiling
 
 
 class TestSDPATiling(unittest.TestCase):
-    _LX_BUDGET = 800 * 1024
+    _LX_BUDGET = 1_625_344
 
     def _select(
         self,
@@ -30,9 +30,10 @@ class TestSDPATiling(unittest.TestCase):
         num_kvheads=12,
         max_seqlen_q=512,
         max_seqlen_kv=512,
+        head_dim=128,
         element_size=2,
         num_cores=32,
-        score_lx_budget_bytes=_LX_BUDGET,
+        lx_budget_bytes=_LX_BUDGET,
     ):
         return _select_sdpa_tiling(
             batch_size=batch_size,
@@ -40,13 +41,14 @@ class TestSDPATiling(unittest.TestCase):
             num_kvheads=num_kvheads,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=max_seqlen_kv,
+            head_dim=head_dim,
             element_size=element_size,
             num_cores=num_cores,
-            score_lx_budget_bytes=score_lx_budget_bytes,
+            lx_budget_bytes=lx_budget_bytes,
         )
 
     def test_issue_4339_uses_one_block_and_work_division(self):
-        config = self._select()
+        config = self._select(head_dim=64)
 
         self.assertEqual(config.strategy, "work_divided")
         self.assertEqual(config.kv_block_size, 512)
@@ -58,16 +60,69 @@ class TestSDPATiling(unittest.TestCase):
             {"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 8},
         )
         self.assertEqual(config.score_bytes_per_core, 192 * 1024)
+        self.assertEqual(config.estimated_live_bytes_per_core, 443136)
 
-    def test_granite_gqa_keeps_existing_coarse_tiling(self):
+    def test_granite_gqa_uses_calibrated_work_divided_tile(self):
         config = self._select(num_heads=32, num_kvheads=8)
 
-        self.assertEqual(config.strategy, "coarse_tiled")
-        self.assertEqual(config.reason, "grouped-query attention")
-        self.assertEqual(config.kv_block_size, 128)
-        self.assertEqual(config.num_kv_blocks, 4)
-        self.assertEqual(config.num_head_tiles, 8)
-        self.assertIsNone(config.work_div)
+        self.assertEqual(config.strategy, "work_divided")
+        self.assertEqual(config.kv_block_size, 512)
+        self.assertEqual(config.num_kv_blocks, 1)
+        self.assertEqual(config.num_head_tiles, 1)
+        self.assertEqual(
+            config.work_div,
+            {"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 4},
+        )
+
+    def test_granite_long_kv_keeps_512_block_and_avoids_head_tiling(self):
+        config = self._select(
+            num_heads=32,
+            num_kvheads=8,
+            max_seqlen_kv=8192,
+        )
+
+        self.assertEqual(config.strategy, "work_divided_tiled")
+        self.assertEqual(config.kv_block_size, 512)
+        self.assertEqual(config.num_kv_blocks, 16)
+        self.assertEqual(config.num_head_tiles, 1)
+        self.assertEqual(
+            config.work_div,
+            {"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 4},
+        )
+
+    def test_gemma_local_uses_smaller_kv_block_for_wide_heads(self):
+        config = self._select(
+            num_heads=16,
+            num_kvheads=8,
+            head_dim=256,
+            max_seqlen_kv=8192,
+        )
+
+        self.assertEqual(config.strategy, "work_divided_tiled")
+        self.assertEqual(config.kv_block_size, 256)
+        self.assertEqual(config.num_kv_blocks, 32)
+        self.assertEqual(
+            config.work_div,
+            {"num_heads": 2, "max_seqlen_q": 16, "max_seqlen_kv": 8},
+        )
+
+    def test_gemma_global_uses_larger_head_split_and_512_kv_block(self):
+        for num_kvheads in (1, 2):
+            with self.subTest(num_kvheads=num_kvheads):
+                config = self._select(
+                    num_heads=16,
+                    num_kvheads=num_kvheads,
+                    head_dim=512,
+                    max_seqlen_kv=8192,
+                )
+
+                self.assertEqual(config.strategy, "work_divided_tiled")
+                self.assertEqual(config.kv_block_size, 512)
+                self.assertEqual(config.num_kv_blocks, 16)
+                self.assertEqual(
+                    config.work_div,
+                    {"num_heads": 8, "max_seqlen_q": 4, "max_seqlen_kv": 4},
+                )
 
     def test_long_contexts_keep_blocking_and_loop_grouping(self):
         for sequence_length in (8 * 1024, 32 * 1024):
@@ -79,7 +134,8 @@ class TestSDPATiling(unittest.TestCase):
 
                 self.assertEqual(config.strategy, "coarse_tiled")
                 self.assertEqual(
-                    config.reason, "sequence extent exceeds the full-block limit"
+                    config.reason,
+                    "query extent exceeds the calibrated work-divided limit",
                 )
                 self.assertEqual(config.kv_block_size, 512)
                 self.assertGreater(config.num_kv_blocks, 1)
@@ -98,13 +154,24 @@ class TestSDPATiling(unittest.TestCase):
         )
         self.assertIsNone(config.work_div)
 
-    def test_score_footprint_over_budget_keeps_coarse_tiling(self):
-        config = self._select(batch_size=2, score_lx_budget_bytes=300 * 1024)
+    def test_lx_budget_reduces_kv_block_until_live_values_fit(self):
+        config = self._select(batch_size=2, lx_budget_bytes=300 * 1024)
 
-        self.assertEqual(config.score_bytes_per_core, 384 * 1024)
+        self.assertEqual(config.strategy, "work_divided_tiled")
+        self.assertEqual(config.kv_block_size, 64)
+        self.assertEqual(config.num_kv_blocks, 8)
+        self.assertEqual(config.score_bytes_per_core, 48 * 1024)
+        self.assertEqual(config.estimated_live_bytes_per_core, 296448)
+
+    def test_live_footprint_over_budget_keeps_coarse_tiling(self):
+        config = self._select(batch_size=2, lx_budget_bytes=250 * 1024)
+
         self.assertEqual(config.strategy, "coarse_tiled")
+        self.assertEqual(config.score_bytes_per_core, 48 * 1024)
+        self.assertEqual(config.estimated_live_bytes_per_core, 296448)
         self.assertEqual(
-            config.reason, "per-core score footprint exceeds the LX budget"
+            config.reason,
+            "estimated per-core live footprint exceeds the LX budget",
         )
 
     def test_work_division_scales_with_available_cores(self):
