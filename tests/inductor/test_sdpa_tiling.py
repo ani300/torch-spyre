@@ -124,14 +124,38 @@ class TestSDPATiling(unittest.TestCase):
                     {"num_heads": 8, "max_seqlen_q": 4, "max_seqlen_kv": 4},
                 )
 
-    def test_decode_uses_full_heads_and_512_kv_blocks(self):
+    def test_decode_uses_geometry_calibrated_policy(self):
         cases = (
-            ("granite", 32, 8, 128, 82048),
-            ("gemma-local", 16, 8, 256, 49216),
-            ("gemma-global-12b", 16, 1, 512, 65600),
-            ("gemma-global-26b", 16, 2, 512, 65600),
+            ("granite", 32, 8, 128, 4096, None, 540800),
+            ("gemma-local", 16, 8, 256, 2048, None, 147520),
+            (
+                "gemma-global-12b",
+                16,
+                1,
+                512,
+                512,
+                {"num_heads": 16, "max_seqlen_q": 1, "max_seqlen_kv": 1},
+                4100,
+            ),
+            (
+                "gemma-global-26b",
+                16,
+                2,
+                512,
+                256,
+                {"num_heads": 8, "max_seqlen_q": 1, "max_seqlen_kv": 1},
+                6152,
+            ),
         )
-        for model, num_heads, num_kvheads, head_dim, expected_live_bytes in cases:
+        for (
+            model,
+            num_heads,
+            num_kvheads,
+            head_dim,
+            kv_block_size,
+            work_div,
+            expected_live_bytes,
+        ) in cases:
             with self.subTest(model=model):
                 config = self._select(
                     num_heads=num_heads,
@@ -141,15 +165,59 @@ class TestSDPATiling(unittest.TestCase):
                     head_dim=head_dim,
                 )
 
-                self.assertEqual(config.strategy, "decode_tiled")
-                self.assertEqual(config.reason, "single-query decode")
-                self.assertEqual(config.kv_block_size, 512)
-                self.assertEqual(config.num_kv_blocks, 16)
+                expected_strategy = (
+                    "decode_work_divided_tiled" if work_div else "decode_tiled"
+                )
+                self.assertEqual(config.strategy, expected_strategy)
+                self.assertEqual(
+                    config.reason, "single-query decode; geometry-calibrated"
+                )
+                self.assertEqual(config.kv_block_size, kv_block_size)
+                self.assertEqual(config.num_kv_blocks, 8192 // kv_block_size)
                 self.assertEqual(config.num_head_tiles, 1)
-                self.assertIsNone(config.work_div)
+                self.assertEqual(config.work_div, work_div)
                 self.assertEqual(
                     config.estimated_live_bytes_per_core, expected_live_bytes
                 )
+
+    def test_unknown_decode_geometry_keeps_conservative_policy(self):
+        config = self._select(
+            num_heads=12,
+            num_kvheads=12,
+            max_seqlen_q=1,
+            max_seqlen_kv=8192,
+            head_dim=64,
+        )
+
+        self.assertEqual(config.strategy, "decode_tiled")
+        self.assertEqual(config.kv_block_size, 512)
+        self.assertEqual(config.num_kv_blocks, 16)
+        self.assertIsNone(config.work_div)
+
+    def test_decode_block_caps_cover_calibrated_lengths(self):
+        cases = (
+            ("granite", 32, 8, 128, (512, 1024, 4096)),
+            ("gemma-local", 16, 8, 256, (512, 1024, 2048)),
+            ("gemma-global-12b", 16, 1, 512, (512, 512, 512)),
+            ("gemma-global-26b", 16, 2, 512, (256, 256, 256)),
+        )
+        for model, num_heads, num_kvheads, head_dim, expected_blocks in cases:
+            for sequence_length, expected_block in zip(
+                (512, 1024, 8192), expected_blocks
+            ):
+                with self.subTest(model=model, sequence_length=sequence_length):
+                    config = self._select(
+                        num_heads=num_heads,
+                        num_kvheads=num_kvheads,
+                        max_seqlen_q=1,
+                        max_seqlen_kv=sequence_length,
+                        head_dim=head_dim,
+                    )
+
+                    self.assertEqual(config.kv_block_size, expected_block)
+                    self.assertEqual(
+                        config.num_kv_blocks, sequence_length // expected_block
+                    )
 
     def test_long_contexts_keep_blocking_and_loop_grouping(self):
         for sequence_length in (8 * 1024, 32 * 1024):

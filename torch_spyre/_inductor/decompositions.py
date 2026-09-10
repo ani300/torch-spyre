@@ -65,6 +65,23 @@ _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_LIVE_QUERY_BUFFER_ALLOWANCE = 2
 _SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
 
+# Decode has a very different working set from prefill: Lq == 1 leaves enough
+# LX for substantially longer K/V blocks, but backend scheduling has sharp
+# geometry-dependent cliffs before capacity is exhausted.  These policies are
+# the stable minima from sweeps at Lkv=512, 1024, and 8192.  Unknown geometries
+# retain the conservative 512-token block and no explicit work division.
+#
+# Values are (maximum K/V block size, logical-head work-division split).
+_SDPA_DECODE_POLICIES: dict[tuple[int, int, int], tuple[int, int | None]] = {
+    # Granite 3.3 8B
+    (32, 8, 128): (4096, None),
+    # Gemma 4 12B/26B local attention
+    (16, 8, 256): (2048, None),
+    # Gemma 4 12B and 26B global attention, respectively
+    (16, 1, 512): (512, 16),
+    (16, 2, 512): (256, 8),
+}
+
 
 @dataclasses.dataclass(frozen=True)
 class _SDPATilingConfig:
@@ -245,21 +262,36 @@ def _select_sdpa_tiling(
     estimated_live_bytes_per_core: int | None = None
     selected_kv_block_size: int | None = None
 
-    # Decode has no useful query-axis parallelism.  Coarse head tiling repeats
-    # the online-softmax body and is substantially slower, while forcing a KV
-    # work split does not propagate through every operation in the
-    # decomposition.  Keep all heads together and let the ordinary scheduler
-    # divide each operation.  A full 512-token KV block wins for the Granite
-    # and Gemma decode geometries; with one query row its worst-case live
-    # footprint is also small enough to check conservatively as if all heads
-    # resided on one core.
+    # Decode has no useful query-axis parallelism, and coarse head tiling
+    # repeats the online-softmax body.  Keep all heads in one coarse tile.
+    # Most geometries are fastest with ordinary scheduling, but very high GQA
+    # ratios benefit from splitting the expanded logical-head axis explicitly.
+    # The K/V block cap is performance-driven and deliberately independent of
+    # the LX limit: sweeps show discontinuities well before capacity is full.
     if max_seqlen_q == 1:
-        selected_kv_block_size = min(max_seqlen_kv, _SDPA_MAX_SEQUENCE_TILE_SIZE)
+        block_limit, head_split = _SDPA_DECODE_POLICIES.get(
+            (num_heads, num_kvheads, head_dim),
+            (_SDPA_MAX_SEQUENCE_TILE_SIZE, None),
+        )
+        selected_kv_block_size = min(max_seqlen_kv, block_limit)
         selected_kv_block_size = max(64, selected_kv_block_size // 64 * 64)
+        decode_work_div = None
+        heads_per_core = num_heads
+        if (
+            head_split is not None
+            and head_split <= num_cores
+            and num_heads % head_split == 0
+        ):
+            decode_work_div = {
+                "num_heads": head_split,
+                "max_seqlen_q": 1,
+                "max_seqlen_kv": 1,
+            }
+            heads_per_core = num_heads // head_split
         score_bytes_per_core, estimated_live_bytes_per_core = (
             _sdpa_estimated_live_bytes_per_core(
                 batch_size=batch_size,
-                heads_per_core=num_heads,
+                heads_per_core=heads_per_core,
                 query_rows_per_core=1,
                 kv_block_size=min(selected_kv_block_size, max_seqlen_kv),
                 head_dim=head_dim,
@@ -270,16 +302,24 @@ def _select_sdpa_tiling(
             num_kv_blocks = (
                 max_seqlen_kv + selected_kv_block_size - 1
             ) // selected_kv_block_size
+            if decode_work_div is None:
+                strategy = "decode" if num_kv_blocks == 1 else "decode_tiled"
+            else:
+                strategy = (
+                    "decode_work_divided"
+                    if num_kv_blocks == 1
+                    else "decode_work_divided_tiled"
+                )
             return _SDPATilingConfig(
-                strategy=("decode" if num_kv_blocks == 1 else "decode_tiled"),
-                reason="single-query decode",
+                strategy=strategy,
+                reason="single-query decode; geometry-calibrated",
                 kv_block_size=selected_kv_block_size,
                 num_kv_blocks=num_kv_blocks,
                 num_q_tiles=1,
                 q_tile_size=1,
                 num_head_tiles=1,
                 kv_blocks_per_loop_group=_kv_blocks_per_loop_group(1, num_kv_blocks),
-                work_div=None,
+                work_div=decode_work_div,
                 score_bytes_per_core=score_bytes_per_core,
                 estimated_live_bytes_per_core=estimated_live_bytes_per_core,
                 lx_budget_bytes=lx_budget_bytes,
@@ -769,7 +809,8 @@ def spyre__sdpa_overrideable(
     # that materializes a full [B, H, S_kv, D] copy that OOMs on long KV. K/V are
     # instead normalized PER BLOCK inside the loop (keys_T's .contiguous() and
     # the per-block v_blk.contiguous()), each a bounded [B, H, kv_block_size, D]
-    # copy (kv_block_size <= 512), never the full [B, H, S_kv, D].
+    # copy chosen by the cost model, never an implicit full [B, H, S_kv, D]
+    # copy. Decode can intentionally choose a full block for short sequences.
     original_query_strides = query.stride()
     query = query.contiguous()
 
