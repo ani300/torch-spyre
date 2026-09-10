@@ -865,6 +865,7 @@ def _windowed_attention(
             denominator = None
             output = None
             for kv_block, (start, end, k_blk, v_blk) in enumerate(window_chunks):
+                correction = None
                 # k_blk is already transposed to [B, Hq, D, block_width].
                 with spyre_hint(named_dims=["_b", "num_heads", "q_block", "kv_block"]):
                     scores = torch.matmul(
@@ -901,11 +902,12 @@ def _windowed_attention(
                 exp_scores = exp_scores.contiguous()
                 with spyre_hint(named_dims=["_b", "num_heads", "q_block", "head_dim"]):
                     weighted = torch.matmul(exp_scores, v_blk)
-                new_output = (
-                    weighted
-                    if kv_block == 0
-                    else output * correction.unsqueeze(-1) + weighted
-                )
+                if kv_block == 0:
+                    new_output = weighted
+                else:
+                    assert output is not None
+                    assert correction is not None
+                    new_output = output * correction.unsqueeze(-1) + weighted
 
                 if kv_block == num_kv_blocks - 1:
                     # Keep the final divide in the same hint scope as its
