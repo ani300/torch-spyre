@@ -36,6 +36,7 @@ import torch._decomp as decomp
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
 from .sliding_window_plan import (
+    STICK,
     SlidingWindowPlan,
     check_window_read,
     plan_sliding_window,
@@ -783,10 +784,11 @@ def _windowed_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     attention_mask: torch.Tensor,
-    plan: SlidingWindowPlan,
+    causal_plan: SlidingWindowPlan | None,
+    q_block: int,
+    padded_seqlen_q: int,
     scaling_factor: float,
     num_heads: int,
-    full_cache: bool,
 ) -> torch.Tensor:
     """Blocked online attention over each query block's physical KV window.
 
@@ -796,12 +798,10 @@ def _windowed_attention(
     a mutation-based ``copy_forced`` carry is not tile-safe when the output row
     spans multiple sticks (Gemma's head_dim=256).
     """
-    q_block = plan.q_block
-    # Runtime-positioned queries (decode and chunked prefill) read the complete
-    # compact allocation; their tensor mask is the only source of geometry.
-    # Square prefill has position fixed by shape, so it retains the cheaper
-    # per-block physical window.
-    buffer_width = key.size(2) if full_cache else plan.buffer_width
+    # A causal square prefill has a static narrow read plan. Generic masks and
+    # runtime-positioned calls scan the complete compact allocation; their
+    # tensor mask is the only source of geometry.
+    buffer_width = key.size(2) if causal_plan is None else causal_plan.buffer_width
 
     # Bound each explicit KV block to the proven SDPA tile size. Unlike a coarse
     # tile over the reduction dimension, explicit blocks make online-softmax
@@ -818,15 +818,17 @@ def _windowed_attention(
     positive_min = torch.finfo(storage_dtype).tiny
 
     out_blocks = []
-    for block_index in range(plan.num_q_blocks):
-        q_start, q_end = plan.block_q_range(block_index)
+    num_q_blocks = padded_seqlen_q // q_block
+    for block_index in range(num_q_blocks):
+        q_start = block_index * q_block
+        q_end = q_start + q_block
         assert q_end - q_start == q_block, (
             f"sliding_window_attention: Q block {block_index} is "
-            f"{q_end - q_start} rows, expected {q_block} -- plan_sliding_window "
-            "should have rejected a query length that does not divide"
+            f"{q_end - q_start} rows, expected {q_block} -- query padding "
+            "should have produced a whole number of blocks"
         )
 
-        read_start = 0 if full_cache else plan.read_start(block_index)
+        read_start = 0 if causal_plan is None else causal_plan.read_start(block_index)
         mask_rows = attention_mask[:, :, q_start:q_end, :]
 
         # Keep the multi-output custom reads outside the coarse-tile scope.
@@ -940,13 +942,15 @@ def spyre_sliding_window_attention(
     value: torch.Tensor,
     attention_mask: torch.Tensor,
     window_size: int,
+    is_causal: bool,
     scale: float | None = None,
 ) -> torch.Tensor:
     """Sliding-window attention with all runtime geometry in a tensor mask.
 
-    Square prefill uses static per-block KV windows. Every other shape reads the
-    complete cache allocation in bounded chunks, so changing mask contents never
-    changes the graph. A ragged query length is padded up rather than refused.
+    Strictly causal square prefill uses static per-block KV windows. Generic
+    masks and every other shape read the complete cache allocation in bounded
+    chunks, so changing mask contents never changes the graph. A ragged query
+    length is padded up rather than refused.
     """
     num_heads = query.size(1)
     head_dim = query.size(3)
@@ -962,6 +966,21 @@ def spyre_sliding_window_attention(
     if window_size <= 0:
         raise Unsupported(
             f"sliding_window_attention: window_size={window_size} must be positive"
+        )
+    if seqlen_q <= 0 or cache_capacity <= 0:
+        raise Unsupported(
+            "sliding_window_attention: query and cache lengths must be positive, "
+            f"got seqlen_q={seqlen_q}, cache_capacity={cache_capacity}"
+        )
+    if seqlen_q > cache_capacity:
+        raise Unsupported(
+            f"sliding_window_attention: seqlen_q={seqlen_q} exceeds "
+            f"cache_capacity={cache_capacity}"
+        )
+    if cache_capacity % STICK != 0:
+        raise Unsupported(
+            f"sliding_window_attention: cache_capacity={cache_capacity} must be a "
+            f"multiple of {STICK}"
         )
 
     expected_mask_shape = (batch_size, 1, seqlen_q, cache_capacity)
@@ -994,34 +1013,35 @@ def spyre_sliding_window_attention(
     q_block, padded_seqlen_q = query_blocking(seqlen_q)
     pad_rows = padded_seqlen_q - seqlen_q
 
-    # Only square prefill has position fully determined by tensor shapes. All
-    # other calls may carry a changing query origin in attention_mask and must
-    # therefore read the complete allocation rather than specialize on a Python
-    # offset. A compact decode allocation keeps this bounded by the window.
-    full_cache = seqlen_q != cache_capacity
-    plan = plan_sliding_window(
-        padded_seqlen_q,
-        cache_capacity,
-        window_size,
-        is_causal=True,
-        q_block=q_block,
-        cache_capacity=cache_capacity,
-    )
-    if plan is None:
-        # Never None when the plan is, but the type says otherwise.
-        reason = (
-            rejection_reason(
-                padded_seqlen_q,
-                cache_capacity,
-                window_size,
-                True,
-                q_block,
-                cache_capacity,
-            )
-            or "the window placement cannot express this shape"
+    # Only a strictly causal square prefill has position and its upper bound
+    # fully determined by tensor shapes. A generic mask can allow future keys,
+    # while non-square calls can carry a changing query origin in mask values;
+    # both must scan the complete allocation. A compact decode cache keeps that
+    # bounded by the configured window.
+    causal_plan = None
+    if is_causal and seqlen_q == cache_capacity:
+        causal_plan = plan_sliding_window(
+            padded_seqlen_q,
+            cache_capacity,
+            window_size,
+            is_causal=True,
+            q_block=q_block,
+            cache_capacity=cache_capacity,
         )
-        raise Unsupported(f"sliding_window_attention: {reason}")
-
+        if causal_plan is None:
+            # Never None when the plan is valid, but the type says otherwise.
+            reason = (
+                rejection_reason(
+                    padded_seqlen_q,
+                    cache_capacity,
+                    window_size,
+                    True,
+                    q_block,
+                    cache_capacity,
+                )
+                or "the window placement cannot express this shape"
+            )
+            raise Unsupported(f"sliding_window_attention: {reason}")
     if pad_rows:
         query = torch.cat(
             [
@@ -1051,10 +1071,11 @@ def spyre_sliding_window_attention(
         key,
         value,
         attention_mask,
-        plan,
+        causal_plan,
+        q_block,
+        padded_seqlen_q,
         scaling_factor,
         num_heads,
-        full_cache,
     )
     return output[:, :, pad_rows:, :] if pad_rows else output
 

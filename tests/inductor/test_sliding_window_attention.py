@@ -66,11 +66,11 @@ def _attention_mask(
     return mask.unsqueeze(1)
 
 
-def _attention(q, k, v, attention_mask, window_size, scale=None):
+def _attention(q, k, v, attention_mask, window_size, scale=None, is_causal=True):
     """Dispatch: the runtime-mask op on Spyre, masked SDPA on CPU."""
     if q.device.type == "spyre":
         return torch.ops.spyre.sliding_window_attention(
-            q, k, v, attention_mask, window_size, scale
+            q, k, v, attention_mask, window_size, is_causal, scale
         )
     return F.scaled_dot_product_attention(
         q,
@@ -358,6 +358,28 @@ class TestSlidingWindowAttention(unittest.TestCase):
         query = cached_randn((1, 4, 128, 256), differentiation=1, dtype=torch.float16)
         _compare_attention(query, key, value, 128, query_end=128, valid_start=[17])
 
+    def test_non_causal_prefill_reads_future_keys_outside_the_causal_plan(self):
+        # A bidirectional vision block can make an early query attend a much
+        # later key. The causal plan for block 0 reads only rows [0, 128), so
+        # allowing row 255 proves the generic path scans the complete cache.
+        query, key, value = _inputs(1, 8, 2, 256, 256)
+        mask = _attention_mask(1, 256, 256, 64)
+        mask[0, 0, 0, 255] = 0
+        expected = _attention(query, key, value, mask, 64, None, False)
+
+        compiled = torch.compile(_attention, backend="inductor")
+        actual = compiled(
+            query.to("spyre"),
+            key.to("spyre"),
+            value.to("spyre"),
+            mask.to("spyre"),
+            64,
+            None,
+            False,
+        ).cpu()
+
+        torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.1)
+
 
 class TestCompactCache(unittest.TestCase):
     """Runtime masks over compact caches with changing logical positions."""
@@ -529,6 +551,37 @@ class TestCompactCache(unittest.TestCase):
         device_args = [tensor.to("spyre") for tensor in (query, key, value)]
         actual = [
             compiled(*device_args, mask.to("spyre"), window).cpu() for mask in masks
+        ]
+
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == 1
+        for got, want in zip(actual, expected):
+            torch.testing.assert_close(got, want, atol=0.1, rtol=0.1)
+
+    def test_non_causal_prefill_mask_reuses_one_graph_as_values_change(self):
+        """Different bidirectional regions remain runtime tensor data."""
+        batch, heads, kvheads, seqlen, window = 1, 8, 2, 256, 64
+        query, key, value = _inputs(batch, heads, kvheads, seqlen, seqlen)
+        masks = []
+        for future_key in (191, 255):
+            mask = _attention_mask(batch, seqlen, seqlen, window)
+            mask[0, 0, 0, future_key] = 0
+            masks.append(mask)
+        expected = [
+            _attention(query, key, value, mask, window, None, False) for mask in masks
+        ]
+
+        torch._dynamo.utils.counters.clear()
+        compiled = torch.compile(_attention, backend="inductor")
+        device_args = [tensor.to("spyre") for tensor in (query, key, value)]
+        actual = [
+            compiled(
+                *device_args,
+                mask.to("spyre"),
+                window,
+                None,
+                False,
+            ).cpu()
+            for mask in masks
         ]
 
         assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == 1

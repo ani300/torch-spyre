@@ -1042,6 +1042,7 @@ def sliding_window_attention(  # type: ignore[empty-body]
     value: torch.Tensor,
     attention_mask: torch.Tensor,
     window_size: int,
+    is_causal: bool,
     scale: Optional[float] = None,
 ) -> torch.Tensor:
     """
@@ -1054,16 +1055,20 @@ def sliding_window_attention(  # type: ignore[empty-body]
     unwritten cache rows, and left padding. Keeping that state in a tensor means
     changing a decode position does not specialize the compiled graph.
 
-    ``window_size`` and ``scale`` are static model configuration. For square
-    prefill, ``window_size`` lets the implementation read only each query
-    block's physical KV window. Other shapes, including anchored single-token
-    decode and chunked prefill, consume the fixed-shape mask over the complete
-    cache allocation in bounded chunks. Use a compact cache for decode so this
-    remains proportional to the sliding window rather than the model context.
+    ``window_size``, ``is_causal``, and ``scale`` are static model
+    configuration. ``is_causal=True`` promises that the mask never allows a
+    future key, which lets square prefill read only each query block's physical
+    causal window. ``is_causal=False`` makes no causal-layout assumption and
+    reads the complete physical cache in bounded chunks; this supports masks
+    with bidirectional regions such as Gemma 4's vision blocks. Other shapes,
+    including anchored single-token decode and chunked prefill, also consume the
+    complete fixed-shape cache because their position is runtime mask data. Use
+    a compact cache for decode so that work remains proportional to the sliding
+    window rather than the model context.
 
-    The operation is causal-only by contract; callers express the exact causal
-    boundary in ``attention_mask``. Zero-fill unwritten cache rows: masked scores
-    are still computed, and adding a mask cannot rescue a NaN.
+    The tensor mask always defines the exact attention semantics. Zero-fill
+    unwritten cache rows: masked scores are still computed, and adding a mask
+    cannot rescue a NaN.
 
     MUST be called under torch.compile(backend="inductor") on the spyre
     device; the real lowering is in decompositions.py. This eager body is
@@ -1079,6 +1084,7 @@ def _(
     value: torch.Tensor,
     attention_mask: torch.Tensor,
     window_size: int,
+    is_causal: bool,
     scale: Optional[float] = None,
 ) -> torch.Tensor:
     return query.new_empty(query.size())
