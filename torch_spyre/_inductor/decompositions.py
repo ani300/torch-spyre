@@ -773,15 +773,6 @@ def spyre_kv_window(
     k_win = key[:, :, read_start : read_start + buffer_width, :].transpose(-1, -2)
     v_win = value[:, :, read_start : read_start + buffer_width, :]
 
-    # A four-stick head dimension (Gemma 4 uses D=256) needs a materialized
-    # bounded window before the tiled matmuls. Keeping the source-cache strides
-    # there makes the layout solver bind a multi-stick head row as though it were
-    # the window axis. One- and two-stick rows retain the zero-copy view: forcing
-    # those through this clone currently regresses offset decode reads.
-    if key.size(3) > 128:
-        k_win = k_win.contiguous()
-        v_win = v_win.contiguous()
-
     expansion = num_heads // key.size(1)
     if expansion != 1:
         k_win = k_win.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
@@ -816,13 +807,6 @@ def _windowed_attention(
     # position into Python specialization state. Planned prefill still reads the
     # smaller per-block slice.
     buffer_width = key.size(2) if runtime_mask is not None else plan.buffer_width
-
-    # Attention projections commonly arrive as a [B, Lq, H, D] allocation viewed
-    # as [B, H, Lq, D]. Normalize that view before the tiled matmuls: physical
-    # stride order otherwise makes the tiler bind the logical head/query axes to
-    # the wrong loops. This is bounded to the query footprint and mirrors the
-    # full-SDPA fix in #4377; K/V remain windowed rather than copied wholesale.
-    query = query.contiguous()
 
     # Bound each explicit KV block to the proven SDPA tile size. Unlike a coarse
     # tile over the reduction dimension, explicit blocks make online-softmax
