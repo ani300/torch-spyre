@@ -170,6 +170,56 @@ def test_async_compile_failure_moves_cache_entry_at_wait():
     move_failed.assert_called_once_with("/tmp/key.tmp")
 
 
+def test_wait_drains_remaining_spyre_futures_after_failure():
+    pool = _RecordingPool()
+    compiler = async_compile_mod.SpyreAsyncCompile()
+
+    with (
+        torch._inductor.config.patch({"compile_threads": 2}),
+        spyre_config.patch({"async_dxp_compile": True, "spyre_kernel_cache": True}),
+        patch.object(compiler, "wait_pool_ready"),
+        patch.object(compiler, "use_process_pool", return_value=True),
+        patch.object(compiler, "process_pool", return_value=pool),
+        patch.object(
+            async_compile_mod,
+            "compute_specs_hash",
+            side_effect=["key0", "key1", "key2"],
+        ),
+        patch.object(async_compile_mod, "get_cached_kernel_dir", return_value=None),
+        patch.object(
+            async_compile_mod,
+            "allocate_compile_dir",
+            side_effect=["/tmp/key0.tmp", "/tmp/key1.tmp", "/tmp/key2.tmp"],
+        ),
+        patch.object(
+            async_compile_mod, "commit_compile_dir", return_value="/cache/key1"
+        ) as commit,
+        patch.object(async_compile_mod, "generate_bundle"),
+        patch.object(async_compile_mod, "find_unimplemented", return_value=None),
+        patch.object(
+            async_compile_mod, "build_kernel_provenance_descriptor", return_value=None
+        ),
+        patch.object(async_compile_mod, "SpyreSDSCKernelRunner", side_effect=_runner),
+        patch.object(async_compile_mod, "_move_to_failed_dir") as move_failed,
+    ):
+        scope = {
+            f"kernel{index}": compiler.sdsc(f"sdsc_{index}", []) for index in range(3)
+        }
+        pool.futures[0].set_exception(RuntimeError("first DXP failure"))
+        pool.futures[1].set_result("compiled")
+        pool.futures[2].set_exception(RuntimeError("later DXP failure"))
+
+        with pytest.raises(RuntimeError, match="first DXP failure"):
+            compiler.wait(scope)
+
+    commit.assert_called_once_with("/tmp/key1.tmp", "key1")
+    assert scope["kernel1"].result() == ("sdsc_1", "/cache/key1", None)
+    assert [call.args[0] for call in move_failed.call_args_list] == [
+        "/tmp/key0.tmp",
+        "/tmp/key2.tmp",
+    ]
+
+
 def test_real_subprocess_pool_runs_dxp_jobs_concurrently(tmp_path: Path):
     """Two DXP jobs must overlap rather than running serially in the parent."""
     bin_dir = tmp_path / "bin"

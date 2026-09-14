@@ -182,6 +182,7 @@ class SpyreAsyncCompile(AsyncCompile):
         super().__init__()
         self._provenance_attempt_count = 0
         self._provenance_failure_count = 0
+        self._pending_spyre_futures: list[_SpyreCompileFuture] = []
 
     def triton(self, *args, **kwargs):
         raise NotImplementedError(
@@ -212,6 +213,24 @@ class SpyreAsyncCompile(AsyncCompile):
 
         _run_dxp(kernel_name, compile_dir, dict(os.environ))
         return None
+
+    def _compile_future(
+        self,
+        task: Future[str],
+        kernel_name: str,
+        compile_dir: str,
+        kernel_provenance,
+        cache_key: str | None = None,
+    ) -> _SpyreCompileFuture:
+        future = _SpyreCompileFuture(
+            task,
+            kernel_name,
+            compile_dir,
+            kernel_provenance,
+            cache_key=cache_key,
+        )
+        self._pending_spyre_futures.append(future)
+        return future
 
     def sdsc(
         self,
@@ -291,7 +310,7 @@ class SpyreAsyncCompile(AsyncCompile):
                     )
                     task = self._submit_dxp(kernel_name, compile_dir)
                     if task is not None:
-                        return _SpyreCompileFuture(
+                        return self._compile_future(
                             task,
                             kernel_name,
                             compile_dir,
@@ -315,7 +334,7 @@ class SpyreAsyncCompile(AsyncCompile):
         generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
         task = self._submit_dxp(kernel_name, output_dir)
         if task is not None:
-            return _SpyreCompileFuture(
+            return self._compile_future(
                 task,
                 kernel_name,
                 output_dir,
@@ -461,12 +480,28 @@ class SpyreAsyncCompile(AsyncCompile):
         return SpyreSDSCKernelRunner(kernel_name, output_dir)
 
     def wait(self, scope: dict[str, Any]) -> None:
-        super().wait(scope)
-        if self._provenance_failure_count:
-            logger.warning(
-                "kernel provenance disabled for %d/%d compiled Spyre kernels",
-                self._provenance_failure_count,
-                self._provenance_attempt_count,
-            )
-        self._provenance_attempt_count = 0
-        self._provenance_failure_count = 0
+        try:
+            super().wait(scope)
+        except Exception:
+            # Upstream stops at the first failed future. Resolve every submitted
+            # Spyre future so successful cache entries are committed and every
+            # other failed .tmp entry is moved aside before preserving the first
+            # exception for the caller. Track the underlying futures directly:
+            # debugging helpers may wrap them in another CodeCacheFuture.
+            wait_timeout = torch._inductor.config.compile_worker_wait_timeout or None
+            for future in self._pending_spyre_futures:
+                try:
+                    future.result(timeout=wait_timeout)
+                except Exception:
+                    pass
+            raise
+        finally:
+            self._pending_spyre_futures.clear()
+            if self._provenance_failure_count:
+                logger.warning(
+                    "kernel provenance disabled for %d/%d compiled Spyre kernels",
+                    self._provenance_failure_count,
+                    self._provenance_attempt_count,
+                )
+            self._provenance_attempt_count = 0
+            self._provenance_failure_count = 0
