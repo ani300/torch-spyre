@@ -793,25 +793,10 @@ def spyre__sdpa_overrideable(
     if dropout_p > 0.0:
         raise Unsupported("Attention dropout not implemented for Spyre")
 
-    # The named_dims seeds below zip names positionally to each seeded op's
-    # PHYSICAL output layout. host_coordinates derives the coord expressions
-    # from the op's physical STRIDES, so the tiler's loop-var -> logical-dim
-    # mapping follows physical stride order, not logical dim order. SDPA is
-    # routinely called with q/k/v as transpose(1, 2) views of a [B, S, H, D]
-    # tensor, so query's physical layout is [B, S, H, D] while its logical shape
-    # is [B, H, S, D]. Seeding ["_b","num_heads","max_seqlen_q",...] on such
-    # a buffer then maps the tile onto the head axis instead of the query
-    # axis and the result is wrong.
-    #
-    # Normalize the QUERY wholesale: query.contiguous() is bounded (same
-    # footprint as the `output` buffer we allocate below) and makes every
-    # query-derived seed (q_scaled, zeros_like(query), the final permute) land
-    # on logical [B, H, S, D] order. We do NOT contiguify key/value wholesale --
-    # that materializes a full [B, H, S_kv, D] copy that OOMs on long KV. K/V are
-    # instead normalized PER BLOCK inside the loop (keys_T's .contiguous() and
-    # the per-block v_blk.contiguous()), each a bounded [B, H, kv_block_size, D]
-    # copy chosen by the cost model, never an implicit full [B, H, S_kv, D]
-    # copy. Decode can intentionally choose a full block for short sequences.
+    # Normalize the query to logical [B, H, S, D] order. SDPA routinely receives
+    # transpose(1, 2) views backed by [B, S, H, D] storage, while each HOP level
+    # slices a logical axis. We do not contiguify key/value wholesale because
+    # that can OOM on long KV; they are normalized one bounded tile at a time.
     original_query_strides = query.stride()
     if num_heads % num_kvheads != 0:
         raise Unsupported(
@@ -829,18 +814,6 @@ def spyre__sdpa_overrideable(
     if use_gqa:
         query = query.unflatten(1, (num_kvheads, gqa_group_size))
 
-    query_dim_names = (
-        [
-            "_b",
-            "num_kvheads",
-            "gqa_group_size",
-            "max_seqlen_q",
-            "head_dim",
-        ]
-        if use_gqa
-        else ["_b", "num_heads", "max_seqlen_q", "head_dim"]
-    )
-    accumulator_dim_names = query_dim_names[:-1]
     tiling = _select_sdpa_tiling(
         batch_size=batch_size,
         num_heads=num_heads,
@@ -952,25 +925,7 @@ def spyre__sdpa_overrideable(
         return result
 
     def kv_level(q_tile, k_tile, v_tile, *mask_tiles):
-        with spyre_hint(named_dims=query_dim_names):
-            q_scaled = q_tile * scaling_factor
-
-        kv_dim_names = (
-            ["_b", "num_kvheads", "_gqa_broadcast", "blk_len", "head_dim"]
-            if use_gqa
-            else ["_b", "num_heads", "blk_len", "head_dim"]
-        )
-        score_dim_names = (
-            [
-                "_b",
-                "num_kvheads",
-                "gqa_group_size",
-                "max_seqlen_q",
-                "blk_len",
-            ]
-            if use_gqa
-            else ["_b", "num_heads", "max_seqlen_q", "blk_len"]
-        )
+        q_scaled = q_tile * scaling_factor
 
         # Keep the sparse accumulator representation used by production SDPA.
         tile_accumulator_shape = (*q_tile.shape[:-1], 64)
@@ -980,17 +935,14 @@ def spyre__sdpa_overrideable(
             device=q_tile.device,
             dtype=q_tile.dtype,
         )
-        with spyre_hint(named_dims=accumulator_dim_names):
-            running_max = running_max_reduced.amax(dim=-1)
+        running_max = running_max_reduced.amax(dim=-1)
         denominator_reduced = torch.zeros(
             tile_accumulator_shape,
             device=q_tile.device,
             dtype=q_tile.dtype,
         )
-        with spyre_hint(named_dims=accumulator_dim_names):
-            denominator = denominator_reduced.amax(dim=-1)
-        with spyre_hint(named_dims=query_dim_names):
-            output_tile = torch.zeros_like(q_tile)
+        denominator = denominator_reduced.amax(dim=-1)
+        output_tile = torch.zeros_like(q_tile)
 
         def sdpa_lk_body(carry, tiles):
             block_maximum, block_denominator, block_output = carry
@@ -999,18 +951,15 @@ def spyre__sdpa_overrideable(
                 k_blk = k_blk.unsqueeze(2)
                 v_blk = v_blk.unsqueeze(2)
 
-            with spyre_hint(named_dims=kv_dim_names):
-                scaled_keys = k_blk * scaling_factor
-            with spyre_hint(named_dims=kv_dim_names):
-                v_blk = v_blk.contiguous()
+            scaled_keys = k_blk * scaling_factor
+            v_blk = v_blk.contiguous()
             keys_T = scaled_keys.transpose(-1, -2).contiguous()
 
-            with spyre_hint(named_dims=score_dim_names):
-                scores = (
-                    torch.ops.spyre.batched_matmul(q_scaled, keys_T)
-                    if use_gqa
-                    else torch.matmul(q_scaled, keys_T)
-                )
+            scores = (
+                torch.ops.spyre.batched_matmul(q_scaled, keys_T)
+                if use_gqa
+                else torch.matmul(q_scaled, keys_T)
+            )
             for block_mask in block_masks:
                 scores = scores + block_mask
 
@@ -1020,12 +969,11 @@ def spyre__sdpa_overrideable(
             exp_scores = torch.exp(scores - new_maximum.unsqueeze(-1))
             new_denominator = block_denominator * correction + exp_scores.sum(dim=-1)
             exp_scores_c = exp_scores.contiguous()
-            with spyre_hint(named_dims=query_dim_names):
-                weighted = (
-                    torch.ops.spyre.batched_matmul(exp_scores_c, v_blk)
-                    if use_gqa
-                    else torch.matmul(exp_scores_c, v_blk)
-                )
+            weighted = (
+                torch.ops.spyre.batched_matmul(exp_scores_c, v_blk)
+                if use_gqa
+                else torch.matmul(exp_scores_c, v_blk)
+            )
             new_output = block_output * correction.unsqueeze(-1) + weighted
             return (new_maximum, new_denominator, new_output), None
 
@@ -1042,8 +990,7 @@ def spyre__sdpa_overrideable(
                 tile_size=kv_tile_size,
                 init=initial,
             )
-        with spyre_hint(named_dims=query_dim_names):
-            return output_tile / denominator.unsqueeze(-1)
+        return output_tile / denominator.unsqueeze(-1)
 
     def query_level(q_tile, k_tile, v_tile, *mask_tiles):
         operands = (q_tile, k_tile, v_tile, *mask_tiles)
