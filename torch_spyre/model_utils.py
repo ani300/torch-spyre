@@ -55,12 +55,11 @@ Usage::
 """
 
 import warnings
-
-from torch_spyre._inductor.logging_utils import get_inductor_logger
-
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from torch_spyre._C import (
     DataFormats,
@@ -69,6 +68,7 @@ from torch_spyre._C import (
     get_device_dtype,
     spyre_empty_with_layout,
 )
+from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre.constants import DEVICE_NAME
 
 logger = get_inductor_logger("model_utils")
@@ -91,6 +91,40 @@ def _validate_target_dtype(dtype: torch.dtype) -> None:
             f"formats, or torch_spyre._inductor.dtype_ops.DtypeOpTable "
             f"for the conversion pairs."
         )
+
+
+@contextmanager
+def _target_spyre_device(device: torch.device | str | int | None) -> Iterator[None]:
+    """Run a layout-aware allocation on the requested Spyre device.
+
+    ``spyre_empty_with_layout`` allocates on the current device and does not
+    accept a device argument itself.  Tensor-parallel loaders, on the other
+    hand, pass the rank's destination device to their placement callback.  Keep
+    that destination explicit here so a loader cannot silently put a shard on
+    whichever device happened to be current in its worker thread.
+    """
+    _ensure_spyre_runtime()
+    if device is None:
+        yield
+        return
+
+    target = (
+        torch.device(DEVICE_NAME, device)
+        if isinstance(device, int)
+        else torch.device(device)
+    )
+    if target.type != DEVICE_NAME:
+        raise ValueError(f"Expected a Spyre destination, got {target}")
+
+    previous = torch.spyre.current_device()
+    target_index = previous if target.index is None else target.index
+    if target_index != previous:
+        torch.spyre.set_device(target_index)
+    try:
+        yield
+    finally:
+        if target_index != previous:
+            torch.spyre.set_device(previous)
 
 
 # --- DMA helpers -----------------------------------------------------
@@ -199,6 +233,39 @@ def _dma_to_spyre_indirect_access(
     return dst
 
 
+def dma_tensor_to_spyre(
+    cpu_tensor: torch.Tensor,
+    target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
+) -> torch.Tensor:
+    """Copy a CPU tensor to a Spyre device using the default device layout."""
+    with _target_spyre_device(device):
+        return _dma_to_spyre_default(cpu_tensor, target_dtype=target_dtype)
+
+
+def dma_linear_weight_to_spyre(
+    weight: torch.Tensor,
+    target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
+) -> torch.Tensor:
+    """Copy a 2D Linear weight using Spyre's matmul-friendly DMA layout."""
+    with _target_spyre_device(device):
+        return _dma_to_spyre_dim_order_swapped(weight, target_dtype=target_dtype)
+
+
+def dma_embedding_weight_to_spyre(
+    weight: torch.Tensor,
+    target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
+) -> torch.Tensor | None:
+    """Copy a 2D Embedding table using Spyre's indirect-access layout."""
+    with _target_spyre_device(device):
+        return _dma_to_spyre_indirect_access(weight, target_dtype=target_dtype)
+
+
 def dma_moe_expert_weight_to_spyre(
     weight: torch.Tensor,
     target_dtype: torch.dtype | None = None,
@@ -292,9 +359,11 @@ def _transfer_module(
     """
     if _module_overrides_apply(module):
         module._apply(
-            lambda t: _dma_to_spyre_default(t, target_dtype=dtype)
-            if t is not None and t.device.type != DEVICE_NAME
-            else t
+            lambda t: (
+                _dma_to_spyre_default(t, target_dtype=dtype)
+                if t is not None and t.device.type != DEVICE_NAME
+                else t
+            )
         )
         return
 
