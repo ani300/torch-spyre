@@ -87,6 +87,30 @@ class TestLoadModelToSpyre(TestCase):
             list(get_spyre_tensor_layout(embedding).device_size), [1000, 4, 64]
         )
 
+    def test_low_level_layout_allocation_uses_explicit_device(self):
+        """The layout allocator targets its device without changing the caller's."""
+        from torch_spyre._C import SpyreTensorLayout, spyre_empty_with_layout
+
+        previous = torch.spyre.current_device()
+        device_index = (previous + 1) % torch.spyre.device_count()
+        device = torch.device("spyre", device_index)
+        layout = SpyreTensorLayout([128, 256], torch.float16)
+
+        tensor = spyre_empty_with_layout(
+            (128, 256), (256, 1), torch.float16, layout, device=device
+        )
+
+        self.assertEqual(tensor.device, device)
+        self.assertEqual(torch.spyre.current_device(), previous)
+
+    def test_public_dma_helpers_accept_an_integer_device(self):
+        """Integer destinations are normalized before entering the C++ binding."""
+        device_index = torch.spyre.current_device()
+        linear = dma_linear_weight_to_spyre(
+            torch.randn(128, 256, dtype=torch.float16), device=device_index
+        )
+        self.assertEqual(linear.device, torch.device("spyre", device_index))
+
     # ── embedding gather-optimal (indirect-access) layout ──────────
 
     def test_embedding_has_indirect_access_layout(self):
