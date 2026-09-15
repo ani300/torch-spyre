@@ -212,6 +212,13 @@ def _patch_tensor_for_spyre():
             if dtype is None:
                 dtype = self.dtype
 
+            # The C++ allocator takes a real c10::Device so it can select the
+            # correct Spyre allocator before creating storage.  Tensor.to also
+            # accepts string destinations, so normalize that public form at
+            # the Python boundary without losing an explicit device index.
+            if device is not None:
+                device = torch.device(device)
+
             from torch_spyre._C import spyre_empty_with_layout
 
             dst = spyre_empty_with_layout(
