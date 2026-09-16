@@ -138,9 +138,7 @@ class TestLoadModelToSpyre(TestCase):
         weight = torch.randn(3, 32, 256, dtype=torch.float16)
 
         with self.assertWarnsRegex(UserWarning, "does not divide 4"):
-            device_weight = dma_moe_expert_weight_to_spyre(
-                weight, output_stick_tile=3
-            )
+            device_weight = dma_moe_expert_weight_to_spyre(weight, output_stick_tile=3)
 
         self.assertIsNone(device_weight)
 
