@@ -62,6 +62,8 @@ _SDPA_GQA_MAX_KV_TILE_SIZE = 1024
 _SDPA_MAX_TILE_PAIRS_PER_LOOP_GROUP = 16
 _SDPA_PREFERRED_HEADS_PER_TILE = (4, 2, 1)
 _SDPA_MHA_MAX_HEAD_WORK_DIVISION = 4
+_SDPA_MHA_QUERY_ONLY_MAX_HEADS = 8
+_SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS = 8
 _SDPA_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_LIVE_QUERY_BUFFER_ALLOWANCE = 2
 _SDPA_TARGET_KV_BYTES_PER_CORE = 1024 * 1024
@@ -176,6 +178,7 @@ def _sdpa_full_core_work_division(
     num_heads: int,
     num_kvheads: int,
     max_seqlen_q: int,
+    max_seqlen_kv: int,
     num_cores: int,
 ) -> dict[str, int] | None:
     """Find placeable head/query splits that keep every core occupied.
@@ -192,6 +195,20 @@ def _sdpa_full_core_work_division(
     if num_heads != num_kvheads:
         if num_heads % num_kvheads or max_seqlen_q % num_cores:
             return None
+        return {"max_seqlen_q": num_cores}
+
+    # A head/query split gives loop-local matmul results two physical ownership
+    # axes. The loop handoff can represent only one primary split, forcing those
+    # results through HBM. For long, low-head MHA, using query rows alone keeps
+    # the loop body and its carries LX-resident and wins back the HBM traffic.
+    # Retain the head split for short loops, where its finer-grained matmul work
+    # is faster, and for wider-head MHA, where query-only scheduling regresses.
+    if (
+        num_heads <= _SDPA_MHA_QUERY_ONLY_MAX_HEADS
+        and max_seqlen_q % num_cores == 0
+        and max_seqlen_kv
+        >= _SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS * _SDPA_MAX_SEQUENCE_TILE_SIZE
+    ):
         return {"max_seqlen_q": num_cores}
 
     max_head_split = _SDPA_MHA_MAX_HEAD_WORK_DIVISION
@@ -350,7 +367,7 @@ def _select_sdpa_tiling(
             )
 
     work_div = _sdpa_full_core_work_division(
-        num_heads, num_kvheads, max_seqlen_q, num_cores
+        num_heads, num_kvheads, max_seqlen_q, max_seqlen_kv, num_cores
     )
     if work_div is not None and max_seqlen_q <= _SDPA_MAX_SEQUENCE_TILE_SIZE:
         head_split = work_div.get("num_heads", 1)
