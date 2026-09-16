@@ -435,25 +435,34 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
             ):
                 continue
             hint = False
+            layout_size = op.get_layout().size
             for hint_dict in get_op_hints(op).values():
                 if "named_dims" in hint_dict and not ignore_inherited_named_dims:
-                    hint = True
                     named_dims = hint_dict["named_dims"]
+                    mismatched_sizes = [
+                        (name, _named_dims[name], int(size))
+                        for name, size in zip(named_dims, layout_size)
+                        if name in _named_dims and _named_dims[name] != int(size)
+                    ]
+                    if len(named_dims) != len(layout_size) or mismatched_sizes:
+                        # Fused and HOP-spliced operations can retain an outer
+                        # scope's annotation even when a reduction or tile view
+                        # changed the rank or extents.  Applying those names
+                        # positionally silently maps following names to the
+                        # wrong axes.  Ignore that annotation and derive the
+                        # output names from inputs.
+                        logger.debug(
+                            f"{op.get_operation_name()}: named_dims hint has "
+                            f"{len(named_dims)} name(s) {named_dims} but output "
+                            f"layout has {len(layout_size)} dim(s) "
+                            f"{list(layout_size)} (incompatible declared sizes: "
+                            f"{mismatched_sizes}); ignoring the mismatched hint"
+                        )
+                        continue
+                    hint = True
                     break
             if hint:
                 coords = op_out_coords(op)
-                layout_size = op.get_layout().size
-                # zip() below truncates to the shorter of named_dims/layout_size,
-                # so a name-count mismatch would silently drop names (leaving them
-                # unregistered) rather than fail loudly like the input path.  Warn
-                # so a bad in-graph annotation is visible instead of a no-op.
-                if len(named_dims) != len(layout_size):
-                    logger.warning(
-                        f"{op.get_operation_name()}: named_dims hint has "
-                        f"{len(named_dims)} name(s) {named_dims} but output layout "
-                        f"has {len(layout_size)} dim(s) {list(layout_size)}; "
-                        f"extra entries are ignored"
-                    )
                 loop_var_dims: dict[sympy.Symbol, list[str]] = {}
                 for i, (coord, dim_name) in enumerate(zip(coords, named_dims)):
                     # Register the size for every name (including size-1 dims) so
