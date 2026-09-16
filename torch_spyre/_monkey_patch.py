@@ -237,6 +237,7 @@ def _patch_tensor_for_spyre():
                     not copy
                     and current_layout is not None
                     and current_layout == device_layout
+                    and self.device == dst.device
                 ):
                     return self
                 else:
@@ -244,9 +245,10 @@ def _patch_tensor_for_spyre():
                     # storage_offset is dropped by Inductor, so the lowering
                     # must re-introduce it in-graph (see copy_from_d2d in
                     # customops.py and lower_spyre_from_d2d).
-                    return torch.ops.spyre.copy_from_d2d(
+                    torch.ops.spyre.copy_from_d2d(
                         self, dst, self.storage_offset(), dst.storage_offset()
                     )
+                    return dst
 
     def spyre_empty(
         *args,

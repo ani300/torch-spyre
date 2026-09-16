@@ -56,8 +56,11 @@ Usage::
 
 import warnings
 
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+
+
 import torch
-from torch import nn
+import torch.nn as nn
 
 from torch_spyre._C import (
     DataFormats,
@@ -66,7 +69,6 @@ from torch_spyre._C import (
     get_device_dtype,
     spyre_empty_with_layout,
 )
-from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre.constants import DEVICE_NAME
 
 logger = get_inductor_logger("model_utils")
@@ -122,6 +124,7 @@ def _dma_to_spyre_default(
     Used for non-Linear-weight tensors (biases, embeddings, layer norm
     parameters, buffers). Stickifies along the last dimension.
     """
+    device = _normalize_spyre_device(device)
     if not cpu_tensor.is_contiguous():
         cpu_tensor = cpu_tensor.contiguous()
     dev_dtype = target_dtype if target_dtype is not None else cpu_tensor.dtype
@@ -150,6 +153,7 @@ def _dma_to_spyre_dim_order_swapped(
     Caller must ensure ``weight.ndim == 2``.
     """
     assert weight.ndim == 2, "dim_order=[1,0] path is for 2D weights only"
+    device = _normalize_spyre_device(device)
 
     if not weight.is_contiguous():
         weight = weight.contiguous()
@@ -194,6 +198,7 @@ def _dma_to_spyre_indirect_access(
     Caller must ensure ``weight.ndim == 2``.
     """
     assert weight.ndim == 2, "indirect-access path is for 2D embedding tables only"
+    device = _normalize_spyre_device(device)
 
     if not weight.is_contiguous():
         weight = weight.contiguous()
@@ -222,43 +227,6 @@ def _dma_to_spyre_indirect_access(
     )
     copy_tensor(weight, dst, non_blocking=False)
     return dst
-
-
-def dma_tensor_to_spyre(
-    cpu_tensor: torch.Tensor,
-    target_dtype: torch.dtype | None = None,
-    *,
-    device: torch.device | str | int | None = None,
-) -> torch.Tensor:
-    """Copy a CPU tensor to a Spyre device using the default device layout."""
-    device = _normalize_spyre_device(device)
-    return _dma_to_spyre_default(cpu_tensor, target_dtype=target_dtype, device=device)
-
-
-def dma_linear_weight_to_spyre(
-    weight: torch.Tensor,
-    target_dtype: torch.dtype | None = None,
-    *,
-    device: torch.device | str | int | None = None,
-) -> torch.Tensor:
-    """Copy a 2D Linear weight using Spyre's matmul-friendly DMA layout."""
-    device = _normalize_spyre_device(device)
-    return _dma_to_spyre_dim_order_swapped(
-        weight, target_dtype=target_dtype, device=device
-    )
-
-
-def dma_embedding_weight_to_spyre(
-    weight: torch.Tensor,
-    target_dtype: torch.dtype | None = None,
-    *,
-    device: torch.device | str | int | None = None,
-) -> torch.Tensor | None:
-    """Copy a 2D Embedding table using Spyre's indirect-access layout."""
-    device = _normalize_spyre_device(device)
-    return _dma_to_spyre_indirect_access(
-        weight, target_dtype=target_dtype, device=device
-    )
 
 
 def dma_moe_expert_weight_to_spyre(
@@ -364,11 +332,9 @@ def _transfer_module(
     """
     if _module_overrides_apply(module):
         module._apply(
-            lambda t: (
-                _dma_to_spyre_default(t, target_dtype=dtype)
-                if t is not None and t.device.type != DEVICE_NAME
-                else t
-            )
+            lambda t: _dma_to_spyre_default(t, target_dtype=dtype)
+            if t is not None and t.device.type != DEVICE_NAME
+            else t
         )
         return
 
