@@ -6642,6 +6642,69 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         self.assertEqual(list(copy_buf.layout.stride), [Integer(1)])
         self.assertFalse(hasattr(copy_buf, "loop_info"))
 
+    def test_advancing_broadcast_copy_drops_absent_loop_dim(self):
+        """An advancing [L,H] input keeps L/H, not a broadcast group axis."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+        full_buf = SpyreEmptyFallback(
+            torch.ops.spyre.empty.default, [64, 128], device, dtype
+        )
+        full_buf.layout = FixedLayout(device, dtype, [64, 128], [128, 1])
+        full_box = TensorBox(StorageBox(full_buf))
+
+        def inner_fn(index):
+            return full_box.make_loader()([index[0], index[2]])
+
+        pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=[Integer(8), Integer(2), Integer(128)],
+        )
+        tiled_op = ComputedBuffer(
+            name="tiled_advancing_broadcast",
+            layout=FixedLayout(device, dtype, [8, 2, 128], None),
+            data=pw.data.data,
+        )
+        tiled_op.operation_name = "tiled_advancing_broadcast"
+        tiled_op.origins = OrderedSet()
+        tiled_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(8)],
+            loop_tiled_dims=[[0]],
+            tiled_dims_per_read=[[[(0, Integer(8))]]],
+        )
+        V.graph.name_to_buffer[tiled_op.get_name()] = tiled_op
+
+        operations = [full_buf, tiled_op]
+        plans = _plan_read_copies(operations, [((0,), [tiled_op], {})])
+        entry = plans[(0,)].entries[0]
+        self.assertFalse(entry.loop_invariant)
+
+        _insert_all_read_copy_ops(operations, plans)
+        copy_buf = next(
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer) and op.get_name() == entry.copy_name
+        )
+        self.assertEqual(list(copy_buf.get_size()), [Integer(8), Integer(128)])
+        self.assertEqual(list(copy_buf.layout.stride), [Integer(128), Integer(1)])
+        self.assertEqual(copy_buf.loop_info.tiled_dims_per_read, [[[(0, Integer(8))]]])
+
     def test_transposed_read_gets_its_own_copy(self):
         """a+b+a.t()-style: two reads of the same buffer with different
         index expressions must NOT share a copy."""

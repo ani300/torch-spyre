@@ -419,9 +419,24 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
         if op.is_no_op():
             _set_no_named_dims(op)
         elif isinstance(op, ComputedBuffer):
+            # Read-copy buffers are reconstructed from a consumer and retain
+            # its FX origins for provenance.  A named_dims scope on those
+            # origins describes the consumer, not the copied source.  The
+            # coarse-tiling pass precomputes source-relative names when they
+            # are available; preserve them here.  Otherwise fall through to
+            # ordinary input propagation instead of treating the inherited
+            # consumer annotation as a direct output annotation.
+            ignore_inherited_named_dims = bool(
+                getattr(op, "_ignore_inherited_named_dims", False)
+            )
+            if (
+                ignore_inherited_named_dims
+                and getattr(op, "_dim_prop_info", None) is not None
+            ):
+                continue
             hint = False
             for hint_dict in get_op_hints(op).values():
-                if "named_dims" in hint_dict:
+                if "named_dims" in hint_dict and not ignore_inherited_named_dims:
                     hint = True
                     named_dims = hint_dict["named_dims"]
                     break
