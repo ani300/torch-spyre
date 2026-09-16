@@ -4909,18 +4909,23 @@ def _insert_one_read_copy(
     # Positions with non-zero coeff are active tensor dims; zero coeff means
     # broadcast/absent (e.g. the N dim in a Reduction reading a[M,K]).
     active_idx = [i for i, c in enumerate(full_coeff) if c != 0]
-    # A staging copy needs only the dimensions that its source index actually
-    # addresses. Keeping absent output/reduction dimensions would materialize
-    # broadcast views in HBM (notably GQA's group and query axes) and can also
-    # hand later layout passes a zero-stride padded tensor. This is independent
-    # of whether the source advances across the counted loop: the loop advance
-    # is represented separately below. A fully-broadcast scalar has no real
-    # dimensions to compact.
-    compact_copy = bool(active_idx)
+    # A loop-invariant staging copy needs only the dimensions that its source
+    # index actually addresses.  A WhileLoop-splice copy needs the same
+    # compaction even though it advances: keeping absent output/reduction
+    # dimensions would materialize broadcast views in HBM (notably GQA's group
+    # and query axes) and can also hand later layout passes a zero-stride padded
+    # tensor.  Preserve ordinary full-rank advancing copies, whose layout is
+    # part of the existing work-division and LX-relayout contract.  A fully
+    # broadcast scalar has no real dimensions to compact.
+    compact_copy = bool(active_idx) and (
+        loop_invariant or bool(_splice_loop_vars(sizing_op))
+    )
     tile_ranges = [dep.size[i] for i in active_idx] if compact_copy else list(dep.size)
-    dep_pos_to_copy_pos = {
-        dep_pos: copy_pos for copy_pos, dep_pos in enumerate(active_idx)
-    }
+    dep_pos_to_copy_pos = (
+        {dep_pos: copy_pos for copy_pos, dep_pos in enumerate(active_idx)}
+        if compact_copy
+        else {pos: pos for pos in range(len(dep.size))}
+    )
 
     tile_strides: list[Expr]
     active_full_strides: list[Expr] = []
@@ -5187,6 +5192,7 @@ def _insert_one_read_copy(
             tile_strides,
         )
     copy_buf = ComputedBuffer(name=copy_name, layout=copy_layout, data=copy_data)
+    copy_buf._read_copy_is_compact = compact_copy  # type: ignore[attr-defined]
     copy_buf.origins = sizing_op.origins
     copy_buf.operation_name = copy_name
     copy_op_metadata(sizing_op, copy_buf)
@@ -5641,7 +5647,7 @@ def _patch_consumer_to_read_copy(
     )
     copy_strides = list(copy_buf.layout.stride)
     active_idx = [i for i, stride in enumerate(pre_extension_strides) if stride != 0]
-    if active_idx and len(copy_strides) == len(active_idx):
+    if getattr(copy_buf, "_read_copy_is_compact", False):
         # Expand a compact copy's real strides back into the
         # consumer's iteration-space positions.  Broadcast loop dimensions
         # remain fixed at zero instead of shifting the real tensor strides.

@@ -6642,8 +6642,8 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         self.assertEqual(list(copy_buf.layout.stride), [Integer(1)])
         self.assertFalse(hasattr(copy_buf, "loop_info"))
 
-    def test_advancing_broadcast_copy_drops_absent_loop_dim(self):
-        """An advancing [L,H] input keeps L/H, not a broadcast group axis."""
+    def test_splice_advancing_broadcast_copy_drops_absent_loop_dim(self):
+        """A spliced advancing [L,H] input omits a broadcast group axis."""
         from torch._inductor.ir import (
             ComputedBuffer,
             FixedLayout,
@@ -6682,6 +6682,15 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         )
         tiled_op.operation_name = "tiled_advancing_broadcast"
         tiled_op.origins = OrderedSet()
+        tiled_op.dim_hints = [
+            DimHint(
+                dim_names=["tile"],
+                split_count=1,
+                loop_var=Symbol("u0"),
+                is_reduction=False,
+                loop_var_range=Integer(8),
+            )
+        ]
         tiled_op.loop_info = CoarseTileInfo(
             loop_group_id=(0,),
             loop_count=[Integer(8)],
