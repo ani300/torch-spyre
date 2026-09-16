@@ -372,8 +372,15 @@ def _sdpa_kv_candidates(
     element_size: int,
     num_cores: int,
     work_div: dict[str, int] | None,
+    equal_tiles: bool = False,
 ) -> list[_SDPAKVBlockCandidate]:
-    """Estimate LX pressure, restick traffic, and DPO execution count."""
+    """Estimate LX pressure, restick traffic, and DPO execution count.
+
+    SDPA can emit a smaller final block, while the for_each_tile HOP used by
+    SWA requires every tile to have the same extent.  For the latter, turn
+    each candidate ceiling into the exact divisor that lowering will run and
+    cost that physical shape rather than the unattainable nominal ceiling.
+    """
     head_split = work_div.get("num_heads", 1) if work_div is not None else 1
     query_split = work_div.get("max_seqlen_q", 1) if work_div is not None else 1
     heads_per_core = num_heads // head_split
@@ -385,8 +392,20 @@ def _sdpa_kv_candidates(
     gqa_reuse = num_heads // num_kvheads if num_heads % num_kvheads == 0 else 1
     restick_lx_limit = _SDPA_RESTICK_LX_BYTES_PER_REUSING_HEAD * gqa_reuse
     result = []
-    for block_size in _sdpa_kv_block_sizes(max_seqlen_kv):
+    seen_block_sizes = set()
+    for candidate_block_size in _sdpa_kv_block_sizes(max_seqlen_kv):
+        if equal_tiles:
+            num_blocks = _num_tiles_for_max_extent(max_seqlen_kv, candidate_block_size)
+            block_size = max_seqlen_kv // num_blocks
+        else:
+            num_blocks = (
+                max_seqlen_kv + candidate_block_size - 1
+            ) // candidate_block_size
+            block_size = candidate_block_size
         effective_block_size = min(block_size, max_seqlen_kv)
+        if effective_block_size in seen_block_sizes:
+            continue
+        seen_block_sizes.add(effective_block_size)
         score_bytes, live_bytes = _sdpa_estimated_live_bytes_per_core(
             batch_size=batch_size,
             heads_per_core=heads_per_core,
@@ -407,12 +426,13 @@ def _sdpa_kv_candidates(
             + restick_active_cores
             - 1
         ) // restick_active_cores
-        num_blocks = (max_seqlen_kv + block_size - 1) // block_size
         blocks_per_group = _kv_blocks_per_loop_group(1, num_blocks)
         num_loop_groups = (num_blocks + blocks_per_group - 1) // blocks_per_group
         result.append(
             _SDPAKVBlockCandidate(
-                block_size=block_size,
+                block_size=(
+                    effective_block_size if equal_tiles else candidate_block_size
+                ),
                 num_blocks=num_blocks,
                 score_bytes_per_core=score_bytes,
                 estimated_live_bytes_per_core=live_bytes,
@@ -658,14 +678,15 @@ def _select_swa_tiling(
     SDPA's ``max_seqlen_q`` and ``max_seqlen_kv`` become ``q_block`` and
     ``kv_block`` in the SWA decomposition.
 
-    The selected block size is an upper bound. As in full SDPA, the caller
-    chooses the closest equal-sized tiling below that bound because
-    ``for_each_tile`` does not support a ragged final tile.
+    Unlike full SDPA, ``for_each_tile`` does not support a ragged final tile.
+    Candidate ceilings are therefore normalized to exact divisors before
+    their costs are evaluated, and the returned block size is the physical
+    tile extent that lowering will run.
     """
-    fallback_kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, buffer_width)
-    fallback_num_kv_blocks = (
-        buffer_width + fallback_kv_block_size - 1
-    ) // fallback_kv_block_size
+    fallback_num_kv_blocks = _num_tiles_for_max_extent(
+        buffer_width, _SDPA_MAX_SEQUENCE_TILE_SIZE
+    )
+    fallback_kv_block_size = buffer_width // fallback_num_kv_blocks
     fallback_num_head_tiles = (
         1 if num_heads != num_kvheads else _sdpa_num_head_tiles(num_heads)
     )
@@ -704,6 +725,7 @@ def _select_swa_tiling(
             element_size=element_size,
             num_cores=num_cores,
             work_div=sdpa_work_div,
+            equal_tiles=True,
         )
         for candidate in candidates:
             logger.debug(
@@ -804,11 +826,10 @@ def _select_swa_tiling(
             selected_work_div = (
                 dict(sdpa_work_div) if sdpa_work_div is not None else None
             )
-            if num_heads == num_kvheads and selected_work_div is not None:
-                selected_work_div["max_seqlen_kv"] = _sdpa_kv_work_division(
-                    query_split=selected_work_div["max_seqlen_q"],
-                    kv_block_size=selected.block_size,
-                )
+            # The HOP loop already owns the K/V traversal and its online
+            # softmax reduction. Unlike full SDPA's statically unrolled
+            # blocks, splitting that reduction again is neither legal nor
+            # useful; preserve only the independent head/query splits.
             swa_work_div = (
                 {
                     {
@@ -820,9 +841,7 @@ def _select_swa_tiling(
                 if selected_work_div is not None
                 else None
             )
-            strategy = (
-                "decode" if is_decode else "work_divided"
-            )
+            strategy = "decode" if is_decode else "work_divided"
             if selected.num_blocks > 1:
                 strategy += "_tiled"
             return _SWATilingConfig(
@@ -845,9 +864,7 @@ def _select_swa_tiling(
         raise AssertionError("SWA candidate selection did not produce a result")
 
     return _SWATilingConfig(
-        strategy=(
-            "fallback" if fallback_num_kv_blocks == 1 else "fallback_tiled"
-        ),
+        strategy=("fallback" if fallback_num_kv_blocks == 1 else "fallback_tiled"),
         reason=reason,
         kv_block_size=fallback_kv_block_size,
         num_kv_blocks=fallback_num_kv_blocks,
@@ -1786,9 +1803,7 @@ def _windowed_attention(
 
                     # Clamp before reducing so fully masked chunks do not form
                     # ``-inf - -inf`` in the online-softmax recurrence.
-                    block_max = torch.amax(
-                        torch.clamp_min(scores, finite_min), dim=-1
-                    )
+                    block_max = torch.amax(torch.clamp_min(scores, finite_min), dim=-1)
                     # Form the old-max correction first.  The loop lowering can
                     # then update running_max without a carry snapshot.
                     correction = torch.exp(
@@ -1808,10 +1823,9 @@ def _windowed_attention(
                     return (new_max, new_denominator, new_output), None
 
                 carry = (running_max, denominator, output)
-                num_kv_tiles = _num_tiles_for_max_extent(
-                    buffer_width, tiling.kv_block_size
-                )
-                kv_tile_size = buffer_width // num_kv_tiles
+                num_kv_tiles = tiling.num_kv_blocks
+                kv_tile_size = tiling.kv_block_size
+                assert num_kv_tiles * kv_tile_size == buffer_width
                 if num_kv_tiles > 1:
                     carry, _ = for_each_tile(
                         swa_kv_body,
