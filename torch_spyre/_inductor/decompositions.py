@@ -59,6 +59,10 @@ logger = get_inductor_logger("decompositions")
 
 
 _SDPA_MAX_SEQUENCE_TILE_SIZE = 512
+# for_each_tile feeds V directly to the second matmul. A partial-width V tile
+# retains its transposed producer layout when padded to a full fp16/bf16 stick;
+# the resulting stride amplification can exceed the 256 MiB per-core span.
+_SDPA_SEQUENCE_TILE_ALIGNMENT = 64
 _SDPA_MAX_TILE_PAIRS_PER_LOOP_GROUP = 16
 _SDPA_PREFERRED_HEADS_PER_TILE = (4, 2, 1)
 _SDPA_MHA_MAX_HEAD_WORK_DIVISION = 4
@@ -140,19 +144,38 @@ def _sdpa_num_head_tiles(num_heads: int) -> int:
     return 1
 
 
-def _num_tiles_for_max_extent(sequence_length: int, max_extent: int) -> int:
+def _num_tiles_for_max_extent(
+    sequence_length: int, max_extent: int, *, tile_alignment: int = 1
+) -> int:
     """Return an exact split count whose tile extent is at most ``max_extent``.
 
     Coarse tiling currently requires equal-sized tiles, so a simple ceiling is
     insufficient when it does not divide ``sequence_length``. Start with the
     minimum count that satisfies the extent cap and advance to the next exact
-    divisor. Sequence lengths used by the adapters are stick-padded, so this
-    normally resolves after only a few candidates.
+    divisor whose tile extent has the requested alignment. If the full extent
+    is not aligned, or the extent cap is smaller than the alignment, no exact
+    aligned split exists and only divisibility is enforced. Sequence lengths
+    used by the adapters are normally stick-padded, so this resolves after only
+    a few candidates.
     """
-    num_tiles = max(1, (sequence_length + max_extent - 1) // max_extent)
-    while sequence_length % num_tiles != 0:
-        num_tiles += 1
-    return num_tiles
+    if sequence_length < 1 or max_extent < 1 or tile_alignment < 1:
+        raise ValueError(
+            "sequence length, maximum extent, and alignment must be positive"
+        )
+
+    alignment_is_possible = (
+        sequence_length % tile_alignment == 0 and max_extent >= tile_alignment
+    )
+    effective_alignment = tile_alignment if alignment_is_possible else 1
+    minimum_tiles = max(1, (sequence_length + max_extent - 1) // max_extent)
+    for num_tiles in range(minimum_tiles, sequence_length + 1):
+        if (
+            sequence_length % num_tiles == 0
+            and (sequence_length // num_tiles) % effective_alignment == 0
+        ):
+            return num_tiles
+
+    raise AssertionError("validated tiling inputs must have an exact tile")
 
 
 def _kv_blocks_per_loop_group(num_q_tiles: int, num_kv_blocks: int) -> int:
@@ -379,14 +402,12 @@ def _sdpa_kv_candidates(
     element_size: int,
     num_cores: int,
     work_div: dict[str, int] | None,
-    equal_tiles: bool = False,
 ) -> list[_SDPAKVBlockCandidate]:
     """Estimate LX pressure, restick traffic, and DPO execution count.
 
-    SDPA can emit a smaller final block, while the for_each_tile HOP used by
-    SWA requires every tile to have the same extent.  For the latter, turn
-    each candidate ceiling into the exact divisor that lowering will run and
-    cost that physical shape rather than the unattainable nominal ceiling.
+    Turn each candidate ceiling into the exact, stick-aligned divisor that
+    ``for_each_tile`` lowering will run, and cost that physical shape rather
+    than an unattainable nominal ceiling.
     """
     head_split = work_div.get("num_heads", 1) if work_div is not None else 1
     query_split = work_div.get("max_seqlen_q", 1) if work_div is not None else 1
@@ -400,16 +421,13 @@ def _sdpa_kv_candidates(
     restick_lx_limit = _SDPA_RESTICK_LX_BYTES_PER_REUSING_HEAD * gqa_reuse
     result = []
     seen_block_sizes = set()
-    for candidate_block_size in _sdpa_kv_block_sizes(max_seqlen_kv):
-        if equal_tiles:
-            num_blocks = _num_tiles_for_max_extent(max_seqlen_kv, candidate_block_size)
-            block_size = max_seqlen_kv // num_blocks
-        else:
-            num_blocks = (
-                max_seqlen_kv + candidate_block_size - 1
-            ) // candidate_block_size
-            block_size = candidate_block_size
-        effective_block_size = min(block_size, max_seqlen_kv)
+    for max_block_size in _sdpa_kv_block_sizes(max_seqlen_kv):
+        num_blocks = _num_tiles_for_max_extent(
+            max_seqlen_kv,
+            max_block_size,
+            tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+        )
+        effective_block_size = max_seqlen_kv // num_blocks
         if effective_block_size in seen_block_sizes:
             continue
         seen_block_sizes.add(effective_block_size)
@@ -437,9 +455,7 @@ def _sdpa_kv_candidates(
         num_loop_groups = (num_blocks + blocks_per_group - 1) // blocks_per_group
         result.append(
             _SDPAKVBlockCandidate(
-                block_size=(
-                    effective_block_size if equal_tiles else candidate_block_size
-                ),
+                block_size=effective_block_size,
                 num_blocks=num_blocks,
                 score_bytes_per_core=score_bytes,
                 estimated_live_bytes_per_core=live_bytes,
@@ -478,10 +494,15 @@ def _select_sdpa_tiling(
     work over query rows only; MHA may divide both heads and query rows.
     """
     quarter_kv_stick_aligned = max(64, ((max_seqlen_kv + 3) // 4 + 63) // 64 * 64)
-    fallback_kv_block_size = min(_SDPA_MAX_SEQUENCE_TILE_SIZE, quarter_kv_stick_aligned)
-    fallback_num_kv_blocks = (
-        max_seqlen_kv + fallback_kv_block_size - 1
-    ) // fallback_kv_block_size
+    fallback_kv_block_limit = min(
+        _SDPA_MAX_SEQUENCE_TILE_SIZE, quarter_kv_stick_aligned
+    )
+    fallback_num_kv_blocks = _num_tiles_for_max_extent(
+        max_seqlen_kv,
+        fallback_kv_block_limit,
+        tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+    )
+    fallback_kv_block_size = max_seqlen_kv // fallback_num_kv_blocks
     fallback_num_q_tiles = _num_tiles_for_max_extent(
         max_seqlen_q, _SDPA_MAX_SEQUENCE_TILE_SIZE
     )
@@ -685,13 +706,14 @@ def _select_swa_tiling(
     SDPA's ``max_seqlen_q`` and ``max_seqlen_kv`` become ``q_block`` and
     ``kv_block`` in the SWA decomposition.
 
-    Unlike full SDPA, ``for_each_tile`` does not support a ragged final tile.
-    Candidate ceilings are therefore normalized to exact divisors before
-    their costs are evaluated, and the returned block size is the physical
-    tile extent that lowering will run.
+    As with full SDPA, candidate ceilings are normalized to exact,
+    stick-aligned divisors before their costs are evaluated, and the returned
+    block size is the physical tile extent that lowering will run.
     """
     fallback_num_kv_blocks = _num_tiles_for_max_extent(
-        buffer_width, _SDPA_MAX_SEQUENCE_TILE_SIZE
+        buffer_width,
+        _SDPA_MAX_SEQUENCE_TILE_SIZE,
+        tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
     )
     fallback_kv_block_size = buffer_width // fallback_num_kv_blocks
     fallback_num_head_tiles = (
@@ -737,7 +759,6 @@ def _select_swa_tiling(
             element_size=element_size,
             num_cores=num_cores,
             work_div=sdpa_work_div,
-            equal_tiles=True,
         )
         for candidate in candidates:
             logger.debug(
@@ -1471,11 +1492,14 @@ def spyre__sdpa_overrideable(
                 f"GQA attention bias must have rank 2-5, got rank {attn_bias.dim()}"
             )
 
-    # for_each_tile requires equal-sized tiles. Preserve the cost model's block
-    # size as an upper bound and choose the nearest exact divisor. This normally
-    # leaves aligned model shapes unchanged and avoids a separately unrolled
-    # ragged tail.
-    num_kv_tiles = _num_tiles_for_max_extent(max_seqlen_kv, tiling.kv_block_size)
+    # for_each_tile requires equal-sized tiles. The cost model already returns
+    # an exact, stick-aligned block; retain the calculation here as a safety net
+    # for configurations supplied by fallback or test overrides.
+    num_kv_tiles = _num_tiles_for_max_extent(
+        max_seqlen_kv,
+        tiling.kv_block_size,
+        tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+    )
     kv_tile_size = max_seqlen_kv // num_kv_tiles
 
     score_dim_names = (
