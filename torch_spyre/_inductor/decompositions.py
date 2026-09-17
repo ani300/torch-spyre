@@ -63,6 +63,10 @@ _SDPA_MAX_SEQUENCE_TILE_SIZE = 512
 # retains its transposed producer layout when padded to a full fp16/bf16 stick;
 # the resulting stride amplification can exceed the 256 MiB per-core span.
 _SDPA_SEQUENCE_TILE_ALIGNMENT = 64
+# SWA's cache-order K/V path has been validated at the finer 16-row matmul
+# granularity.  Keeping this separate from SDPA's stricter layout requirement
+# preserves efficient exact tiles such as K272 for the 1088-row Gemma 4 cache.
+_SWA_SEQUENCE_TILE_ALIGNMENT = 16
 _SDPA_MAX_TILE_PAIRS_PER_LOOP_GROUP = 16
 _SDPA_PREFERRED_HEADS_PER_TILE = (4, 2, 1)
 _SDPA_MHA_MAX_HEAD_WORK_DIVISION = 4
@@ -402,6 +406,7 @@ def _sdpa_kv_candidates(
     element_size: int,
     num_cores: int,
     work_div: dict[str, int] | None,
+    tile_alignment: int = _SDPA_SEQUENCE_TILE_ALIGNMENT,
 ) -> list[_SDPAKVBlockCandidate]:
     """Estimate LX pressure, restick traffic, and DPO execution count.
 
@@ -425,7 +430,7 @@ def _sdpa_kv_candidates(
         num_blocks = _num_tiles_for_max_extent(
             max_seqlen_kv,
             max_block_size,
-            tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
+            tile_alignment=tile_alignment,
         )
         effective_block_size = max_seqlen_kv // num_blocks
         if effective_block_size in seen_block_sizes:
@@ -707,7 +712,7 @@ def _select_swa_tiling(
     ``kv_block`` in the SWA decomposition.
 
     As with full SDPA, candidate ceilings are normalized to exact,
-    stick-aligned divisors before their costs are evaluated, and the returned
+    matmul-aligned divisors before their costs are evaluated, and the returned
     block size is the physical tile extent that lowering will run.
     """
     fallback_num_kv_blocks = _num_tiles_for_max_extent(
@@ -759,6 +764,7 @@ def _select_swa_tiling(
             element_size=element_size,
             num_cores=num_cores,
             work_div=sdpa_work_div,
+            tile_alignment=_SWA_SEQUENCE_TILE_ALIGNMENT,
         )
         for candidate in candidates:
             logger.debug(

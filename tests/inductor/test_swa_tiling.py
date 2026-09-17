@@ -51,11 +51,11 @@ class TestSWATiling(unittest.TestCase):
         config = self._select()
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 64)
-        self.assertEqual(config.num_kv_blocks, 17)
+        self.assertEqual(config.kv_block_size, 272)
+        self.assertEqual(config.num_kv_blocks, 4)
         self.assertEqual(config.num_head_tiles, 1)
         self.assertEqual(config.work_div, {"q_block": 16})
-        self.assertEqual(config.kv_bytes_per_core, 64 * 4096)
+        self.assertEqual(config.kv_bytes_per_core, 272 * 4096)
 
     def test_gemma4_decode_uses_fewest_dsc_executions(self):
         config = self._select(q_block=1)
@@ -137,7 +137,7 @@ class TestSWATiling(unittest.TestCase):
         config = self._select(num_cores=16)
 
         self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 64)
+        self.assertEqual(config.kv_block_size, 272)
         self.assertEqual(config.work_div, {"q_block": 16})
         self.assertEqual(config.num_head_tiles, 1)
 
