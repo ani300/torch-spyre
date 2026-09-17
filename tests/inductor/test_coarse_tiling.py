@@ -882,6 +882,82 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         )
         self.assertEqual(simplify(expr2 - expected2), 0)
 
+    def test_general_tile_advance_uses_scheduler_dependencies(self):
+        """Codegen must not rebuild deps after a layout squeezes output rank."""
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        d0 = sympy_index_symbol("d0")
+        dep = self._dep(d0, {d0: Integer(8)})
+        ir_node = SimpleNamespace(
+            loop_info=CoarseTileInfo(
+                loop_group_id=(0,),
+                loop_count=[Integer(1)],
+                loop_tiled_dims=[[]],
+                tiled_dims_per_read=[[[]]],
+            ),
+            get_operation_name=lambda: "squeezed_layout_op",
+            get_read_writes=MagicMock(
+                side_effect=AssertionError("stale IR layout rank")
+            ),
+        )
+        kernel = SpyreKernel()
+        kernel.current_node = SimpleNamespace(
+            node=ir_node,
+            read_writes=SimpleNamespace(reads=[dep], writes=[]),
+        )
+
+        tensor = SimpleNamespace(
+            layout=SimpleNamespace(
+                device_layout=SimpleNamespace(device_size=[], stride_map=[])
+            )
+        )
+        self.assertIsNone(kernel._general_tile_advance(tensor, True, "t0"))
+        ir_node.get_read_writes.assert_not_called()
+
+    def test_splice_tile_advance_consumes_raw_loop_variable(self):
+        """A splice offset advances once and is removed from the base index."""
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        d0 = sympy_index_symbol("d0")
+        d1 = sympy_index_symbol("d1")
+        d2 = sympy_index_symbol("d2")
+        u0 = Symbol("u0", integer=True)
+        dep = self._dep(
+            131072 * d0 + d1 + 256 * d2 + 65536 * u0,
+            {d0: Integer(2), d1: Integer(256), d2: Integer(8)},
+        )
+        ir_node = SimpleNamespace(
+            data=SimpleNamespace(ranges=[2, 256, 1, 8, 1, 256], reduction_ranges=[]),
+            loop_info=CoarseTileInfo(
+                loop_group_id=(0,),
+                loop_count=[Integer(8)],
+                loop_tiled_dims=[[3]],
+                loop_splice_vars=[u0],
+                tiled_dims_per_read=[[[(3, Integer(256))]]],
+            ),
+            get_operation_name=lambda: "splice_add",
+        )
+        kernel = SpyreKernel()
+        kernel.current_node = SimpleNamespace(
+            node=ir_node,
+            read_writes=SimpleNamespace(reads=[dep], writes=[]),
+        )
+        tensor = SimpleNamespace(
+            layout=SimpleNamespace(
+                device_layout=SimpleNamespace(device_size=[], stride_map=[])
+            )
+        )
+
+        with patch(
+            "torch_spyre._inductor.spyre_kernel.tiling_expr_to_device_expr",
+            side_effect=lambda _size, _strides, expr: expr,
+        ):
+            advance, consumed = kernel._general_tile_advance_details(tensor, True, "t0")
+
+        level_symbol = Symbol("_tile_adv_splice_add_lvl0")
+        self.assertEqual(simplify(advance - 65536 * level_symbol), 0)
+        self.assertEqual(consumed, frozenset({u0}))
+
     def test_transposed_index_keeps_its_own_coefficient_per_dim(self):
         """A dep whose stride is transposed relative to the "usual" d0-major
         layout must keep each dim's own coefficient, not the row-major one.
@@ -6509,6 +6585,60 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         ]
         self.assertEqual(len(generated), 1)
         self.assertFalse(hasattr(generated[0], "work_div_loop_info"))
+
+    def test_read_copy_ignores_stale_source_named_dims_hint(self):
+        """A direct source hint with stale rank must not rename copy axes."""
+        from torch._inductor.dependencies import MemoryDep
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _propagate_read_copy_named_dims,
+        )
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+        source_size = [2, 256, 1, 8, 1, 256]
+        source_pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=lambda index: 0.0,
+            ranges=source_size,
+        )
+        source = ComputedBuffer(
+            name="stale_named_source",
+            layout=FixedLayout(device, dtype, source_size, None),
+            data=source_pw.data.data,
+        )
+        V.graph.name_to_buffer[source.get_name()] = source
+
+        copy_pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=lambda index: 0.0,
+            ranges=[8, 256, 256],
+        )
+        copy_buf = ComputedBuffer(
+            name="stale_named_copy",
+            layout=FixedLayout(device, dtype, [8, 256, 256], None),
+            data=copy_pw.data.data,
+        )
+        d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True)
+        dep = MemoryDep(
+            name=source.get_name(),
+            index=131072 * d0 + d1 + 256 * d2,
+            var_names=(d0, d1, d2),
+            size=(Integer(8), Integer(256), Integer(256)),
+        )
+
+        stale_hint = ["_b", "num_kvheads", "gqa_group_size", "q_block", "head_dim"]
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile.get_op_hints",
+            return_value={0: {"named_dims": stale_hint}},
+        ):
+            _propagate_read_copy_named_dims(copy_buf, dep)
+
+        self.assertTrue(copy_buf._ignore_inherited_named_dims)
+        self.assertFalse(hasattr(copy_buf, "_dim_prop_info"))
 
     def test_advancing_read_copy_stays_inside_loop(self):
         """Only fixed reads move to the preheader; advancing reads retain

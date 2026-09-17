@@ -117,6 +117,7 @@ from .propagate_named_dims import (
     _get_dim_prop_info,
     _get_layout,
     _lone_sym,
+    _named_dims_hint_is_compatible,
 )
 from ..pass_utils import (
     op_out_coords,
@@ -606,10 +607,21 @@ def plan_coarse_tile_groups(
                 op, read_deps, write_deps, per_level_extents
             )
 
+            hints_by_id = {hint.hint_id: hint for hint in getattr(op, "dim_hints", [])}
+            loop_splice_vars = []
+            for hint_id, _count in levels:
+                hint = hints_by_id.get(hint_id)
+                loop_splice_vars.append(
+                    hint.loop_var
+                    if hint is not None and hint.loop_var_range is not None
+                    else None
+                )
+
             plan[id(op)] = CoarseTileInfo(
                 loop_group_id=nested_group_id,
                 loop_count=counts,
                 loop_tiled_dims=op_tiled_dims,
+                loop_splice_vars=loop_splice_vars,
                 loop_tiled_reduction_dims=op_tiled_reduction_dims,
                 tiled_dims_per_read=tiled_dims_per_read,
                 output_tiled_dims=output_tiled_dims,
@@ -810,6 +822,7 @@ def _compute_fill_loop_info_planned(
     outer_counts: list[sympy.Expr] = []
     outer_tiled_dims: list[list[int]] = []
     outer_tiled_rdims: list[list[int]] = []
+    outer_splice_vars: list[sympy.Symbol | None] = []
     for i, (dims, _rdims, count) in enumerate(
         zip(info.loop_tiled_dims, tiled_rdims, info.loop_count)
     ):
@@ -817,6 +830,9 @@ def _compute_fill_loop_info_planned(
             outer_counts.append(count)
             outer_tiled_dims.append(dims)
             outer_tiled_rdims.append([])
+            outer_splice_vars.append(
+                info.loop_splice_vars[i] if i < len(info.loop_splice_vars) else None
+            )
 
     if not outer_counts:
         return None  # flat: fill runs before all loops
@@ -826,6 +842,7 @@ def _compute_fill_loop_info_planned(
         loop_group_id=outer_gid,
         loop_count=outer_counts,
         loop_tiled_dims=outer_tiled_dims,
+        loop_splice_vars=outer_splice_vars,
         loop_tiled_reduction_dims=outer_tiled_rdims,
         tiled_dims_per_read=[],
         output_tiled_dims=[],
@@ -4668,6 +4685,9 @@ def _propagate_read_copy_named_dims(copy_buf: ComputedBuffer, dep: MemoryDep) ->
     # names to preserve.
     copy_buf._ignore_inherited_named_dims = True  # type: ignore[attr-defined]
 
+    layout = _get_layout(dep)
+    if layout is None:
+        return
     dpi = _get_dim_prop_info(dep)
     named_dims = dpi.named_dims if dpi is not None else None
     if not named_dims:
@@ -4679,12 +4699,17 @@ def _propagate_read_copy_named_dims(copy_buf: ComputedBuffer, dep: MemoryDep) ->
         if isinstance(source, Operation):
             for _, hint_dict in sorted(get_op_hints(source).items()):
                 if hint_named_dims := hint_dict.get("named_dims"):
-                    named_dims = hint_named_dims
-                    break
+                    if _named_dims_hint_is_compatible(hint_named_dims, layout.size):
+                        named_dims = hint_named_dims
+                        break
+                    logger.debug(
+                        "coarse_tile: ignoring incompatible named_dims hint "
+                        "%s for read-copy source %s with layout %s",
+                        hint_named_dims,
+                        dep.name,
+                        list(layout.size),
+                    )
     if not named_dims:
-        return
-    layout = _get_layout(dep)
-    if layout is None:
         return
     coords = host_coordinates(layout, dep, None)
     # Direct in-graph annotations retain size-1 dimensions while MemoryDep

@@ -115,6 +115,19 @@ def _untracked_name(context: str, sym, size: int) -> str:
     return name
 
 
+def _named_dims_hint_is_compatible(named_dims: list[str], layout_size) -> bool:
+    """Whether a direct ``named_dims`` hint can describe ``layout_size``.
+
+    Direct hints are positional, so both rank and every already-declared
+    extent must agree.  Unknown names are accepted and registered later by
+    propagation.
+    """
+    return len(named_dims) == len(layout_size) and all(
+        name not in _named_dims or _named_dims[name] == int(size)
+        for name, size in zip(named_dims, layout_size)
+    )
+
+
 def _input_range_for_symbol(inputs: list[MemoryDep], sym: sympy.Symbol) -> sympy.Expr:
     """Return ``sym``'s range from the input dependency that defines it."""
     for inp in inputs:
@@ -444,7 +457,7 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
                         for name, size in zip(named_dims, layout_size)
                         if name in _named_dims and _named_dims[name] != int(size)
                     ]
-                    if len(named_dims) != len(layout_size) or mismatched_sizes:
+                    if not _named_dims_hint_is_compatible(named_dims, layout_size):
                         # Fused and HOP-spliced operations can retain an outer
                         # scope's annotation even when a reduction or tile view
                         # changed the rank or extents.  Applying those names
