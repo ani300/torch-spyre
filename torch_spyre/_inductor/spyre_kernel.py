@@ -916,11 +916,16 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.index,
             {symbol: sympy.Integer(0) for symbol in consumed_splice_vars},
         )
+        final_indirect_sizes = {
+            symbol: size
+            for symbol, size in indirect_sizes.items()
+            if symbol not in consumed_splice_vars
+        }
         device_coords = alignment_coordinates(
             tensor.layout.device_layout,
             base_index,
             it_space,
-            indirect_sizes,
+            final_indirect_sizes,
             repeat_info_out=self._alignment_repeat_info,
         )
         work_division = work_division_from_view(
