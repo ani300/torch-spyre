@@ -630,11 +630,17 @@ class SpyreKernel(Kernel[CSEVariable]):
     def _general_tile_advance(
         self, tensor: TensorAccess, is_input: bool, name: str
     ) -> "sympy.Expr | None":
-        advance, _ = self._general_tile_advance_details(tensor, is_input, name)
+        advance, _ = self._general_tile_advance_details(
+            tensor, is_input, name, frozenset()
+        )
         return advance
 
     def _general_tile_advance_details(
-        self, tensor: TensorAccess, is_input: bool, name: str
+        self,
+        tensor: TensorAccess,
+        is_input: bool,
+        name: str,
+        invalid_splice_vars: "frozenset[sympy.Symbol]",
     ) -> "tuple[sympy.Expr | None, frozenset[sympy.Symbol]]":
         """This arg's device-element tile-advance expr.
 
@@ -657,13 +663,15 @@ class SpyreKernel(Kernel[CSEVariable]):
         already in host-element space) through the same
         tiling_expr_to_device_expr projection instead.
 
-        A synthesized ``for_each_tile`` induction variable is already an
-        absolute per-trip offset in ``dep.index``.  For such a level, replace
-        that symbol with the minted level symbol directly (not
-        ``extent * level_symbol``), and return it in the consumed-symbol set.
-        ``create_tensor_arg`` rebases exactly those symbols to zero in the
-        base address so the raw unbacked variable cannot both contribute to
-        ``device_coordinates`` and be applied again by the tile advance.
+        A synthesized ``for_each_tile`` induction variable normally remains
+        an ordinary operation dimension and needs no special treatment.  A
+        transformed access can, however, retain that variable after it has
+        disappeared from this operation's iteration space.  The caller
+        identifies exactly those invalid variables from the already-built
+        device coordinates.  For such a level, replace the raw trip index by
+        the minted loop-level symbol and report it as consumed so the caller
+        can remove it from the base coordinates.  Restricting the conversion
+        this way preserves ordinary ``for_each_tile`` coordinate semantics.
 
         This is the sole tile-advance mechanism. Returns ``(None, empty)``
         for ops without loop_info/coarse tiling.
@@ -675,16 +683,17 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         op_name = ir_node.get_operation_name()
         squeezed_advance_per_level: list[list[tuple[sympy.Expr, sympy.Expr]]] = []
-        # SchedulerNode computed these dependencies from the final simplified
-        # loop body before codegen.  Re-extracting them from the IR node here
-        # is both redundant and unsafe after layout propagation: squeezed
-        # views can legitimately leave ``data.ranges`` at a higher rank than
-        # the final layout, which makes ComputedBuffer.get_read_writes()
-        # rebuild its output index with mismatched ranks.  Test fixtures that
-        # do not provide a real SchedulerNode retain the old fallback.
-        read_writes = getattr(self.current_node, "read_writes", None)
-        if read_writes is None:
+        # Prefer dependencies rebuilt from the final loop body: later passes
+        # can rewrite their indices after the scheduler snapshot was created.
+        # A physically squeezed output can make that rebuild fail because its
+        # layout and logical loop-body ranks intentionally differ; only in
+        # that case fall back to the scheduler's finalized snapshot.
+        try:
             read_writes = ir_node.get_read_writes()
+        except (AssertionError, IndexError):
+            read_writes = getattr(self.current_node, "read_writes", None)
+            if read_writes is None:
+                raise
 
         if is_input:
             read_deps = [dep for dep in read_writes.reads if isinstance(dep, MemoryDep)]
@@ -739,16 +748,23 @@ class SpyreKernel(Kernel[CSEVariable]):
                 getattr(loop_info, "squeezed_advance_output", None) or []
             )
 
-        if not per_level_dims and not any(squeezed_advance_per_level):
-            return None, frozenset()
-
         device_size = tensor.layout.device_layout.device_size
         stride_map = tensor.layout.device_layout.stride_map
 
         total_device_expr: "sympy.Expr | None" = None
         consumed_splice_vars: set[sympy.Symbol] = set()
         loop_splice_vars = getattr(loop_info, "loop_splice_vars", [])
-        n_levels = max(len(per_level_dims), len(squeezed_advance_per_level))
+        if (
+            not per_level_dims
+            and not any(squeezed_advance_per_level)
+            and not invalid_splice_vars.intersection(loop_splice_vars)
+        ):
+            return None, frozenset()
+        n_levels = max(
+            len(per_level_dims),
+            len(squeezed_advance_per_level),
+            len(loop_splice_vars),
+        )
         for level_idx in range(n_levels):
             dim_extent_pairs = (
                 per_level_dims[level_idx] if level_idx < len(per_level_dims) else []
@@ -758,8 +774,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                 if level_idx < len(squeezed_advance_per_level)
                 else []
             )
-            if not dim_extent_pairs and not squeezed_pairs:
-                continue
             level_symbol = self._get_or_mint_level_symbol(level_idx, op_name)
             splice_var = (
                 loop_splice_vars[level_idx]
@@ -767,33 +781,43 @@ class SpyreKernel(Kernel[CSEVariable]):
                 else None
             )
             consumes_splice_var = bool(
-                splice_var is not None and splice_var in dep.index.free_symbols
+                splice_var is not None
+                and splice_var in invalid_splice_vars
+                and splice_var in tensor.index.free_symbols
             )
+            if not dim_extent_pairs and not squeezed_pairs and not consumes_splice_var:
+                continue
             host_expr = sympy.S.Zero
-            if dim_extent_pairs:
-                if consumes_splice_var:
-                    # The splice variable itself counts loop trips.  Its
-                    # coefficient in dep.index already contains the complete
-                    # per-tile stride, so multiplying it by the tile extent a
-                    # second time would over-advance the address.
-                    tiled_dim_extents = {splice_var: level_symbol}
-                else:
-                    tiled_dim_extents = {
-                        self._host_dim_to_index_symbol(ir_node, d): extent
-                        * level_symbol
-                        for d, extent in dim_extent_pairs
-                    }
+            if consumes_splice_var:
+                # Use the exact access expression that produced the invalid
+                # coordinate.  The splice variable already carries the
+                # complete per-trip offset, so applying either the ordinary
+                # tiled-dimension extent or squeezed advance as well would
+                # advance the address twice.
+                tiled_dim_extents = {splice_var: level_symbol}
+                advance_index = tensor.index
+            elif dim_extent_pairs:
+                tiled_dim_extents = {
+                    self._host_dim_to_index_symbol(ir_node, d): extent * level_symbol
+                    for d, extent in dim_extent_pairs
+                }
+                advance_index = dep.index
+            else:
+                tiled_dim_extents = {}
+                advance_index = dep.index
+            if tiled_dim_extents:
                 subs = dict(tiled_dim_extents)
                 subs.update(
                     {
                         sym: sympy.Integer(0)
-                        for sym in dep.index.free_symbols
+                        for sym in advance_index.free_symbols
                         if sym not in subs
                     }
                 )
-                host_expr += dep.index.subs(subs)
-            for host_stride, extent in squeezed_pairs:
-                host_expr += level_symbol * extent * host_stride
+                host_expr += advance_index.subs(subs)
+            if not consumes_splice_var:
+                for host_stride, extent in squeezed_pairs:
+                    host_expr += level_symbol * extent * host_stride
             if consumes_splice_var:
                 consumed_splice_vars.add(splice_var)
             device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)
@@ -865,8 +889,28 @@ class SpyreKernel(Kernel[CSEVariable]):
             **self.indirect_sizes,
             **loop_var_ranges_from_dim_hints(self.current_node.node),
         }
+        initial_device_coords = alignment_coordinates(
+            tensor.layout.device_layout,
+            tensor.index,
+            it_space,
+            indirect_sizes,
+        )
+        loop_info = getattr(operation, "loop_info", None)
+        splice_vars = {
+            symbol
+            for symbol in getattr(loop_info, "loop_splice_vars", [])
+            if symbol is not None
+        }
+        coordinate_symbols = set().union(
+            *(coord.free_symbols for coord in initial_device_coords)
+        )
+        invalid_splice_vars = frozenset(
+            (coordinate_symbols & splice_vars) - it_space.keys()
+        )
         device_tile_advance_expr, consumed_splice_vars = (
-            self._general_tile_advance_details(tensor, is_input, name)
+            self._general_tile_advance_details(
+                tensor, is_input, name, invalid_splice_vars
+            )
         )
         base_index = sympy_subs(
             tensor.index,

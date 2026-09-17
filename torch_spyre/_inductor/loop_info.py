@@ -297,11 +297,11 @@ class CoarseTileInfo:
         innermost.  ``len(loop_count) == len(loop_group_id)`` always holds.
     loop_splice_vars:
         Synthesized ``for_each_tile`` induction variable for each nesting
-        level, or ``None`` for an ordinary ``spyre_hint`` level.  This lets
-        codegen distinguish a raw splice offset already expressed in a
-        dependency index from an ordinary tiled iteration dimension: the
-        former advances by substituting the level symbol directly, whereas
-        the latter advances by ``tile_extent * level_symbol``.
+        level, or ``None`` for an ordinary ``spyre_hint`` level.  Codegen
+        uses this provenance only when the variable survives in a tensor's
+        coordinates without belonging to that operation's iteration space;
+        such a variable names the surrounding counted loop rather than an
+        operation dimension and must be represented by tile advance instead.
     loop_tiled_dims:
         List of lists, one sub-list per nesting level.  Each sub-list
         contains the ``data.ranges`` positional indices that are tiled at

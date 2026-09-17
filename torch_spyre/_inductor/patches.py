@@ -47,9 +47,8 @@ def _cached_scheduler_node_symbol_uses(
     the scheduler snapshot.
 
     Synthesized ``for_each_tile`` induction variables are internal to the
-    emitted counted loop, not graph-partition inputs.  Codegen converts them
-    to ``device_tile_advance_expr`` symbols, so exclude exactly the variables
-    recorded on the node's coarse-tile levels.
+    emitted counted loop, not graph-partition inputs, so exclude the variables
+    recorded by the node's splice-generated dimension hints.
     """
     ir_node = node.node
     assert isinstance(ir_node, ComputedBuffer)
@@ -64,11 +63,10 @@ def _cached_scheduler_node_symbol_uses(
     free_symbol_uses.update(
         *(get_layout_symints(output) for output in ir_node.get_outputs())
     )
-    loop_info = getattr(ir_node, "loop_info", None)
     free_symbol_uses.difference_update(
-        symbol
-        for symbol in getattr(loop_info, "loop_splice_vars", [])
-        if symbol is not None
+        hint.loop_var
+        for hint in getattr(ir_node, "dim_hints", [])
+        if hint.loop_var is not None and hint.loop_var_range is not None
     )
     return free_symbol_uses
 

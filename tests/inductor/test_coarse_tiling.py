@@ -882,8 +882,8 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         )
         self.assertEqual(simplify(expr2 - expected2), 0)
 
-    def test_general_tile_advance_uses_scheduler_dependencies(self):
-        """Codegen must not rebuild deps after a layout squeezes output rank."""
+    def test_general_tile_advance_falls_back_to_scheduler_dependencies(self):
+        """A failed final dependency rebuild uses the scheduler snapshot."""
         from torch_spyre._inductor.spyre_kernel import SpyreKernel
 
         d0 = sympy_index_symbol("d0")
@@ -912,11 +912,11 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
             )
         )
         self.assertIsNone(kernel._general_tile_advance(tensor, True, "t0"))
-        ir_node.get_read_writes.assert_not_called()
+        ir_node.get_read_writes.assert_called_once_with()
 
-    def test_splice_tile_advance_consumes_raw_loop_variable(self):
-        """A splice offset advances once and is removed from the base index."""
-        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+    def test_only_invalid_splice_variable_is_consumed(self):
+        """A splice offset becomes loop advance only outside the op domain."""
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel, TensorAccess
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -936,27 +936,39 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
                 tiled_dims_per_read=[[[(3, Integer(256))]]],
             ),
             get_operation_name=lambda: "splice_add",
+            get_read_writes=lambda: SimpleNamespace(reads=[dep], writes=[]),
         )
         kernel = SpyreKernel()
         kernel.current_node = SimpleNamespace(
             node=ir_node,
             read_writes=SimpleNamespace(reads=[dep], writes=[]),
         )
-        tensor = SimpleNamespace(
-            layout=SimpleNamespace(
+        tensor = TensorAccess(
+            "t0",
+            dep.index,
+            SimpleNamespace(
                 device_layout=SimpleNamespace(device_size=[], stride_map=[])
-            )
+            ),
         )
 
         with patch(
             "torch_spyre._inductor.spyre_kernel.tiling_expr_to_device_expr",
             side_effect=lambda _size, _strides, expr: expr,
         ):
-            advance, consumed = kernel._general_tile_advance_details(tensor, True, "t0")
+            invalid_advance, consumed = kernel._general_tile_advance_details(
+                tensor, True, "t0", frozenset({u0})
+            )
+            kernel._general_tile_advance_seen = {}
+            kernel._tile_advance_symbols = {}
+            valid_advance, valid_consumed = kernel._general_tile_advance_details(
+                tensor, True, "t0", frozenset()
+            )
 
         level_symbol = Symbol("_tile_adv_splice_add_lvl0")
-        self.assertEqual(simplify(advance - 65536 * level_symbol), 0)
+        self.assertEqual(simplify(invalid_advance - 65536 * level_symbol), 0)
         self.assertEqual(consumed, frozenset({u0}))
+        self.assertEqual(simplify(valid_advance - 65536 * level_symbol), 0)
+        self.assertEqual(valid_consumed, frozenset())
 
     def test_transposed_index_keeps_its_own_coefficient_per_dim(self):
         """A dep whose stride is transposed relative to the "usual" d0-major

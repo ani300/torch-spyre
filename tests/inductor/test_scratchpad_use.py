@@ -158,8 +158,8 @@ def test_partition_symbol_uses_reuses_final_scheduler_dependencies():
         loop_group_id=(0,),
         loop_count=[4],
         loop_tiled_dims=[[0]],
-        loop_splice_vars=[loop_var],
     )
+    node.dim_hints = [SimpleNamespace(loop_var=loop_var, loop_var_range=4)]
 
     with patch.object(
         node,
