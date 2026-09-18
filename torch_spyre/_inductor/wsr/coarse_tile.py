@@ -1564,6 +1564,19 @@ def _tiled_dims_for_dep(
     first place -- see _loop_var_to_ranges_pos/
     _loop_var_to_reduction_ranges_pos) and test dep.index's coefficient on
     that symbol directly, instead of name-matching.
+
+    A dim's loop_var symbol only appears in the ONE dependency the splice
+    machinery rewrote in place (the in-place carry target's own
+    ReinterpretView offset, e.g. `_rebase_splice_write_offset`'s
+    `12*u5`-style term) -- an op's other reads of that same tiled dim keep
+    the ordinary squeezed d<N> convention and never contain the loop_var
+    at all. So a zero coefficient on the loop_var does not mean this dep
+    doesn't read dim d; it means this dep uses the other convention. Fall
+    through to the d-prefix membership test rather than returning False --
+    otherwise a real, ordinary-indexed read of a splice-tiled dim (e.g.
+    the mutation_write_back write-back's OWN read of its non-carry input)
+    is wrongly reported as not reading that dim at all, leaving it with no
+    tracked advance mechanism whatsoever.
     """
     pos_to_loop_var: dict[int, sympy.Symbol] = {}
     hints = getattr(ir_node, "dim_hints", None) or ()
@@ -1598,8 +1611,8 @@ def _tiled_dims_for_dep(
 
     def _dim_is_read(d: int) -> bool:
         loop_var = pos_to_loop_var.get(d)
-        if loop_var is not None:
-            return dep.index.coeff(loop_var) != 0
+        if loop_var is not None and dep.index.coeff(loop_var) != 0:
+            return True
         return raw_to_squeezed.get(d, d) in dep_dims
 
     return [
