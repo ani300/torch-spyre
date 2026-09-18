@@ -1482,7 +1482,11 @@ def splice_while_loops(graph) -> None:
                 while_op, _stacking_carry_indices(while_op, loop_var)
             )
             group_ops = splice_while_loop(
-                graph, while_op, carries, trip_count=result.trip_count
+                graph,
+                while_op,
+                carries,
+                trip_count=result.trip_count,
+                loop_var=loop_var,
             )
 
             _consume_tile_dim_markers(group_ops, graph.operations)

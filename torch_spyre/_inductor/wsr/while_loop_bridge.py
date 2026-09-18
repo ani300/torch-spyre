@@ -28,6 +28,9 @@ import dataclasses
 import logging
 from typing import TYPE_CHECKING, Any
 
+from torch._inductor.ops_handler import WrapperHandler
+from torch._inductor.virtualized import V
+
 from ..errors import Unsupported
 from ..loop_info import LoopCarryRecord
 
@@ -36,6 +39,52 @@ if TYPE_CHECKING:
     from torch._inductor.graph import GraphLowering
 
 logger = logging.getLogger(__name__)
+
+
+class _FinalTripNameSwapHandler(WrapperHandler):
+    """Redirect ops.load(old_name, index) to new_name, pinning loop_var.
+
+    Used only when redirecting an outside consumer's read of a while_loop
+    carry's final value (see _repoint_refs_to_buffer). A plain name swap
+    (NameSwapHandler in pass_utils.py) leaves the loop's own splice
+    loop_var alive in `index` -- correct for reads still inside the
+    spliced body, but wrong here: this op sits outside the loop entirely,
+    was never one of _stamp_direct_loop_info's group_ops, and so has no
+    dim_hints of its own to let spyre_kernel.py's create_tensor_arg strip
+    that symbol later. Pin it to its value at the final trip
+    (trip_count - 1) instead -- the accumulator's real address at that
+    point (see splice_while_loop's own "drain" case docstring: after the
+    last trip, the buffer itself IS the final value with no other
+    patching needed for the *value*, only the *address*).
+
+    Only fires when both old_name matches AND loop_var/final_trip_value
+    are not None -- callers with no loop_var context still get plain
+    name-only redirection (matches NameSwapHandler's existing contract for
+    every other caller of redirect_computed_buffer_reads).
+    """
+
+    def __init__(
+        self,
+        inner,
+        old_name: str,
+        new_name: str,
+        loop_var: Any,
+        final_trip_value: Any,
+    ):
+        super().__init__(inner)
+        self._old_name = old_name
+        self._new_name = new_name
+        self._loop_var = loop_var
+        self._final_trip_value = final_trip_value
+
+    def load(self, name, index):
+        if name == self._old_name:
+            if self._loop_var is not None:
+                from torch._inductor.utils import sympy_subs
+
+                index = sympy_subs(index, {self._loop_var: self._final_trip_value})
+            return super().load(self._new_name, index)
+        return super().load(name, index)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -609,6 +658,8 @@ def _rewire_accumulator_output(
     binding: CarryBinding,
     body_ops: list["ir.Operation"],
     real_input: Any,
+    trip_count: Any = None,
+    loop_var: Any = None,
 ) -> list["ir.Operation"]:
     """Make an accumulator carry's body write land in the carry's own buffer.
 
@@ -690,12 +741,19 @@ def _rewire_accumulator_output(
     producer._loop_carry_record = record
 
     if while_out_name is not None:
-        _repoint_refs_to_buffer(graph, while_out_name, target)
+        _repoint_refs_to_buffer(
+            graph, while_out_name, target, trip_count=trip_count, loop_var=loop_var
+        )
     return body_ops
 
 
 def _repoint_refs_to_buffer(
-    graph: "GraphLowering", old_name: str, new_buf: Any
+    graph: "GraphLowering",
+    old_name: str,
+    new_buf: Any,
+    *,
+    trip_count: Any = None,
+    loop_var: Any = None,
 ) -> None:
     """Point graph outputs (and any op input) naming old_name at new_buf.
 
@@ -750,13 +808,33 @@ def _repoint_refs_to_buffer(
         if isinstance(op, ir.ComputedBuffer):
             reads = {dep.name for dep in op.get_read_writes().reads}
             if old_name in reads:
+                if loop_var is not None and trip_count is not None:
+                    orig_inner = op.data.inner_fn
+                    final_trip_value = trip_count - 1
+                    new_name = new_buf.get_name()
+
+                    def new_inner_fn(
+                        *args,
+                        _orig=orig_inner,
+                        _old=old_name,
+                        _new=new_name,
+                        _lv=loop_var,
+                        _final=final_trip_value,
+                    ):
+                        with V.set_ops_handler(
+                            _FinalTripNameSwapHandler(V.ops, _old, _new, _lv, _final)
+                        ):
+                            return _orig(*args)
+
+                    object.__setattr__(op.data, "inner_fn", new_inner_fn)
                 graph.operations[i] = redirect_computed_buffer_reads(
                     op,
                     name_map,
                     graph.operations,
                     pass_name="splice_while_loops",
                     reason="redirect an outside consumer's carry read to "
-                    "the carry's real accumulator buffer",
+                    "the carry's real accumulator buffer, resolving its "
+                    "residual splice loop_var to the final trip's value",
                 )
 
 
@@ -765,6 +843,7 @@ def splice_while_loop(
     while_op: "ir.WhileLoop",
     carries: list[CarryBinding],
     trip_count: Any = None,
+    loop_var: Any = None,
 ) -> list["ir.Operation"]:
     """Replace while_op in graph.operations with its body subgraph's ops.
 
@@ -796,7 +875,11 @@ def splice_while_loop(
 
     (see ``_rewire_accumulator_output``'s own comment for the full
     rationale, including why this replaced an earlier ``scratch_name``
-    redirect that no buffer was ever materialized under).
+    redirect that no buffer was ever materialized under). ``loop_var``,
+    when not ``None``, is this loop's own splice loop_var (the caller's
+    ``_body_loop_var(while_op)`` result) -- used to resolve an outside
+    consumer's residual reference to it after redirection (see
+    ``_rewire_accumulator_output``).
 
     So the read side is handled per carry shape, distinguishing two cases by
     identity (confirmed against both split_m_fn and split_k_fn):
@@ -919,7 +1002,13 @@ def splice_while_loop(
                     body_ops,
                 )
             body_ops = _rewire_accumulator_output(
-                graph, while_op, binding, body_ops, real_input
+                graph,
+                while_op,
+                binding,
+                body_ops,
+                real_input,
+                trip_count=trip_count,
+                loop_var=loop_var,
             )
 
         # Read side always resolves to the real, already-registered initial
