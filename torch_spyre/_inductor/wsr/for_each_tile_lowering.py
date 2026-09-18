@@ -1179,6 +1179,42 @@ def lookup_marker_dim(
     return None
 
 
+def _stamp_direct_loop_info(
+    group_ops: list["ir.Operation"],
+    while_op: "ir.WhileLoop",
+    loop_var: sympy.Symbol,
+    trip_count: sympy.Expr,
+    group_idx: int,
+) -> None:
+    """Directly construct and append one CoarseTileInfo level per op.
+
+    Ground truth only -- trip count from try_prove_for_each_tile, loop_var
+    from _body_loop_var, per-op tiled-dim resolution from
+    lookup_marker_dim. Never calls coarse_tile_pre_stickify. propagation
+    is never produced; every CoarseTileInfo built here leaves it None (see
+    docs/superpowers/specs/2026-09-17-while-loop-direct-loop-info-design.md
+    Sec4.2a for why: zero consumers outside coarse_tile.py's own Pass
+    1/2/3, which while_loop groups skip entirely).
+
+    Called once per while_loop nesting level, innermost first (splice
+    order): appends onto whatever loop_info a strictly-inner level's own
+    call already stamped, never overwriting it.
+    """
+    from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+    loop_group_id = (group_idx,)
+    loop_count = [trip_count]
+
+    for op in group_ops:
+        existing = getattr(op, "loop_info", None) or []
+        info = CoarseTileInfo(
+            loop_group_id=loop_group_id,
+            loop_count=loop_count,
+            loop_tiled_dims=[[]],
+        )
+        op.loop_info = [*existing, info]
+
+
 def splice_while_loops(graph) -> None:
     """CustomPreSchedulingPasses entry point: splice every for_each_tile WhileLoop.
 

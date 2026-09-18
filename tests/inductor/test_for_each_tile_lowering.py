@@ -2272,5 +2272,85 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=1e-2, rtol=1e-2)
 
 
+class TestStampDirectLoopInfo(unittest.TestCase):
+    """_stamp_direct_loop_info builds loop_group_id/loop_count directly."""
+
+    def _run_graph(self, fn, args):
+        """Lower fn(*args) through a fresh GraphLowering and return it.
+
+        Same pattern as TestSpliceWhileLoops._run_graph/TestConsumeTileDim
+        Markers._run_graph: a standalone GraphLowering.run() call stops
+        short of codegen(), so splice_while_loops (a pre-scheduling pass
+        that only fires from _update_scheduler during codegen()) never
+        runs -- leaving the WhileLoop op intact in graph.operations for
+        this test to splice and stamp itself.
+        """
+        from torch._inductor.graph import GraphLowering
+
+        from tests.inductor.for_each_tile_fixtures import capture_post_grad_while_loop
+
+        _out, gm = capture_post_grad_while_loop(fn, args)
+
+        fake_mode = None
+        for node in gm.graph.nodes:
+            val = node.meta.get("val") if hasattr(node, "meta") else None
+            candidate = getattr(val, "fake_mode", None)
+            if candidate is not None:
+                fake_mode = candidate
+                break
+        assert fake_mode is not None, "could not recover a fake_mode from gm node.meta"
+
+        graph = GraphLowering(
+            gm, example_inputs=list(args), shape_env=fake_mode.shape_env
+        )
+        with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
+            graph.run(*args)
+        return graph
+
+    def test_single_level_stamps_group_id_and_count(self):
+        from torch._inductor import ir
+
+        from tests.inductor.for_each_tile_fixtures import matmul_inputs, split_k_fn
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _stamp_direct_loop_info,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_k_fn, (X, Y))
+
+        while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertEqual(len(while_ops), 1)
+        while_op = while_ops[0]
+
+        result = try_prove_for_each_tile(while_op)
+        self.assertTrue(result.accepted, result.reason)
+        loop_var = _body_loop_var(while_op)
+        self.assertIsNotNone(loop_var)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(while_op)
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=result.trip_count
+            )
+
+            _stamp_direct_loop_info(
+                group_ops, while_op, loop_var, result.trip_count, group_idx=0
+            )
+
+        stamped = [op for op in group_ops if getattr(op, "loop_info", None)]
+        self.assertTrue(stamped, "no op received a loop_info stamp")
+        for op in stamped:
+            info = op.loop_info[-1]
+            self.assertEqual(info.loop_group_id, (0,))
+            self.assertEqual(info.loop_count, [result.trip_count])
+            self.assertIsNone(info.propagation)
+
+
 if __name__ == "__main__":
     unittest.main()
