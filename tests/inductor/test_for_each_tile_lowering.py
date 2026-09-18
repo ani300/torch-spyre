@@ -2351,6 +2351,72 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             self.assertEqual(info.loop_count, [result.trip_count])
             self.assertIsNone(info.propagation)
 
+    def test_marker_resolved_dim_appears_in_loop_tiled_dims(self):
+        """A marker-resolved tile read surfaces in loop_tiled_dims.
+
+        Deviates from the brief's literal snippet in fixture choice:
+        split_m_fn's own tile-marker consumer is `x_tile @ y_whole`, a
+        matmul that lowers to an aten-fallback ExternKernelOut on this
+        CPU-fixture path -- a StarDep-shaped consumer (see
+        split_m_elementwise_fn's own docstring in for_each_tile_fixtures.py)
+        that lookup_marker_dim deliberately returns None for (no
+        index/ranges to resolve a position from). Verified empirically:
+        with split_m_fn, no op in group_ops ever gets a non-empty
+        loop_tiled_dims, so the assertion below would fail even against a
+        correct implementation. split_m_elementwise_fn's intervening
+        `x_tile * 2.0` lowers to a genuine Pointwise ComputedBuffer, whose
+        MemoryDep read of the marker IS what _consume_tile_dim_markers'
+        ComputedBuffer branch (_inline_marker_into_consumer) fuses in and
+        maps -- giving lookup_marker_dim a real MemoryDep to resolve.
+        """
+        from torch._inductor import ir
+
+        from tests.inductor.for_each_tile_fixtures import split_m_elementwise_fn
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _stamp_direct_loop_info,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        X = torch.randn(128, 12)
+        Y = torch.randn(12, 6)
+        graph = self._run_graph(split_m_elementwise_fn, (X, Y))
+
+        while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertEqual(len(while_ops), 1)
+        while_op = while_ops[0]
+
+        result = try_prove_for_each_tile(while_op)
+        self.assertTrue(result.accepted, result.reason)
+        loop_var = _body_loop_var(while_op)
+        self.assertIsNotNone(loop_var)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(while_op)
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=result.trip_count
+            )
+            _consume_tile_dim_markers(group_ops, graph.operations)
+
+            _stamp_direct_loop_info(
+                group_ops, while_op, loop_var, result.trip_count, group_idx=0
+            )
+
+        tiled_ops = [
+            op
+            for op in group_ops
+            if getattr(op, "loop_info", None) and op.loop_info[-1].loop_tiled_dims[-1]
+        ]
+        self.assertTrue(
+            tiled_ops,
+            "no op in split_m_elementwise_fn's body has a marker-resolved tiled dim",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

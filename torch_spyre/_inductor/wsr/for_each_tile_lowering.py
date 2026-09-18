@@ -1207,10 +1207,22 @@ def _stamp_direct_loop_info(
 
     for op in group_ops:
         existing = getattr(op, "loop_info", None) or []
+
+        resolved = lookup_marker_dim(op, loop_var)
+        loop_tiled_dims: list[int] = []
+        loop_tiled_reduction_dims: list[int] = []
+        if resolved is not None:
+            ranges_pos, is_reduction = resolved
+            if is_reduction:
+                loop_tiled_reduction_dims.append(ranges_pos)
+            else:
+                loop_tiled_dims.append(ranges_pos)
+
         info = CoarseTileInfo(
             loop_group_id=loop_group_id,
             loop_count=loop_count,
-            loop_tiled_dims=[[]],
+            loop_tiled_dims=[loop_tiled_dims],
+            loop_tiled_reduction_dims=[loop_tiled_reduction_dims],
         )
         op.loop_info = [*existing, info]
 
