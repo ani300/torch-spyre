@@ -1126,9 +1126,11 @@ def _stamp_direct_loop_info(
     Sec4.2a for why: zero consumers outside coarse_tile.py's own Pass
     1/2/3, which while_loop groups skip entirely).
 
-    Called once per while_loop nesting level, innermost first (splice
-    order): extends whatever single CoarseTileInfo a strictly-inner level's
-    own call already stamped, never overwriting it. ``op.loop_info`` is
+    Called once per while_loop nesting level, in outermost-first order,
+    after every level has been spliced (see splice_while_loops's own
+    docstring for why stamping is deferred this way): extends whatever
+    single CoarseTileInfo a strictly-outer level's own call already
+    stamped, never overwriting it. ``op.loop_info`` is
     ALWAYS a single ``CoarseTileInfo`` (never a list of them) -- confirmed
     against every other stamping site in the codebase (coarse_tile.py's own
     ``op.loop_info = dataclasses.replace(info, ...)``, padding.py,
@@ -1288,6 +1290,104 @@ def _stamp_direct_loop_info(
             )
 
 
+def _recordable_op_names(group_ops: list["ir.Operation"]) -> list[str]:
+    """Names group_ops will resolve to by the time every level is spliced.
+
+    A nested (not-yet-accepted-this-iteration) for_each_tile's own
+    ir.WhileLoop can still be sitting inside group_ops here, unspliced --
+    it only becomes visible to try_prove_for_each_tile on a LATER iteration
+    of splice_while_loops's `while True:` driver, once ITS nesting level
+    gets accepted and spliced in turn. Recording group_ops's own names
+    verbatim would therefore include this WhileLoop's name and its
+    MultiOutput children's names -- neither of which survive that later
+    splice_while_loop call, which replaces the WhileLoop wholesale with its
+    body_subgraph's own ops (under entirely different names) and drops the
+    WhileLoop's MultiOutput children from graph.operations outright (see
+    splice_while_loop's own docstring and its trailing graph.operations
+    filter). A name recorded for either would never resolve at stamp time.
+
+    But every op that a later splice of this nested WhileLoop will
+    eventually materialize -- including an accumulator-add op that does not
+    exist as a distinct object yet -- already has a fixed, predictable name:
+    while_op.body_subgraph.graph.operations is the body subgraph's own op
+    list, already carrying its final (fully-prefixed) names before its own
+    splice ever runs (confirmed empirically: a doubly-nested body's ops
+    already read as
+    "..._while_loop_body_graph_0_0_while_loop_body_graph_0_bufN" even before
+    the inner WhileLoop's own splice_while_loop call). So this level's
+    op_names must recurse into any nested ir.WhileLoop's own
+    body_subgraph.graph.operations (arbitrarily deep, for >2 nesting
+    levels) and record ITS names instead of the WhileLoop's own -- that is
+    what gives an op materialized only by a later, inner splice a chance to
+    receive this (outer) level's own stamped contribution too, which is the
+    entire point of deferring stamping in the first place. The WhileLoop's
+    own MultiOutput children (which never survive its splice either way)
+    are dropped with no replacement.
+
+    One more staleness gap this recursion must account for: a nested,
+    not-yet-spliced body's own operations snapshot (taken here, before that
+    body's OWN splice_while_loop/`_consume_tile_dim_markers` calls ever run)
+    still includes its own tile_dim_marker op(s) -- see `_marker_dim`. Most
+    of those are erased outright (not rebuilt under the same name, unlike a
+    marker's *consumer*, which _consume_tile_dim_markers rebuilds via
+    replace_computed_buffer_body and which therefore DOES keep a stable,
+    recordable name -- see splice_while_loops's own docstring) once that
+    nested level's own `_consume_tile_dim_markers` call actually runs, on a
+    LATER iteration of the `while True:` driver. A marker's name recorded
+    here would therefore usually never resolve at stamp time, so markers are
+    excluded from the RECURSED (still-nested, not-yet-consumed) branch the
+    same way the WhileLoop's own MultiOutput children are.
+
+    This exclusion must NOT apply to the top-level `group_ops` this function
+    is originally called with (as opposed to a nested body's operations,
+    reached only via the recursive call above): `splice_while_loops` always
+    calls `_consume_tile_dim_markers(group_ops, graph.operations)` for
+    THIS level's own group_ops before calling this function, so by the time
+    this function sees them, every one of this level's own markers has
+    already been resolved one of two ways (see MarkerResolution): a
+    ComputedBuffer-consumer marker is INLINE_ERASED and no longer present in
+    group_ops at all (nothing to exclude), but a StarDep-consumer marker
+    (e.g. one whose sole consumer is a still-nested inner WhileLoop's
+    carried input -- exactly the outer-M/inner-K shape this module exists
+    for) is deliberately kept materialized (STAR_DEP_KEPT) as a real,
+    addressable buffer that group_ops still legitimately contains and that
+    DOES need this level's own stamp -- excluding it here silently drops it
+    from `pending_levels`, leaving its `dim_hints`/`loop_info` unstamped and
+    producing a codegen-time "indirect symbol ... not found in
+    indirect_sizes" failure. So the marker check below only fires while
+    recursing into a still-nested WhileLoop's own body (`nested`), never at
+    this function's own top-level `group_ops`.
+    """
+    from torch._inductor import ir
+
+    def _walk(ops: list["ir.Operation"], nested: bool) -> list[str]:
+        names: list[str] = []
+        for op in ops:
+            if isinstance(op, ir.WhileLoop):
+                nested_ops = list(op.body_subgraph.graph.operations)
+                names.extend(_walk(nested_ops, nested=True))
+                continue
+            nested_inputs = getattr(op, "inputs", None) or ()
+            if any(isinstance(inp, ir.WhileLoop) for inp in nested_inputs):
+                # MultiOutput child of a still-nested WhileLoop; dropped by
+                # its later splice, not replaced -- see this function's
+                # docstring.
+                continue
+            if nested and _marker_dim(op) is not None:
+                # tile_dim_marker op belonging to a still-nested level;
+                # usually erased outright by that level's own (not yet run)
+                # marker consumption -- see this function's docstring. Not
+                # applied at the top level, where group_ops's own markers
+                # have already been resolved (INLINE_ERASED removed them
+                # already; STAR_DEP_KEPT ones are real ops that must still
+                # be recorded).
+                continue
+            names.append(op.get_name())
+        return names
+
+    return _walk(group_ops, nested=False)
+
+
 def splice_while_loops(graph) -> None:
     """CustomPreSchedulingPasses entry point: splice every for_each_tile WhileLoop.
 
@@ -1300,12 +1400,58 @@ def splice_while_loops(graph) -> None:
     docs/superpowers/specs/2026-09-17-while-loop-direct-loop-info-design.md
     for why: coarse_tile_pre_stickify's index-coefficient inference runs
     once per nesting level, blind to prior runs, and metadata goes stale
-    between them (the op23/buf7 bug). Stamping runs bottom-up (innermost
-    level first, matching splice order); each call extends -- never
-    overwrites -- whatever an inner level's own call already stamped, and
-    since the per-level list fields are documented outermost-first, each
-    new (outer) level's contribution is prepended onto the existing lists,
-    not appended (see _stamp_direct_loop_info's own docstring).
+    between them (the op23/buf7 bug).
+
+    Splicing itself runs outermost-first for a nested for_each_tile: the
+    outer WhileLoop is visible in graph.operations immediately, while an
+    inner WhileLoop only becomes visible once the outer splice flattens its
+    body in on a later iteration of the `while True:` loop below. But ALL
+    stamping is deferred to a single final phase, run only after every level
+    has been spliced -- i.e. after this function's own `while True:` driver
+    has exited. This is necessary, not merely convenient: an op materialized
+    only by an INNER level's splice (e.g. an accumulator-add whose write
+    buffer is a fresh per-outer-trip allocation) does not exist yet at the
+    time an outer level's splice iteration finishes, so stamping outer-first
+    per-iteration (the old structure) would call _stamp_direct_loop_info for
+    the outer level before that op exists -- it can never receive the outer
+    level's tiling contribution, silently corrupting its device-address
+    advance. Deferring every _stamp_direct_loop_info call to after the last
+    splice guarantees every op that will ever exist for this compile is
+    already present before any stamping happens.
+
+    Per-level ops are recorded by NAME (`op.get_name()`, via
+    `_recordable_op_names`), never by object reference:
+    `_consume_tile_dim_markers`, invoked here on a LATER splice iteration
+    for a different, still-nested level, can replace a ComputedBuffer
+    object in `graph.operations` via `pass_utils.replace_computed_buffer_body`
+    (see `_inline_marker_into_consumer` above), which mints a brand-new
+    object at the same list index under the SAME name. An object reference
+    collected on an earlier splice iteration would silently go stale by the
+    time the stamp phase runs; the name stays stable across such a rebuild
+    (the same convention `_consume_tile_dim_markers`'s own docstring
+    documents for its marker map). `_recordable_op_names` additionally
+    recurses into any still-nested (not yet accepted this iteration)
+    ir.WhileLoop found in group_ops, recording its body_subgraph's own
+    (already fixed, pre-splice) op names instead of the WhileLoop's own --
+    otherwise an op materialized only once THAT WhileLoop is itself spliced
+    on a later iteration (e.g. the accumulator-add) would never be recorded
+    for this (outer) level at all, since it does not exist as a distinct
+    object yet. See `_recordable_op_names`'s own docstring for why those
+    names are already fixed and predictable ahead of that later splice.
+
+    Stamping itself still proceeds level-0-first (outermost first) within
+    the single final phase, preserving the existing outermost-first
+    convention _stamp_direct_loop_info's own per-level list fields rely on
+    (see its docstring). _stamp_direct_loop_info itself is unchanged: each
+    call still PREPENDS its own contribution onto whatever an earlier call
+    already stamped for the same (now-resolved-by-name) op. Under this
+    function's new outermost-first CALL order, that means level 0's call
+    stamps first (existing=None, loop_group_id=(0,)), and a strictly-inner
+    level's later call resolves the SAME live object again by name and
+    prepends -- e.g. level 1 onto level 0 yields loop_group_id=(1, 0). See
+    _stamp_direct_loop_info's own docstring for why this prepend, not
+    append, is what keeps loop_group_id/loop_count/etc. consistent with
+    every consumer's outermost-first-at-index-0 assumption.
     """
     from torch._inductor import ir
 
@@ -1315,6 +1461,7 @@ def splice_while_loops(graph) -> None:
     )
 
     group_idx = 0
+    pending_levels: list[tuple[sympy.Symbol, sympy.Expr, int, list[str]]] = []
 
     while True:
         while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
@@ -1340,8 +1487,13 @@ def splice_while_loops(graph) -> None:
 
             _consume_tile_dim_markers(group_ops, graph.operations)
 
-            _stamp_direct_loop_info(
-                group_ops, while_op, loop_var, result.trip_count, group_idx
+            pending_levels.append(
+                (
+                    loop_var,
+                    result.trip_count,
+                    group_idx,
+                    _recordable_op_names(group_ops),
+                )
             )
 
             group_idx += 1
@@ -1350,3 +1502,16 @@ def splice_while_loops(graph) -> None:
         if not progressed:
             # Every remaining WhileLoop was declined; stop rather than loop forever.
             break
+
+    # Stamp phase: every level has been spliced, so every op that will ever
+    # exist for this compile is present in graph.operations now. Resolve each
+    # level's recorded names back to LIVE ir.Operation objects -- never the
+    # objects recorded during the splice phase above, which may have gone
+    # stale (see this function's own docstring) -- and stamp in level order
+    # (group_idx ascending, i.e. outermost first).
+    name_to_op = {op.get_name(): op for op in graph.operations}
+    for loop_var, trip_count, level_group_idx, op_names in pending_levels:
+        resolved_ops = [name_to_op[name] for name in op_names]
+        _stamp_direct_loop_info(
+            resolved_ops, None, loop_var, trip_count, level_group_idx
+        )
