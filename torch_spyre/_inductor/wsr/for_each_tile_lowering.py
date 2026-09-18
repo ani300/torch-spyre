@@ -1199,7 +1199,25 @@ def _stamp_direct_loop_info(
     Called once per while_loop nesting level, innermost first (splice
     order): appends onto whatever loop_info a strictly-inner level's own
     call already stamped, never overwriting it.
+
+    tiled_dims_per_read/output_tiled_dims are filled from
+    ``op.get_read_writes()`` ground truth: a dep advances at this level iff
+    its own index has a nonzero coefficient on loop_var, in which case its
+    extent for this (single) level is simply trip_count -- no multi-level
+    extent composition is needed here, since each call only ever stamps one
+    level's own CoarseTileInfo (see the module-level per-level
+    append-not-overwrite convention above). Both fields carry one extra
+    list layer of nesting beyond loop_tiled_dims's own ``[loop_tiled_dims]``
+    wrapping (see CoarseTileInfo's field types in loop_info.py:
+    tiled_dims_per_read is list[per_read][per_level][pair],
+    output_tiled_dims is list[per_level][pair]) -- each per-read entry is
+    wrapped as a 1-element per-level list the same way loop_tiled_dims
+    itself is, not passed as a bare per-level list. squeezed_advance_per_read/
+    squeezed_advance_output are left at their [] defaults -- Task 5's
+    concern, not this one's.
     """
+    from torch._inductor.dependencies import MemoryDep
+
     from torch_spyre._inductor.loop_info import CoarseTileInfo
 
     loop_group_id = (group_idx,)
@@ -1211,18 +1229,42 @@ def _stamp_direct_loop_info(
         resolved = lookup_marker_dim(op, loop_var)
         loop_tiled_dims: list[int] = []
         loop_tiled_reduction_dims: list[int] = []
+        resolved_pos: int | None = None
         if resolved is not None:
             ranges_pos, is_reduction = resolved
+            resolved_pos = ranges_pos
             if is_reduction:
                 loop_tiled_reduction_dims.append(ranges_pos)
             else:
                 loop_tiled_dims.append(ranges_pos)
+
+        rw = op.get_read_writes()
+        # StarDep has no .index (raises NotImplementedError, not
+        # AttributeError, so hasattr(dep, "index") is not a safe filter
+        # here) -- isinstance against MemoryDep is the correct guard, same
+        # as lookup_marker_dim's own filtering above.
+        reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
+        tiled_dims_per_read: list[list[list[tuple[int, sympy.Expr]]]] = []
+        for dep in reads:
+            per_level: list[tuple[int, sympy.Expr]] = []
+            if resolved_pos is not None and dep.index.coeff(loop_var) != 0:
+                per_level.append((resolved_pos, trip_count))
+            tiled_dims_per_read.append([per_level])
+
+        output_tiled_dims_level: list[tuple[int, sympy.Expr]] = []
+        writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
+        if writes:
+            write_dep = writes[0]
+            if resolved_pos is not None and write_dep.index.coeff(loop_var) != 0:
+                output_tiled_dims_level.append((resolved_pos, trip_count))
 
         info = CoarseTileInfo(
             loop_group_id=loop_group_id,
             loop_count=loop_count,
             loop_tiled_dims=[loop_tiled_dims],
             loop_tiled_reduction_dims=[loop_tiled_reduction_dims],
+            tiled_dims_per_read=tiled_dims_per_read,
+            output_tiled_dims=[output_tiled_dims_level],
         )
         op.loop_info = [*existing, info]
 

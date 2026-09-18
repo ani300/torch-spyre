@@ -2417,6 +2417,118 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             "no op in split_m_elementwise_fn's body has a marker-resolved tiled dim",
         )
 
+    def test_tiled_dims_per_read_has_one_entry_per_read_dep(self):
+        """tiled_dims_per_read/output_tiled_dims match op.get_read_writes().
+
+        Deviates from the brief's literal snippet in two ways, both
+        verified empirically against the real fixture/API before writing
+        this test (see task-4-report.md):
+
+        1. Fixture: split_m_fn's own tile-marker consumer (`x_tile @
+           y_whole`) is a StarDep-shaped ExternKernelOut consumer -- same
+           reason test_marker_resolved_dim_appears_in_loop_tiled_dims
+           (Task 3) switched to split_m_elementwise_fn. Reused here rather
+           than reintroducing split_m_fn's dead end.
+        2. Read-dep filter: the brief's snippet filters reads/writes with
+           `hasattr(d, "index")`, but StarDep.index is a property that
+           raises NotImplementedError (not AttributeError) when accessed
+           -- hasattr() only swallows AttributeError in Python 3, so that
+           filter crashes on any op with a StarDep read/write (confirmed
+           via a throwaway probe against this exact fixture, e.g. the
+           ExternKernelOut matmul op and every AssertScalar/DynamicScalar
+           op in the spliced group). isinstance(dep, MemoryDep) is the
+           correct filter and is what the real implementation uses too.
+        """
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from tests.inductor.for_each_tile_fixtures import split_m_elementwise_fn
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _stamp_direct_loop_info,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        X = torch.randn(128, 12)
+        Y = torch.randn(12, 6)
+        graph = self._run_graph(split_m_elementwise_fn, (X, Y))
+
+        while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertEqual(len(while_ops), 1)
+        while_op = while_ops[0]
+
+        result = try_prove_for_each_tile(while_op)
+        self.assertTrue(result.accepted, result.reason)
+        loop_var = _body_loop_var(while_op)
+        self.assertIsNotNone(loop_var)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(while_op)
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=result.trip_count
+            )
+            _consume_tile_dim_markers(group_ops, graph.operations)
+
+            _stamp_direct_loop_info(
+                group_ops, while_op, loop_var, result.trip_count, group_idx=0
+            )
+
+            # op.get_read_writes() needs the live GraphLowering (V.graph)
+            # context, same as the stamping call above -- stays inside the
+            # `with` block rather than reading loop_info alone afterward.
+            saw_advancing_read = False
+            for op in group_ops:
+                if not getattr(op, "loop_info", None):
+                    continue
+                info = op.loop_info[-1]
+                rw = op.get_read_writes()
+                reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
+                self.assertEqual(
+                    len(info.tiled_dims_per_read),
+                    len(reads),
+                    f"{op.get_name()}: tiled_dims_per_read entry count must "
+                    "match the op's own read-dep count",
+                )
+                # Each per-read entry carries one list per nesting level
+                # (parallel to loop_tiled_dims's own [loop_tiled_dims]
+                # wrapping) -- this function only ever stamps one level, so
+                # entry[-1] is that level's (pos, extent) list.
+                for dep, per_read_levels in zip(reads, info.tiled_dims_per_read):
+                    per_level = per_read_levels[-1]
+                    if dep.index.coeff(loop_var) != 0:
+                        self.assertEqual(
+                            per_level,
+                            [(info.loop_tiled_dims[-1][0], result.trip_count)],
+                            f"{op.get_name()}: advancing read must carry "
+                            "(resolved_pos, trip_count)",
+                        )
+                        saw_advancing_read = True
+                    else:
+                        self.assertEqual(
+                            per_level,
+                            [],
+                            f"{op.get_name()}: non-advancing read must stay empty",
+                        )
+
+                writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
+                if writes and writes[0].index.coeff(loop_var) == 0:
+                    self.assertEqual(
+                        info.output_tiled_dims[-1],
+                        [],
+                        f"{op.get_name()}: non-advancing write must stay empty",
+                    )
+
+        self.assertTrue(
+            saw_advancing_read,
+            "no op in split_m_elementwise_fn's body has a loop_var-advancing "
+            "read -- test would pass vacuously",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
