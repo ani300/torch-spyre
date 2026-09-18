@@ -1140,9 +1140,14 @@ def _stamp_direct_loop_info(
     (loop_group_id/loop_count/loop_tiled_dims/loop_tiled_reduction_dims/
     tiled_dims_per_read's and output_tiled_dims's per-level entries) already
     encode every nesting level inside ONE object -- outermost first, per
-    loop_info.py's docstring -- so a second (outer) call must EXTEND those
-    lists on top of an inner call's already-stamped object, not wrap the
-    whole object in a new outer list.
+    loop_info.py's docstring. Since this function is called innermost
+    level first, a second (outer) call must PREPEND its own level's
+    contribution onto the front of an inner call's already-stamped lists
+    (not append onto the end, and not wrap the whole object in a new outer
+    list) -- otherwise levels end up ordered innermost-first, the reverse
+    of every consumer's assumption (scheduler.py's and coarse_tile.py's
+    reliance on loop_group_id[0] being the outermost level, in
+    particular).
 
     tiled_dims_per_read/output_tiled_dims are filled from
     ``op.get_read_writes()`` ground truth: a dep advances at this level iff
@@ -1239,12 +1244,20 @@ def _stamp_direct_loop_info(
                 output_tiled_dims=[output_tiled_dims_level],
             )
         else:
+            # Stamping runs innermost-first (splice order), but every
+            # per-level list field's documented convention is
+            # outermost-first (loop_info.py's own docstring; the design
+            # spec; scheduler.py's and coarse_tile.py's reliance on
+            # loop_group_id[0] being the outermost level). So this call's
+            # (outer) contribution must be PREPENDED onto whatever an
+            # inner call already stamped, not appended -- appending would
+            # put levels in innermost-first order, the wrong way round.
             merged_tiled_dims_per_read = list(existing.tiled_dims_per_read)
             if merged_tiled_dims_per_read and len(merged_tiled_dims_per_read) == len(
                 new_tiled_dims_per_read
             ):
                 merged_tiled_dims_per_read = [
-                    [*prior_levels, new_level]
+                    [new_level, *prior_levels]
                     for prior_levels, new_level in zip(
                         merged_tiled_dims_per_read, new_tiled_dims_per_read
                     )
@@ -1260,17 +1273,17 @@ def _stamp_direct_loop_info(
 
             op.loop_info = dataclasses.replace(
                 existing,
-                loop_group_id=(*existing.loop_group_id, group_idx),
-                loop_count=[*existing.loop_count, trip_count],
-                loop_tiled_dims=[*existing.loop_tiled_dims, loop_tiled_dims],
+                loop_group_id=(group_idx, *existing.loop_group_id),
+                loop_count=[trip_count, *existing.loop_count],
+                loop_tiled_dims=[loop_tiled_dims, *existing.loop_tiled_dims],
                 loop_tiled_reduction_dims=[
-                    *existing.loop_tiled_reduction_dims,
                     loop_tiled_reduction_dims,
+                    *existing.loop_tiled_reduction_dims,
                 ],
                 tiled_dims_per_read=merged_tiled_dims_per_read,
                 output_tiled_dims=[
-                    *existing.output_tiled_dims,
                     output_tiled_dims_level,
+                    *existing.output_tiled_dims,
                 ],
             )
 
@@ -1288,8 +1301,11 @@ def splice_while_loops(graph) -> None:
     for why: coarse_tile_pre_stickify's index-coefficient inference runs
     once per nesting level, blind to prior runs, and metadata goes stale
     between them (the op23/buf7 bug). Stamping runs bottom-up (innermost
-    level first, matching splice order), appending onto -- never
-    overwriting -- whatever an inner level's own call already stamped.
+    level first, matching splice order); each call extends -- never
+    overwrites -- whatever an inner level's own call already stamped, and
+    since the per-level list fields are documented outermost-first, each
+    new (outer) level's contribution is prepended onto the existing lists,
+    not appended (see _stamp_direct_loop_info's own docstring).
     """
     from torch._inductor import ir
 

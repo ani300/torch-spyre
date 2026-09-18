@@ -2362,6 +2362,124 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             "no op in split_m_elementwise_fn's body has a marker-resolved tiled dim",
         )
 
+    def test_nested_outer_call_prepends_never_appends(self):
+        """A second (outer) call's contribution is ordered before an
+        inner call's, matching every consumer's outermost-first convention.
+
+        No fixture currently in for_each_tile_fixtures.py causes the same
+        op to be visited by two levels' _stamp_direct_loop_info calls --
+        confirmed empirically by instrumenting real splice_while_loop/
+        _stamp_direct_loop_info calls against both nested_split_m_then_k_fn
+        and triple_nested_stardep_multilevel_fn (every group_ops set the
+        real pipeline produces across nesting levels is pairwise disjoint
+        for every fixture in the file today). So this test drives
+        _stamp_direct_loop_info directly, twice, against one single-level
+        fixture's already-spliced group_ops -- simulating an inner call
+        (group_idx=0, the real call) followed by a second, synthetic outer
+        call (group_idx=1, a different loop_var/trip_count) on the exact
+        same ops, the same shape of input the real bottom-up splice order
+        would hand it for a two-level nest where one op survives into both
+        levels' group_ops (see the design spec's op23/buf7 worked example,
+        Sec4.3: an accumulator carry op is exactly the case where this
+        happens for real, once _rewire_accumulator_output's rewiring
+        target op persists across both splices).
+
+        Order-sensitive: asserts loop_group_id == (outer_idx, inner_idx),
+        not just length/presence -- length/presence alone would pass under
+        the pre-fix append-only bug just as easily as under the fix.
+        """
+        import sympy
+        from torch._inductor import ir
+
+        from tests.inductor.for_each_tile_fixtures import matmul_inputs, split_k_fn
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _stamp_direct_loop_info,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        (X, Y), _ref = matmul_inputs()
+        graph = self._run_graph(split_k_fn, (X, Y))
+
+        while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertEqual(len(while_ops), 1)
+        while_op = while_ops[0]
+
+        result = try_prove_for_each_tile(while_op)
+        self.assertTrue(result.accepted, result.reason)
+        inner_loop_var = _body_loop_var(while_op)
+        self.assertIsNotNone(inner_loop_var)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(while_op)
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=result.trip_count
+            )
+
+            # Inner-level call first (real splice order: innermost first).
+            inner_trip_count = result.trip_count
+            _stamp_direct_loop_info(
+                group_ops, while_op, inner_loop_var, inner_trip_count, group_idx=0
+            )
+
+            stamped_before = {
+                op.get_name(): op.loop_info
+                for op in group_ops
+                if getattr(op, "loop_info", None)
+            }
+            self.assertTrue(stamped_before, "inner call stamped no op")
+
+            # Synthetic outer-level call second, on the SAME group_ops --
+            # simulating the op23/buf7 case where an op survives into a
+            # second (outer) level's own _stamp_direct_loop_info call.
+            # Distinct loop_var/trip_count so a positional mix-up between
+            # the two levels' contributions would be visible.
+            outer_loop_var = sympy.Symbol("u_outer_synthetic")
+            outer_trip_count = sympy.Integer(7)
+            _stamp_direct_loop_info(
+                group_ops, while_op, outer_loop_var, outer_trip_count, group_idx=1
+            )
+
+            multi_stamped = [
+                op
+                for op in group_ops
+                if op.get_name() in stamped_before
+                and getattr(op, "loop_info", None) is not None
+            ]
+            self.assertTrue(multi_stamped, "no op received a second stamp")
+
+            for op in multi_stamped:
+                info = op.loop_info
+                # Outermost first: the second (outer, group_idx=1) call's
+                # contribution must come BEFORE the first (inner,
+                # group_idx=0) call's -- i.e. (1, 0), not (0, 1).
+                self.assertEqual(
+                    info.loop_group_id,
+                    (1, 0),
+                    f"{op.get_name()}: loop_group_id must be outermost-first "
+                    "(outer call's group_idx before inner's), got "
+                    f"{info.loop_group_id}",
+                )
+                self.assertEqual(
+                    info.loop_count,
+                    [outer_trip_count, inner_trip_count],
+                    f"{op.get_name()}: loop_count must be outermost-first",
+                )
+                self.assertEqual(len(info.loop_tiled_dims), 2)
+                self.assertEqual(len(info.loop_tiled_reduction_dims), 2)
+                self.assertEqual(len(info.output_tiled_dims), 2)
+                for per_read_levels in info.tiled_dims_per_read:
+                    self.assertEqual(
+                        len(per_read_levels),
+                        2,
+                        f"{op.get_name()}: tiled_dims_per_read entries must "
+                        "carry one item per level after two stamps",
+                    )
+
     def test_tiled_dims_per_read_has_one_entry_per_read_dep(self):
         """tiled_dims_per_read/output_tiled_dims match op.get_read_writes().
 
