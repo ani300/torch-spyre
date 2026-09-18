@@ -17,9 +17,10 @@
 Recognizes the exact WhileLoop shape torch-spyre#4136's for_each_tile
 frontend (via decompose_scan_to_while_loop) produces, derives a provable
 trip count, and -- once accepted -- hands off to the generic bridge
-(while_loop_bridge.py) plus DimHint synthesis to actually splice and
-coarse-tile the body. This module owns every for_each_tile-specific
-assumption; while_loop_bridge.py knows none of them.
+(while_loop_bridge.py) to splice the body, then directly constructs and
+stamps CoarseTileInfo from ground truth (see _stamp_direct_loop_info).
+This module owns every for_each_tile-specific assumption;
+while_loop_bridge.py knows none of them.
 
 Real cond-graph shape (confirmed empirically against a live compiled graph
 for both split_m_fn (map mode) and split_k_fn (carry mode) -- see the task-4
@@ -200,16 +201,16 @@ def _body_loop_var(while_op: "ir.WhileLoop") -> sympy.Symbol | None:
     written in terms of that symbol -- confirmed against a live compiled
     graph for both split_m_fn (map mode) and split_k_fn (carry mode).
 
-    _synthesize_dim_hints_for_group's DimHint.loop_var must be exactly this
-    symbol: coarse_tile.py's _loop_var_to_ranges_pos/
-    _loop_var_to_reduction_ranges_pos resolve loop_var by searching for it
-    inside an op's own index expressions (via op_out_coords/
-    reduction_loop_vars), so a freshly-minted, disconnected sympy.Symbol
-    would never resolve and every op would land with empty tiled dims.
+    _stamp_direct_loop_info's loop_var parameter must be exactly this
+    symbol: lookup_marker_dim/coarse_tile.py's op_out_coords/
+    reduction_loop_vars resolve loop_var by searching for it inside an
+    op's own index expressions, so a freshly-minted, disconnected
+    sympy.Symbol would never resolve and every op would land with empty
+    tiled dims.
 
     Returns None if the body subgraph does not have this exact shape (no
     DynamicScalar reading the first placeholder), signaling the caller to
-    decline rather than synthesize a hint nothing will ever match.
+    decline rather than stamp loop_info nothing will ever resolve against.
     """
     from torch._inductor import ir
 
@@ -237,8 +238,6 @@ def _body_loop_var(while_op: "ir.WhileLoop") -> sympy.Symbol | None:
             return next(iter(defs))
     return None
 
-
-_next_synthetic_hint_id_start = 1 << 30  # reserved range, well above real hint scopes
 
 _MARKER_MAPS: dict[int, dict[tuple[str, "Dep"], int]] = {}
 """Per-compile marker-map registry, keyed by id(operations).
@@ -275,75 +274,6 @@ def clear_marker_maps() -> None:
     both entries stored the same dim, which is not a general guarantee.
     """
     _MARKER_MAPS.clear()
-
-
-def _synthesize_dim_hints_for_group(
-    group_ops: list["ir.Operation"],
-    loop_var: sympy.Symbol,
-    hint_id: int,
-    trip_count: sympy.Expr,
-) -> None:
-    """Stamp one synthesized DimHint per op in group_ops for this while-loop level.
-
-    loop_var is this level's own induction variable -- there is exactly one
-    per nesting level, unlike a user spyre_hint() scope which can cover many
-    ops arbitrarily.
-
-    ``is_reduction`` here is ADVISORY ONLY, unlike on an ordinary
-    ``spyre_hint()`` DimHint where it selects the lookup channel. One
-    synthesized hint covers the whole level, so it cannot say, per op,
-    whether the level lands on an output dim or a reduction dim OF THAT OP --
-    and the two fixtures disagree for structurally identical ``aten.mm``
-    bodies: ``split_m_fn``'s matmul reduces over K but the loop tiles M (an
-    output dim), while ``split_k_fn``'s reduces over K and the loop tiles K
-    itself. ``coarse_tile.py``'s ``_hint_ranges_pos`` therefore resolves the
-    channel per op from where ``loop_var`` actually appears, and ignores this
-    field for a WhileLoop-splice hint (identified by ``loop_var_range`` being
-    non-None). It is still populated from ``reduction_type`` so the hint
-    reads sensibly in logs and so any future consumer that keys off it sees
-    the op's own reduction-ness rather than a hard-coded False.
-
-    Which dim is tiled, and whether an op is tiled at all, likewise come from
-    that resolution: an op that never mentions loop_var simply gets no tiled
-    dim recorded for this hint_id, which is the correct outcome for ops that
-    are loop-invariant at this level (e.g. an INVARIANT operand's own read).
-
-    loop_var must be the real per-iteration index symbol already present in
-    the spliced body's own index expressions (see _body_loop_var) -- not a
-    freshly-minted, disconnected sympy.Symbol, for the same reason.
-    """
-    from torch_spyre._inductor.propagate_hints import DimHint
-
-    for op in group_ops:
-        if not hasattr(op, "data"):
-            continue
-        if _marker_resolution(op) is MarkerResolution.INLINE_ERASED:
-            # An inline-erased tile_dim_marker op is gone from operations
-            # by the time this runs -- if group_ops still holds a stale
-            # reference to it (should not happen post-consumption, but
-            # guard defensively), it is not itself a for_each_tile tile
-            # read: it IS the marker, already fused into its consumer's
-            # inner_fn, with nothing left to hint.
-            #
-            # A STAR_DEP_KEPT marker, by contrast, is still a live member
-            # of group_ops and its own upstream read still carries a real
-            # per-iteration offset -- the next nesting level up needs a
-            # synthesized hint for it to resolve provenance through
-            # lookup_marker_dim/_hint_ranges_pos (issue #4581: the old
-            # guard, `_marker_dim(op) is not None`, skipped BOTH marker
-            # kinds here, silently starving this exact case of a hint).
-            continue
-        existing = list(getattr(op, "dim_hints", []) or [])
-        is_reduction = getattr(op.data, "reduction_type", None) is not None
-        hint = DimHint(
-            dim_names=[f"_while_loop_{hint_id}"],
-            split_count=1,  # per-level count; coarse_tile derives real counts from `levels`
-            loop_var=loop_var,
-            is_reduction=is_reduction,
-            hint_id=hint_id,
-            loop_var_range=trip_count,
-        )
-        op.dim_hints = [*existing, hint]
 
 
 def _stacking_carry_indices(
@@ -1186,7 +1116,7 @@ def _stamp_direct_loop_info(
     trip_count: sympy.Expr,
     group_idx: int,
 ) -> None:
-    """Directly construct and append one CoarseTileInfo level per op.
+    """Directly construct and stamp one CoarseTileInfo level per op.
 
     Ground truth only -- trip count from try_prove_for_each_tile, loop_var
     from _body_loop_var, per-op tiled-dim resolution from
@@ -1197,34 +1127,73 @@ def _stamp_direct_loop_info(
     1/2/3, which while_loop groups skip entirely).
 
     Called once per while_loop nesting level, innermost first (splice
-    order): appends onto whatever loop_info a strictly-inner level's own
-    call already stamped, never overwriting it.
+    order): extends whatever single CoarseTileInfo a strictly-inner level's
+    own call already stamped, never overwriting it. ``op.loop_info`` is
+    ALWAYS a single ``CoarseTileInfo`` (never a list of them) -- confirmed
+    against every other stamping site in the codebase (coarse_tile.py's own
+    ``op.loop_info = dataclasses.replace(info, ...)``, padding.py,
+    read_copy_elision.py, insert_restickify.py, and
+    work_division_constraints.py's own reader, which does
+    ``for level_dims in loop_info.loop_tiled_dims`` directly against
+    ``ctx.op.loop_info`` with no list-of-CoarseTileInfo indirection
+    anywhere). ``CoarseTileInfo``'s own per-level list fields
+    (loop_group_id/loop_count/loop_tiled_dims/loop_tiled_reduction_dims/
+    tiled_dims_per_read's and output_tiled_dims's per-level entries) already
+    encode every nesting level inside ONE object -- outermost first, per
+    loop_info.py's docstring -- so a second (outer) call must EXTEND those
+    lists on top of an inner call's already-stamped object, not wrap the
+    whole object in a new outer list.
 
     tiled_dims_per_read/output_tiled_dims are filled from
     ``op.get_read_writes()`` ground truth: a dep advances at this level iff
     its own index has a nonzero coefficient on loop_var, in which case its
     extent for this (single) level is simply trip_count -- no multi-level
-    extent composition is needed here, since each call only ever stamps one
-    level's own CoarseTileInfo (see the module-level per-level
-    append-not-overwrite convention above). Both fields carry one extra
-    list layer of nesting beyond loop_tiled_dims's own ``[loop_tiled_dims]``
-    wrapping (see CoarseTileInfo's field types in loop_info.py:
-    tiled_dims_per_read is list[per_read][per_level][pair],
-    output_tiled_dims is list[per_level][pair]) -- each per-read entry is
-    wrapped as a 1-element per-level list the same way loop_tiled_dims
-    itself is, not passed as a bare per-level list. squeezed_advance_per_read/
+    extent composition is needed here, since each call only ever computes
+    one new level's contribution before appending it onto any existing
+    per-read entries. ``op.get_read_writes()`` returns reads in the same
+    order regardless of which level's call invokes it (it is a pure
+    function of the op's own current IR, not of loop_info), so appending
+    this level's per-read entry at the same read-index an inner call already
+    populated is positionally safe. squeezed_advance_per_read/
     squeezed_advance_output are left at their [] defaults -- Task 5's
     concern, not this one's.
+
+    Also appends a minimal ``DimHint(loop_var=loop_var,
+    loop_var_range=trip_count)`` onto ``op.dim_hints``. This is NOT a
+    revival of ``_synthesize_dim_hints_for_group`` (no hint_id minting, no
+    is_reduction/dim_names/split_count advisory content -- those fields are
+    left at their dataclass defaults and unread by any consumer on this
+    path). It exists only to keep ``loop_var_ranges_from_dim_hints`` (see
+    pass_utils.py) working: that helper -- and its callers
+    ``op_out_coords`` and ``_build_indirect_store_subs`` -- reads
+    ``{h.loop_var: h.loop_var_range for h in op.dim_hints}`` to recognize a
+    WhileLoop-splice loop_var that is deliberately not a ``dep.ranges`` key.
+    Without this, ``_build_indirect_store_subs`` misclassifies loop_var as
+    a runtime scatter-row symbol (its only signal is "not a loop range
+    key"), which crashed as "indirect symbol not found in indirect_sizes
+    {}" once this function stopped populating dim_hints. See
+    _build_indirect_store_subs's own docstring for the identical bug this
+    once already fixed for the old mechanism.
     """
     from torch._inductor.dependencies import MemoryDep
 
     from torch_spyre._inductor.loop_info import CoarseTileInfo
-
-    loop_group_id = (group_idx,)
-    loop_count = [trip_count]
+    from torch_spyre._inductor.propagate_hints import DimHint
 
     for op in group_ops:
-        existing = getattr(op, "loop_info", None) or []
+        existing: CoarseTileInfo | None = getattr(op, "loop_info", None)
+
+        prior_hints = list(getattr(op, "dim_hints", None) or [])
+        op.dim_hints = [
+            *prior_hints,
+            DimHint(
+                dim_names=[],
+                split_count=1,
+                loop_var=loop_var,
+                is_reduction=False,
+                loop_var_range=trip_count,
+            ),
+        ]
 
         resolved = lookup_marker_dim(op, loop_var)
         loop_tiled_dims: list[int] = []
@@ -1244,12 +1213,12 @@ def _stamp_direct_loop_info(
         # here) -- isinstance against MemoryDep is the correct guard, same
         # as lookup_marker_dim's own filtering above.
         reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
-        tiled_dims_per_read: list[list[list[tuple[int, sympy.Expr]]]] = []
+        new_tiled_dims_per_read: list[list[tuple[int, sympy.Expr]]] = []
         for dep in reads:
             per_level: list[tuple[int, sympy.Expr]] = []
             if resolved_pos is not None and dep.index.coeff(loop_var) != 0:
                 per_level.append((resolved_pos, trip_count))
-            tiled_dims_per_read.append([per_level])
+            new_tiled_dims_per_read.append(per_level)
 
         output_tiled_dims_level: list[tuple[int, sympy.Expr]] = []
         writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
@@ -1258,15 +1227,52 @@ def _stamp_direct_loop_info(
             if resolved_pos is not None and write_dep.index.coeff(loop_var) != 0:
                 output_tiled_dims_level.append((resolved_pos, trip_count))
 
-        info = CoarseTileInfo(
-            loop_group_id=loop_group_id,
-            loop_count=loop_count,
-            loop_tiled_dims=[loop_tiled_dims],
-            loop_tiled_reduction_dims=[loop_tiled_reduction_dims],
-            tiled_dims_per_read=tiled_dims_per_read,
-            output_tiled_dims=[output_tiled_dims_level],
-        )
-        op.loop_info = [*existing, info]
+        if existing is None:
+            op.loop_info = CoarseTileInfo(
+                loop_group_id=(group_idx,),
+                loop_count=[trip_count],
+                loop_tiled_dims=[loop_tiled_dims],
+                loop_tiled_reduction_dims=[loop_tiled_reduction_dims],
+                tiled_dims_per_read=[
+                    [per_read] for per_read in new_tiled_dims_per_read
+                ],
+                output_tiled_dims=[output_tiled_dims_level],
+            )
+        else:
+            merged_tiled_dims_per_read = list(existing.tiled_dims_per_read)
+            if merged_tiled_dims_per_read and len(merged_tiled_dims_per_read) == len(
+                new_tiled_dims_per_read
+            ):
+                merged_tiled_dims_per_read = [
+                    [*prior_levels, new_level]
+                    for prior_levels, new_level in zip(
+                        merged_tiled_dims_per_read, new_tiled_dims_per_read
+                    )
+                ]
+            else:
+                # Read shape changed between levels (should not happen for
+                # the same op, but guard rather than silently misalign
+                # positionally) -- fall back to this level's own reads with
+                # no prior-level history rather than raising.
+                merged_tiled_dims_per_read = [
+                    [per_read] for per_read in new_tiled_dims_per_read
+                ]
+
+            op.loop_info = dataclasses.replace(
+                existing,
+                loop_group_id=(*existing.loop_group_id, group_idx),
+                loop_count=[*existing.loop_count, trip_count],
+                loop_tiled_dims=[*existing.loop_tiled_dims, loop_tiled_dims],
+                loop_tiled_reduction_dims=[
+                    *existing.loop_tiled_reduction_dims,
+                    loop_tiled_reduction_dims,
+                ],
+                tiled_dims_per_read=merged_tiled_dims_per_read,
+                output_tiled_dims=[
+                    *existing.output_tiled_dims,
+                    output_tiled_dims_level,
+                ],
+            )
 
 
 def splice_while_loops(graph) -> None:
@@ -1274,20 +1280,24 @@ def splice_while_loops(graph) -> None:
 
     Runs to a fixed point (handles nested for_each_tile, whose inner
     WhileLoop only appears after the outer one's body has been spliced in).
-    Calls coarse_tile_pre_stickify immediately per accepted group -- before
-    propagate_named_dims/assign_dim_hints ever run for this compile -- since
-    those overwrite op.dim_hints from scratch and would otherwise silently
-    clobber the synthesized hints this function just stamped.
+    Directly constructs and stamps CoarseTileInfo per accepted group from
+    ground truth (trip count, loop var, tile_dim_marker resolution, carry
+    roles) via _stamp_direct_loop_info -- never hands the group to
+    coarse_tile_pre_stickify for re-inference. See
+    docs/superpowers/specs/2026-09-17-while-loop-direct-loop-info-design.md
+    for why: coarse_tile_pre_stickify's index-coefficient inference runs
+    once per nesting level, blind to prior runs, and metadata goes stale
+    between them (the op23/buf7 bug). Stamping runs bottom-up (innermost
+    level first, matching splice order), appending onto -- never
+    overwriting -- whatever an inner level's own call already stamped.
     """
     from torch._inductor import ir
 
-    from torch_spyre._inductor.wsr.coarse_tile import coarse_tile_pre_stickify
     from torch_spyre._inductor.wsr.while_loop_bridge import (
         carry_bindings_for,
         splice_while_loop,
     )
 
-    hint_id = _next_synthetic_hint_id_start
     group_idx = 0
 
     while True:
@@ -1314,17 +1324,11 @@ def splice_while_loops(graph) -> None:
 
             _consume_tile_dim_markers(group_ops, graph.operations)
 
-            _synthesize_dim_hints_for_group(
-                group_ops, loop_var, hint_id, result.trip_count
-            )
-
-            levels = [(hint_id, result.trip_count)]
-            coarse_tile_pre_stickify(
-                graph, groups=[(group_ops, levels)], group_idx_offset=group_idx
+            _stamp_direct_loop_info(
+                group_ops, while_op, loop_var, result.trip_count, group_idx
             )
 
             group_idx += 1
-            hint_id += 1
             progressed = True
 
         if not progressed:

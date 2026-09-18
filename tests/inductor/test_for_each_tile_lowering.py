@@ -527,7 +527,9 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 tiled_ops, "expected at least one op with loop_info stamped"
             )
             for op in tiled_ops:
-                self.assertTrue(op.dim_hints, f"{op} missing synthesized dim_hints")
+                info = op.loop_info
+                self.assertEqual(info.loop_group_id, (0,))
+                self.assertIsNone(info.propagation)
 
     def test_carry_mode_group_gets_loop_info(self):
         from torch._inductor import ir
@@ -553,7 +555,9 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 tiled_ops, "expected at least one op with loop_info stamped"
             )
             for op in tiled_ops:
-                self.assertTrue(op.dim_hints, f"{op} missing synthesized dim_hints")
+                info = op.loop_info
+                self.assertEqual(info.loop_group_id, (0,))
+                self.assertIsNone(info.propagation)
 
             records_by_name = {
                 op.get_name(): record
@@ -1569,65 +1573,6 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             "(pre-existing behavior, must not regress)",
         )
 
-    def test_synthesize_dim_hints_skips_only_inline_erased_markers(self):
-        """_synthesize_dim_hints_for_group's guard: skip INLINE_ERASED only.
-
-        Before this fix, the guard was `_marker_dim(op) is not None`, which
-        skips BOTH marker kinds -- silently dropping a hint for a
-        STAR_DEP_KEPT marker's own upstream read, exactly the issue #4581
-        gap. This test builds one op of each MarkerResolution kind (plus a
-        plain non-marker op as a control) and confirms only the
-        INLINE_ERASED one is skipped.
-        """
-        import sympy
-
-        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
-            MarkerResolution,
-            _synthesize_dim_hints_for_group,
-        )
-
-        loop_var = sympy.Symbol("d0")
-        trip_count = sympy.Integer(4)
-
-        def make_op(name, resolution):
-            op = mock.Mock(
-                name=name, spec=["data", "dim_hints", "tile_marker_resolution"]
-            )
-            op.data = mock.Mock(reduction_type=None)
-            op.dim_hints = []
-            op.tile_marker_resolution = resolution
-            return op
-
-        inline_erased_op = make_op("inline_erased_op", MarkerResolution.INLINE_ERASED)
-        stardep_kept_op = make_op("stardep_kept_op", MarkerResolution.STAR_DEP_KEPT)
-        plain_op = mock.Mock(name="plain_op", spec=["data", "dim_hints"])
-        plain_op.data = mock.Mock(reduction_type=None)
-        plain_op.dim_hints = []
-
-        _synthesize_dim_hints_for_group(
-            [inline_erased_op, stardep_kept_op, plain_op],
-            loop_var,
-            hint_id=0,
-            trip_count=trip_count,
-        )
-
-        self.assertEqual(
-            inline_erased_op.dim_hints,
-            [],
-            "INLINE_ERASED marker must still get no synthesized hint",
-        )
-        self.assertEqual(
-            len(stardep_kept_op.dim_hints),
-            1,
-            "STAR_DEP_KEPT marker must now get a synthesized hint (the "
-            "issue #4581 fix)",
-        )
-        self.assertEqual(
-            len(plain_op.dim_hints),
-            1,
-            "an ordinary non-marker op must still get a synthesized hint",
-        )
-
     def test_nested_for_each_tile_markers_resolve_correctly(self):
         """Two tile_dim_marker-tagged reads at two nesting levels resolve.
 
@@ -2346,7 +2291,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
         stamped = [op for op in group_ops if getattr(op, "loop_info", None)]
         self.assertTrue(stamped, "no op received a loop_info stamp")
         for op in stamped:
-            info = op.loop_info[-1]
+            info = op.loop_info
             self.assertEqual(info.loop_group_id, (0,))
             self.assertEqual(info.loop_count, [result.trip_count])
             self.assertIsNone(info.propagation)
@@ -2410,7 +2355,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
         tiled_ops = [
             op
             for op in group_ops
-            if getattr(op, "loop_info", None) and op.loop_info[-1].loop_tiled_dims[-1]
+            if getattr(op, "loop_info", None) and op.loop_info.loop_tiled_dims[-1]
         ]
         self.assertTrue(
             tiled_ops,
@@ -2485,7 +2430,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             for op in group_ops:
                 if not getattr(op, "loop_info", None):
                     continue
-                info = op.loop_info[-1]
+                info = op.loop_info
                 rw = op.get_read_writes()
                 reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
                 self.assertEqual(
