@@ -2274,7 +2274,8 @@ def _hint_ranges_pos(
 
     resolved = lookup_marker_dim(op, hint.loop_var)
     if resolved is not None:
-        return resolved
+        pos, is_reduction = resolved
+        return pos, is_reduction
 
     # No read resolved through the marker map. That is the CORRECT,
     # expected outcome for an op that is genuinely loop-invariant at this
