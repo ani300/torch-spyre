@@ -277,7 +277,9 @@ def clear_marker_maps() -> None:
 
 
 def _stacking_carry_indices(
-    while_op: "ir.WhileLoop", loop_var: sympy.Symbol
+    while_op: "ir.WhileLoop",
+    loop_var: sympy.Symbol,
+    trip_count: "sympy.Expr | int | None" = None,
 ) -> frozenset[int]:
     """Which carry positions are ``scan``-``ys`` stacking carries, not accumulators.
 
@@ -306,7 +308,18 @@ def _stacking_carry_indices(
     3. That write's per-iteration position depends on ``loop_var``: the
        target view's own offset mentions it. This is what makes it a stack
        of tiles rather than one whole-buffer overwrite, and it is the fact
-       the fold arithmetic relies on.
+       the fold arithmetic relies on. EXCEPT when ``trip_count == 1``: a
+       single-trip loop's write offset has only one possible value, so
+       Inductor's own symbolic simplification legitimately drops
+       ``loop_var`` from it entirely (confirmed empirically: a real
+       ``ys``-stacking carry at trip_count=1, e.g. an inner for_each_tile
+       whose tile_size spans a whole dimension, shows offset=0 rather than
+       an expression mentioning ``loop_var``). Treat that case as
+       satisfying evidence 3 too, rather than falling through to the
+       pass-through-leaf classification -- ``fold_stacked_carry_layout``
+       already documents and handles this same trip_count=1 degeneracy on
+       the fold-arithmetic side (its ``size[1] == 1`` branch), so detection
+       must recognize the same shape or the fold never runs at all.
 
     Requiring all three keeps every other carry shape -- accumulator,
     read-only pass-through leaf, scalar step counter -- on the pre-existing
@@ -318,6 +331,10 @@ def _stacking_carry_indices(
     body_graph = while_op.body_subgraph.graph
     placeholder_names = list(body_graph.graph_inputs.keys())
     body_outputs = body_graph.graph_outputs
+
+    single_trip = (
+        trip_count is not None and sympy.simplify(sympy.sympify(trip_count) - 1) == 0
+    )
 
     # Placeholders written in place, per iteration, at a loop_var-dependent
     # offset (evidence 2 + 3).
@@ -333,7 +350,7 @@ def _stacking_carry_indices(
         if target_layout is None:
             continue
         offset = sympy.sympify(getattr(target_layout, "offset", 0))
-        if loop_var not in offset.free_symbols:
+        if loop_var not in offset.free_symbols and not single_trip:
             continue
         name = getattr(layout.get_buffer(), "get_name", lambda: None)()
         if name is not None:
@@ -1200,10 +1217,13 @@ def _stamp_direct_loop_info(
     Sec4.2a for why: zero consumers outside coarse_tile.py's own Pass
     1/2/3, which while_loop groups skip entirely).
 
-    Called once per while_loop nesting level, innermost first (splice
-    order; see splice_while_loops's own docstring): extends whatever
-    single CoarseTileInfo a strictly-inner level's own call already
-    stamped, never overwriting it. ``op.loop_info`` is
+    Called once per while_loop nesting level, OUTERMOST first: splice_while_loops
+    defers every call to a final phase that iterates pending_levels in
+    splice-ACCEPTANCE order, and the outer while_loop is always accepted
+    (and appended to pending_levels) before a nested while_loop can even
+    become visible -- see splice_while_loops's own docstring. Each call
+    extends whatever single CoarseTileInfo a strictly-outer level's own
+    call already stamped, never overwriting it. ``op.loop_info`` is
     ALWAYS a single ``CoarseTileInfo`` (never a list of them) -- confirmed
     against every other stamping site in the codebase (coarse_tile.py's own
     ``op.loop_info = dataclasses.replace(info, ...)``, padding.py,
@@ -1215,16 +1235,19 @@ def _stamp_direct_loop_info(
     (loop_group_id/loop_count/loop_tiled_dims/loop_tiled_reduction_dims/
     tiled_dims_per_read's and output_tiled_dims's per-level entries) already
     encode every nesting level inside ONE object -- outermost first, per
-    loop_info.py's docstring. Since this function is called INNERMOST
+    loop_info.py's docstring. Since this function is called OUTERMOST
     level first, the first call for a given op sets its lists with that
-    inner level already at index 0 (existing=None branch below), and every
-    later, strictly-outer call must PREPEND its own level's contribution
-    onto the front of the already-stamped lists (not append onto the end,
-    and not wrap the whole object in a new outer list) -- appending here
-    would leave the inner call's own level at index 0, the reverse of
+    outer level already at index 0 (existing=None branch below), and every
+    later, strictly-inner call must APPEND its own level's contribution
+    onto the end of the already-stamped lists (not prepend onto the front,
+    and not wrap the whole object in a new outer list) -- prepending here
+    would shift the outer call's own level out of index 0, the reverse of
     every consumer's assumption (scheduler.py's and coarse_tile.py's
     reliance on loop_group_id[0] being the outermost level, in
-    particular).
+    particular; confirmed by a real bug this fixed, where an inner-nested
+    op's loop_group_id[0] disagreed with its outer siblings', splitting one
+    nested for_each_tile group into sibling, not nested,
+    CountedLoopSchedulerNodes -- see scheduler.py's _build_loop_group).
 
     tiled_dims_per_read/output_tiled_dims are filled from
     ``op.get_read_writes()`` ground truth: a dep advances at this level iff
@@ -1235,7 +1258,7 @@ def _stamp_direct_loop_info(
     per-read entries. ``op.get_read_writes()`` returns reads in the same
     order regardless of which level's call invokes it (it is a pure
     function of the op's own current IR, not of loop_info), so appending
-    this level's per-read entry at the same read-index an inner call already
+    this level's per-read entry at the same read-index an outer call already
     populated is positionally safe. squeezed_advance_per_read/
     squeezed_advance_output are left at their [] defaults -- Task 5's
     concern, not this one's.
@@ -1532,23 +1555,34 @@ def _stamp_direct_loop_info(
                 output_tiled_dims=[output_tiled_dims_level],
             )
         else:
-            # Stamping runs innermost-first (splice order; see
-            # splice_while_loops's own docstring), so the first call for a
-            # given op already put that inner level at index 0 (the
+            # Stamping actually runs outermost-first: splice_while_loops
+            # defers every _stamp_direct_loop_info call to a final phase
+            # that iterates pending_levels in splice-acceptance order, and
+            # the outer while_loop is always accepted (and so appended to
+            # pending_levels) before a nested while_loop can become visible
+            # (see splice_while_loops's own docstring: "the outer WhileLoop
+            # is visible in graph.operations immediately, while an inner
+            # WhileLoop only becomes visible once the outer splice flattens
+            # its body in"). So the FIRST call for a given op is the
+            # OUTERMOST level, and already correctly occupies index 0 (the
             # existing=None branch above). Every per-level list field's
             # documented convention is outermost-first (loop_info.py's own
-            # docstring; the design spec; scheduler.py's and
-            # coarse_tile.py's reliance on loop_group_id[0] being the
-            # outermost level), so this call's (strictly outer) contribution
-            # must be PREPENDED onto the front of what an inner call already
-            # stamped, not appended -- appending would leave the inner
-            # level at index 0, the wrong way round.
+            # docstring; the design spec; scheduler.py's and coarse_tile.py's
+            # reliance on loop_group_id[0] being the outermost level), so
+            # each later, strictly-inner call's own contribution must be
+            # APPENDED onto the end of what an outer call already stamped --
+            # prepending here would shift the outer level's own key out of
+            # index 0, making an inner-nested op's loop_group_id[0] disagree
+            # with its outer siblings' loop_group_id[0] and breaking
+            # scheduler.py's _build_loop_group grouping (confirmed: this
+            # produced sibling, not nested, CountedLoopSchedulerNodes for
+            # test_nested_add_outer_row_inner_col_multi_stick).
             merged_tiled_dims_per_read = list(existing.tiled_dims_per_read)
             if merged_tiled_dims_per_read and len(merged_tiled_dims_per_read) == len(
                 new_tiled_dims_per_read
             ):
                 merged_tiled_dims_per_read = [
-                    [new_level, *prior_levels]
+                    [*prior_levels, new_level]
                     for prior_levels, new_level in zip(
                         merged_tiled_dims_per_read, new_tiled_dims_per_read
                     )
@@ -1564,17 +1598,17 @@ def _stamp_direct_loop_info(
 
             op.loop_info = dataclasses.replace(
                 existing,
-                loop_group_id=(group_idx, *existing.loop_group_id),
-                loop_count=[trip_count, *existing.loop_count],
-                loop_tiled_dims=[loop_tiled_dims, *existing.loop_tiled_dims],
+                loop_group_id=(*existing.loop_group_id, group_idx),
+                loop_count=[*existing.loop_count, trip_count],
+                loop_tiled_dims=[*existing.loop_tiled_dims, loop_tiled_dims],
                 loop_tiled_reduction_dims=[
-                    loop_tiled_reduction_dims,
                     *existing.loop_tiled_reduction_dims,
+                    loop_tiled_reduction_dims,
                 ],
                 tiled_dims_per_read=merged_tiled_dims_per_read,
                 output_tiled_dims=[
-                    output_tiled_dims_level,
                     *existing.output_tiled_dims,
+                    output_tiled_dims_level,
                 ],
             )
 
@@ -1731,16 +1765,20 @@ def splice_while_loops(graph) -> None:
     Stamping itself still proceeds level-0-first (outermost first) within
     the single final phase, preserving the existing outermost-first
     convention _stamp_direct_loop_info's own per-level list fields rely on
-    (see its docstring). _stamp_direct_loop_info itself is unchanged: each
-    call still PREPENDS its own contribution onto whatever an earlier call
-    already stamped for the same (now-resolved-by-name) op. Under this
-    function's new outermost-first CALL order, that means level 0's call
-    stamps first (existing=None, loop_group_id=(0,)), and a strictly-inner
-    level's later call resolves the SAME live object again by name and
-    prepends -- e.g. level 1 onto level 0 yields loop_group_id=(1, 0). See
-    _stamp_direct_loop_info's own docstring for why this prepend, not
-    append, is what keeps loop_group_id/loop_count/etc. consistent with
-    every consumer's outermost-first-at-index-0 assumption.
+    (see its docstring). _stamp_direct_loop_info's own call order matches:
+    level 0's call stamps first (existing=None, loop_group_id=(0,)), and a
+    strictly-inner level's later call resolves the SAME live object again
+    by name and APPENDS -- e.g. level 1 onto level 0 yields
+    loop_group_id=(0, 1). See _stamp_direct_loop_info's own docstring for
+    why this append, not prepend, is what keeps loop_group_id/loop_count/
+    etc. consistent with every consumer's outermost-first-at-index-0
+    assumption. (A prior version of this code prepended instead, which
+    silently disagreed with the real outermost-first call order and gave a
+    nested for_each_tile's own group_idx=1 loop_group_id=(1, 0) --
+    loop_group_id[0]=1, disagreeing with its outer siblings'
+    loop_group_id[0]=0 -- splitting one nested group into sibling
+    CountedLoopSchedulerNodes instead of a nested one; see
+    scheduler.py's _build_loop_group.)
     """
     from torch._inductor import ir
 
@@ -1768,7 +1806,8 @@ def splice_while_loops(graph) -> None:
                 continue  # body shape doesn't match; leave untouched
 
             carries = carry_bindings_for(
-                while_op, _stacking_carry_indices(while_op, loop_var)
+                while_op,
+                _stacking_carry_indices(while_op, loop_var, result.trip_count),
             )
             group_ops = splice_while_loop(
                 graph,
