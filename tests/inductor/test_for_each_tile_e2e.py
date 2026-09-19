@@ -82,7 +82,30 @@ from tests.inductor.for_each_tile_fixtures import (
 )
 
 
-class TestForEachTileE2E(unittest.TestCase):
+class _DynamoResetTestCase(unittest.TestCase):
+    """Resets Dynamo before each test.
+
+    Every test in this file torch.compile()s one of a small set of shared
+    fixture functions (e.g. add_tiled_fn is compiled by test_add_tiled_small
+    AND test_add_tiled_multi_stick, at different shapes/tile_sizes). Without
+    a reset, a later test's compile of the SAME function object can hit
+    Dynamo's guard/recompile cache from an earlier test and skip re-entering
+    Inductor's codegen entirely -- silently reusing a compiled artifact
+    specialized for the wrong shape instead of recompiling for the new one.
+    Confirmed: test_add_tiled_small passes in isolation but fails (wrong
+    numerics, no new torch_compile_debug artifact) when run immediately
+    after test_add_tiled_multi_stick in the same process; torch._dynamo.
+    reset() before each test fixes it. This mirrors the reset
+    capture_post_grad_while_loop (for_each_tile_fixtures.py) already does
+    for the same reason.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch._dynamo.reset()
+
+
+class TestForEachTileE2E(_DynamoResetTestCase):
     # Spyre's matmul runs in fp16, so the reference has to be an fp16-faithful
     # one: cast the operands first, then accumulate in fp32 on CPU. Comparing
     # against the fp32 product of fp32 operands would fail on rounding alone,
@@ -218,7 +241,7 @@ class TestForEachTileE2E(unittest.TestCase):
         torch.testing.assert_close(out.cpu().float(), ref, atol=2.0, rtol=0.05)
 
 
-class TestForEachTilePointwiseE2E(unittest.TestCase):
+class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
     """Single-level map-mode pointwise/softmax fixtures, simpler than TestForEachTileE2E.
 
     for_each_tile doesn't need coarse_tile_e2e's exhaustive combinatorial
@@ -355,7 +378,7 @@ class TestForEachTilePointwiseE2E(unittest.TestCase):
         torch.testing.assert_close(out.cpu().float(), ref, atol=0.02, rtol=0.1)
 
 
-class TestForEachTileNestedMapE2E(unittest.TestCase):
+class TestForEachTileNestedMapE2E(_DynamoResetTestCase):
     """Two-level nested for_each_tile, both levels pure map mode (no carry).
 
     Separate tier from the carry-based nested fixtures in

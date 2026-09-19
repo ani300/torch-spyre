@@ -2582,11 +2582,26 @@ class TestStampDirectLoopInfo(unittest.TestCase):
                 for dep, per_read_levels in zip(reads, info.tiled_dims_per_read):
                     per_level = per_read_levels[-1]
                     if dep.index.coeff(loop_var) != 0:
+                        # Extent is this dep's own per-trip tile size (its
+                        # matched range var's own dep.ranges value), not
+                        # trip_count -- these only coincide when tile_size==1.
+                        # See _extent_at_pos's docstring: stamping trip_count
+                        # here silently doubled the read-side device advance
+                        # on any tile_size>1 fixture (confirmed on
+                        # add_tiled_fn). split_m_elementwise_fn's tile_size=64
+                        # means the real per-trip extent is 64, not
+                        # result.trip_count (2).
+                        pos = info.loop_tiled_dims[-1][0]
+                        matched_var = next(
+                            var
+                            for var, rng in dep.ranges.items()
+                            if dep.index.coeff(var) * rng == dep.index.coeff(loop_var)
+                        )
                         self.assertEqual(
                             per_level,
-                            [(info.loop_tiled_dims[-1][0], result.trip_count)],
+                            [(pos, dep.ranges[matched_var])],
                             f"{op.get_name()}: advancing read must carry "
-                            "(resolved_pos, trip_count)",
+                            "(resolved_pos, per-trip tile extent)",
                         )
                         saw_advancing_read = True
                     else:

@@ -1193,7 +1193,9 @@ def _stamp_direct_loop_info(
         op_out_coords,
     )
 
-    def _structural_resolve(dep: "MemoryDep") -> "tuple[int, sympy.Expr] | None":
+    def _structural_resolve(
+        dep: "MemoryDep", prior_levels: "list[tuple[int, sympy.Expr]] | None"
+    ) -> "tuple[int, sympy.Expr] | None":
         """Structural fallback: resolve (pos, extent) for dep without a
         marker, when lookup_marker_dim's op-level resolution didn't apply
         or didn't cover this particular dep.
@@ -1217,29 +1219,31 @@ def _stamp_direct_loop_info(
         the no-stamp outcome before), so it cannot regress a case that
         worked before this fallback existed.
 
-        _loop_var_to_ranges_pos matches a position two ways: loop_var is the
-        coordinate's SOLE free symbol (a genuine, distinct tiled dim of this
-        op), or loop_var merely has a nonzero coefficient inside a coordinate
-        that already has OTHER free symbols too -- its own docstring's
-        "WhileLoop-splice case", e.g. coordinate ``d0 + 64*u5`` for an
-        in-place carry target whose splice offset landed on the same host
-        dim d0 already tiles. That second branch means loop_var is not a
-        distinct tiling level at all -- it is already folded into d0's own
-        existing coordinate/level. Stamping a SEPARATE (structural_pos,
-        extent) level for it would double that dim's per-trip advance once
-        this op also carries its real (marker-resolved) level for d0: two
-        separate output_tiled_dims entries, each minted its own independent
-        level_symbol in _general_tile_advance, so the SAME device dim
-        advances twice per trip instead of once (confirmed on op23 in
-        test_nested_for_each_tile_value_correct: outer level's structural
-        fallback stamped (pos=0, extent=64) for the outer splice loop_var
-        u5, duplicating the inner K-tile level's own real (pos=0, extent=64)
-        entry for the same d0/device dim 0). So only accept a match here
-        when loop_var is that coordinate's sole free symbol; the splice-
-        folded case is exactly what _general_tile_advance's own
-        uncovered_splice_vars/tiled_device_dims machinery already handles
-        correctly as a single contribution, and must not also get a second,
-        structurally-stamped level here.
+        `prior_levels` is this SAME dep's own already-stamped (pos, extent)
+        entries, flattened across every strictly-inner level a prior call
+        already stamped (``existing.tiled_dims_per_read[i]`` /
+        ``existing.output_tiled_dims`` flattened, before this level's own
+        entry is prepended -- None/empty on the first, innermost call). Only
+        used to
+        detect the confirmed op23 double-advance bug in
+        test_nested_for_each_tile_value_correct: an outer level's structural
+        fallback there matched the SAME position (pos=0) an inner level's
+        own marker-resolved call had already claimed for this exact dep,
+        producing two independent output_tiled_dims entries for one device
+        dim -- each minted its own level_symbol in _general_tile_advance, so
+        the dim advanced twice per trip instead of once. That is a real
+        collision, keyed on "this dep already has a stamp at this position
+        from another level", not merely on "loop_var shares this coordinate
+        with another free symbol" -- the latter also fires for e.g. a
+        WhileLoop-splice-folded write index (coordinate ``d0 + 2*u5``) where
+        d0 is this SAME op's own local tile coordinate and there is no
+        competing claim on pos 0 at all (confirmed on buf24 in
+        test_nested_add_outer_row_inner_col_small: lookup_marker_dim returns
+        None and prior_levels is empty, so rejecting there was a false
+        positive that left output_tiled_dims empty and broke codegen
+        addressing). So reject only when structural_pos is already present
+        among prior_levels' own positions for this dep -- not unconditionally
+        whenever the coordinate has extra free symbols.
         """
         dep_loop_var_coeff = dep.index.coeff(loop_var)
         if dep_loop_var_coeff == 0:
@@ -1251,19 +1255,13 @@ def _stamp_direct_loop_info(
         structural_pos = _loop_var_to_ranges_pos(out_coords, loop_var)
         if structural_pos is None:
             return None
-        # Reject the "WhileLoop-splice case" branch of
-        # _loop_var_to_ranges_pos's own OR (loop_var sharing a coordinate
-        # with other free symbols via a nonzero coefficient): that branch
-        # means loop_var is not a distinct tiling level at all -- it is
-        # already folded into that coordinate's own existing dim, and
-        # _general_tile_advance's uncovered_splice_vars/tiled_device_dims
-        # machinery already accounts for it as a single contribution. Only
-        # a coordinate where loop_var is the SOLE free symbol is a genuine,
-        # distinct structural level worth stamping here -- see this
-        # function's own docstring for the confirmed double-advance bug
-        # (op23 in test_nested_for_each_tile_value_correct) this guards
-        # against.
-        if out_coords[structural_pos].free_symbols != {loop_var}:
+        # Reject only a genuine collision: this dep already carries a
+        # stamped level at structural_pos from a strictly-inner call (the
+        # confirmed op23 double-advance case -- see this function's own
+        # docstring). A coordinate where loop_var shares free symbols with
+        # another var (the WhileLoop-splice case) is NOT by itself a reason
+        # to reject -- see buf24 in the same docstring.
+        if prior_levels and any(pos == structural_pos for pos, _ in prior_levels):
             return None
         # mapped_sym: this SAME dep's own index variable occupying
         # structural_pos -- resolved the same convention
@@ -1286,6 +1284,46 @@ def _stamp_direct_loop_info(
             return None
         extent = dep_loop_var_coeff / mapped_coeff
         return structural_pos, extent
+
+    def _extent_at_pos(dep: "MemoryDep", pos: int) -> "sympy.Expr | None":
+        """This dep's own per-trip tile extent at marker-resolved `pos`.
+
+        lookup_marker_dim resolves POSITION only (via a coefficient-
+        coincidence match against loop_var, then discards the matched
+        var/range -- see its own docstring). The actual extent to stamp
+        is that matched var's own range in THIS dep (dep.ranges[var]),
+        not trip_count: trip_count is the loop's iteration count, while
+        the extent tiled_dims_per_read/output_tiled_dims must carry is
+        the tile's own per-trip size in the dim's host-range units (see
+        loop_info.py's tiled_dims_per_read docstring) -- these coincide
+        only when tile_size==1. Confirmed wrong on add_tiled_fn' tile_size=2
+        case: stamping trip_count (4) instead of the real per-trip extent
+        (2) doubled the read-side device advance (256 vs the correct 128
+        for a row-stride-64 buffer), silently reading past/aliasing wrong
+        rows on later trips.
+
+        Re-derives the same coefficient-coincidence equation
+        lookup_marker_dim used to find pos in the first place
+        (dep.index.coeff(var) * dep.ranges[var] == dep.index.coeff(
+        loop_var)), scoped to dep's own ranges rather than trusting
+        `pos` alone -- `pos` is an op_out_coords position, and more than
+        one dep.ranges var can share it only when they're genuinely the
+        same tiled dim, so re-matching here is safe and mirrors
+        _structural_resolve's identical pattern just above.
+        """
+        out_coords = op_out_coords(op)
+        if pos >= len(out_coords):
+            return None
+        dep_loop_var_coeff = dep.index.coeff(loop_var)
+        for var, rng in dep.ranges.items():
+            if _loop_var_to_ranges_pos(out_coords, var) != pos:
+                continue
+            var_coeff = dep.index.coeff(var)
+            if var_coeff == 0:
+                continue
+            if sympy.simplify(dep_loop_var_coeff - var_coeff * rng) == 0:
+                return rng
+        return None
 
     for op in group_ops:
         existing: CoarseTileInfo | None = getattr(op, "loop_info", None)
@@ -1313,6 +1351,24 @@ def _stamp_direct_loop_info(
                 loop_tiled_reduction_dims.append(ranges_pos)
             else:
                 loop_tiled_dims.append(ranges_pos)
+        elif (marker_dim := _marker_dim(op)) is not None:
+            # op is itself a tile_dim_marker (not a marker CONSUMER, which
+            # lookup_marker_dim above already covers) that survived splicing
+            # as a real, addressable op -- e.g. a StarDep-consumed marker
+            # kept materialized as a still-nested WhileLoop's carried input
+            # (MarkerResolution.STAR_DEP_KEPT; see splice_while_loops's own
+            # docstring on _recordable_op_names). Such an op's own write
+            # never carries loop_var (only its READ of the underlying
+            # tensor does), so lookup_marker_dim's marker-map lookup (keyed
+            # by CONSUMER op name) finds no entry, and _structural_resolve's
+            # op_out_coords-anchored fallback below also can't resolve it.
+            # tile_marker_dim is ground truth for this op's own tiled
+            # position (for_each_tile.py's spec.dim, stamped by
+            # lower_tile_dim_marker onto this exact op/tensor -- no
+            # cross-shape translation risk here, unlike lookup_marker_dim's
+            # marker-to-consumer case, since the marker IS this op).
+            resolved_pos = marker_dim
+            loop_tiled_dims.append(resolved_pos)
 
         rw = op.get_read_writes()
         # StarDep has no .index (raises NotImplementedError, not
@@ -1320,13 +1376,24 @@ def _stamp_direct_loop_info(
         # here) -- isinstance against MemoryDep is the correct guard, same
         # as lookup_marker_dim's own filtering above.
         reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
+        existing_per_read = list(existing.tiled_dims_per_read) if existing else []
         new_tiled_dims_per_read: list[list[tuple[int, sympy.Expr]]] = []
-        for dep in reads:
+        for read_idx, dep in enumerate(reads):
             per_level: list[tuple[int, sympy.Expr]] = []
-            if resolved_pos is not None and dep.index.coeff(loop_var) != 0:
-                per_level.append((resolved_pos, trip_count))
+            extent = (
+                _extent_at_pos(dep, resolved_pos)
+                if resolved_pos is not None and dep.index.coeff(loop_var) != 0
+                else None
+            )
+            if extent is not None and resolved_pos is not None:
+                per_level.append((resolved_pos, extent))
             else:
-                structural = _structural_resolve(dep)
+                prior_levels = (
+                    [entry for level in existing_per_read[read_idx] for entry in level]
+                    if read_idx < len(existing_per_read)
+                    else None
+                )
+                structural = _structural_resolve(dep, prior_levels)
                 if structural is not None:
                     per_level.append(structural)
             new_tiled_dims_per_read.append(per_level)
@@ -1335,10 +1402,20 @@ def _stamp_direct_loop_info(
         writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
         if writes:
             write_dep = writes[0]
-            if resolved_pos is not None and write_dep.index.coeff(loop_var) != 0:
-                output_tiled_dims_level.append((resolved_pos, trip_count))
+            write_extent = (
+                _extent_at_pos(write_dep, resolved_pos)
+                if resolved_pos is not None and write_dep.index.coeff(loop_var) != 0
+                else None
+            )
+            if write_extent is not None and resolved_pos is not None:
+                output_tiled_dims_level.append((resolved_pos, write_extent))
             else:
-                structural = _structural_resolve(write_dep)
+                prior_output_levels = (
+                    [entry for level in existing.output_tiled_dims for entry in level]
+                    if existing
+                    else None
+                )
+                structural = _structural_resolve(write_dep, prior_output_levels)
                 if structural is not None:
                     output_tiled_dims_level.append(structural)
 
