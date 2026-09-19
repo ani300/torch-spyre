@@ -1315,20 +1315,23 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
 
     def test_consume_tile_dim_markers_raises_on_wrong_consumer_count(self):
-        """_consume_tile_dim_markers's consumer-count guard (F4.3).
+        """_consume_tile_dim_markers's consumer-count guards (F4.3).
 
-        A tile_dim_marker op is expected to have exactly one consuming
-        read within its spliced body (for_each_tile_lowering.py,
-        ~line 762-769). Zero consumers or more than one are both
-        unrecognized shapes and must raise AssertionError rather than
-        silently pick a default -- untested anywhere in this file before
-        this test. Covers both wrong-count shapes in one test (zero, then
-        two), each built directly via this class's established
-        mock.Mock(spec=[...]) convention (see TestSpliceWhileLoop above)
-        rather than a full torch.compile. The zero-consumer shape is
-        believed unreachable through the ordinary lowering path, which is
-        why it needs direct construction to exercise at all. The
-        two-consumer shape is NOT unreachable: it is reached for real by
+        A tile_dim_marker op must have at least one consuming read within
+        its spliced body, and at most one StarDep-shaped consuming read
+        (multiple ComputedBuffer consuming reads ARE supported -- see
+        torch.softmax's amax/sub siblings, test_softmax_row_tiled_small).
+        Zero consumers and multiple StarDep consumers are both unrecognized/
+        unhandled shapes and must raise AssertionError rather than silently
+        pick a default or (for the StarDep case) silently produce wrong
+        numerics -- untested anywhere in this file before this test. Covers
+        both wrong-count shapes in one test (zero, then two StarDep), each
+        built directly via this class's established mock.Mock(spec=[...])
+        convention (see TestSpliceWhileLoop above) rather than a full
+        torch.compile. The zero-consumer shape is believed unreachable
+        through the ordinary lowering path, which is why it needs direct
+        construction to exercise at all. The two-StarDep-consumer shape is
+        NOT unreachable: it is reached for real by
         for_each_tile_fixtures.py's sibling_nested_fn/sibling_nested_
         stardep_fn (two independent WhileLoops both consuming a single
         outer marker on their shared tiled operand via StarDep -- see
@@ -1401,7 +1404,9 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         two_graph.operations = two_operations
 
         with V.set_graph_handler(two_graph):
-            with self.assertRaisesRegex(AssertionError, r"has 2 consuming reads"):
+            with self.assertRaisesRegex(
+                AssertionError, r"has 2 StarDep-shaped consuming reads"
+            ):
                 _consume_tile_dim_markers(two_group_ops, two_operations)
 
     def test_consume_tile_dim_markers_stamps_marker_resolution(self):

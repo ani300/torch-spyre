@@ -370,16 +370,18 @@ def _marker_dim(op: "ir.Operation") -> "int | None":
 class MarkerResolution(enum.Enum):
     """How _consume_tile_dim_markers resolved one tile_dim_marker op.
 
-    INLINE_ERASED: the marker's single consumer is a ComputedBuffer (or was
-    inlined into one) -- the marker's transform was fused directly into
-    that consumer's inner_fn and the marker op was removed from both
-    operations and group_ops.
+    INLINE_ERASED: every one of the marker's consumers is a ComputedBuffer
+    (or was inlined into one) -- the marker's transform was fused directly
+    into each such consumer's inner_fn and the marker op was removed from
+    both operations and group_ops.
 
-    STAR_DEP_KEPT: the marker's single consumer reaches it via a StarDep,
-    not an ordinary MemoryDep -- the marker cannot be fused away and stays
-    live as a real, addressable buffer (see _consume_tile_dim_markers's own
-    comment on why removing it from operations would break
-    coarse_tile.py's _validate_contiguous gapless-block invariant).
+    STAR_DEP_KEPT: at least one of the marker's consumers reaches it via a
+    StarDep, not an ordinary MemoryDep -- the marker cannot be fused away
+    and stays live as a real, addressable buffer (see
+    _consume_tile_dim_markers's own comment on why removing it from
+    operations would break coarse_tile.py's _validate_contiguous
+    gapless-block invariant), even if other consumers of the same marker
+    were inlined.
     """
 
     INLINE_ERASED = "inline_erased"
@@ -646,10 +648,26 @@ def _consume_tile_dim_markers(
     """Find every tile_dim_marker-tagged op in group_ops, erase it, map its dim.
 
     For each marker op (an op whose realized ComputedBuffer carries
-    tile_marker_dim -- see lowering.py's lower_tile_dim_marker): find its
-    single consuming use among group_ops, record
-    (op.get_name(), dep) -> dim in the returned map, then erase the
-    marker and remove the marker op from `operations`.
+    tile_marker_dim -- see lowering.py's lower_tile_dim_marker): find every
+    consuming use among group_ops, record (op.get_name(), dep) -> dim in
+    the returned map for each one, then erase the marker and remove the
+    marker op from `operations`.
+
+    A marker can have more than one consuming use: e.g. torch.softmax's
+    default decomposition (amax, sub, exp, sum, div) reads its input tensor
+    directly from two sibling ops (amax and sub both read the
+    pre-decomposition value, per torch._inductor.decomposition's aten
+    softmax decomp), so a for_each_tile tile whose body calls softmax on
+    the whole tile produces a marker read by two independent ComputedBuffer
+    consumers rather than one op chained through another. Confirmed via
+    test_softmax_row_tiled_multi_stick/_small, which raised
+    "has 2 consuming reads ... expected exactly one" before this was
+    handled. Each consuming read is resolved independently -- inlining the
+    marker's transform into each ComputedBuffer consumer in turn, or
+    redirecting each StarDep-shaped consumer's reference -- and the marker
+    itself is erased only once every consuming read has been resolved (see
+    below on why any StarDep consumer forces STAR_DEP_KEPT for the whole
+    marker, even when other consumers were inlined).
 
     A marker's consumer can hold its read in either of two shapes (both
     already handled elsewhere in this package for the analogous WAR-hazard
@@ -692,12 +710,15 @@ def _consume_tile_dim_markers(
       ``_snapshot_carry_placeholder`` already relies on for this exact read
       shape.
 
-    Zero or more than one consuming use (of either shape) is an unrecognized
-    shape and raises -- this pass runs on a freshly spliced body whose only
-    consumers of a marker's output should be exactly the op(s) for_each_tile's
-    frontend wrote to read that tile; anything else means an assumption this
-    module owns (see the module docstring) no longer holds and a silent guess
-    would be worse than a loud failure.
+    Zero consuming uses (of either shape) is an unrecognized shape and
+    raises -- this pass runs on a freshly spliced body whose only consumers
+    of a marker's output should be the op(s) for_each_tile's frontend wrote
+    to read that tile, so no consumer at all means an assumption this
+    module owns (see the module docstring) no longer holds and a silent
+    guess would be worse than a loud failure. More than one StarDep-shaped
+    consuming use also raises (see the dedicated check above) -- that shape
+    (sibling for_each_tile loops sharing one outer tile, issue #4581) is not
+    yet handled correctly, unlike multiple ComputedBuffer consuming uses.
 
     Must run before any hint synthesis -- callers of _hint_ranges_pos
     consult the module-level _MARKER_MAPS registry this function populates,
@@ -771,15 +792,42 @@ def _consume_tile_dim_markers(
                 if isinstance(dep, (MemoryDep, StarDep)) and dep.name == marker_name:
                     consumers.append((candidate, dep))
 
-        if len(consumers) != 1:
+        if len(consumers) == 0:
             raise AssertionError(
-                f"tile_dim_marker op {marker_name!r} has {len(consumers)} "
-                "consuming reads within its spliced body; expected exactly "
-                "one. This is an unrecognized for_each_tile shape -- "
+                f"tile_dim_marker op {marker_name!r} has 0 consuming reads "
+                "within its spliced body; expected at least one. This is "
+                "an unrecognized for_each_tile shape -- "
                 "_consume_tile_dim_markers only knows how to erase a marker "
-                "whose output is read by exactly one downstream op."
+                "whose output is read by one or more downstream ops."
             )
-        consumer_op, consumer_dep = consumers[0]
+
+        # More than one StarDep-shaped consumer of the SAME marker is a
+        # distinct, still-unhandled shape from the multi-ComputedBuffer case
+        # above (e.g. torch.softmax's amax/sub siblings): it arises when two
+        # independent sibling for_each_tile loops (each lowering to its own
+        # ir.WhileLoop) are both handed the same outer tile directly -- see
+        # sibling_nested_fn/sibling_nested_stardep_fn in
+        # for_each_tile_fixtures.py (issue #4581). Redirecting each StarDep
+        # consumer's reference to marker_op independently (the StarDep branch
+        # below) is only proven correct for a single such consumer; empirical
+        # end-to-end testing of the two-sibling-WhileLoop shape (bypassing
+        # this guard) produced silently wrong numerics (~99.9% mismatched
+        # elements), not a crash -- so this must keep raising rather than
+        # silently accept a shape the resolution logic doesn't actually
+        # handle correctly. Only count StarDep consumers here; multiple
+        # ComputedBuffer consumers remain supported by the loop below.
+        star_dep_consumer_count = sum(
+            1 for consumer_op, _ in consumers if not hasattr(consumer_op, "data")
+        )
+        if star_dep_consumer_count > 1:
+            raise AssertionError(
+                f"tile_dim_marker op {marker_name!r} has "
+                f"{star_dep_consumer_count} StarDep-shaped consuming reads "
+                "within its spliced body; expected at most one. Multiple "
+                "sibling for_each_tile loops consuming the same outer tile "
+                "directly (issue #4581) are not yet supported -- see this "
+                "function's docstring."
+            )
 
         # ComputedBuffer has no plain `.inputs` list attribute (that
         # attribute belongs to the InputsKernel family -- FallbackKernel,
@@ -800,98 +848,126 @@ def _consume_tile_dim_markers(
             )
         marker_input_name = marker_reads[0].name
 
-        if hasattr(consumer_op, "data"):
-            new_consumer = _inline_marker_into_consumer(
-                consumer_op, marker_op, operations
-            )
-            # _inline_marker_into_consumer swaps `operations[op_idx]` in
-            # place but returns a new object whose reads no longer include
-            # `consumer_dep` at all -- the marker's own inner_fn (its
-            # genuine per-iteration coordinate transform, e.g. an extra
-            # `+ 24*u0` advance term) is now composed directly into the
-            # consumer's read of `marker_input_name`, replacing the old,
-            # marker-relative read. lookup_marker_dim looks up entries
-            # keyed by the CURRENT read it finds on `op` at lookup time, so
-            # the map must be keyed by that post-inline dep (the one now
-            # naming `marker_input_name`, with the marker's own index
-            # composed in), not by the stale pre-inline `consumer_dep`
-            # (which named the marker itself and will never appear among
-            # new_consumer's reads again).
-            new_reads = [
-                d
-                for d in new_consumer.get_read_writes().reads
-                if isinstance(d, MemoryDep) and d.name == marker_input_name
-            ]
-            if len(new_reads) != 1:
-                raise AssertionError(
-                    f"consumer {consumer_op.get_name()!r} has "
-                    f"{len(new_reads)} post-inline MemoryDep reads named "
-                    f"{marker_input_name!r}; expected exactly 1 (the "
-                    "inlined read that used to go through erased marker "
-                    f"{marker_name!r})."
+        # A marker CAN have more than one consuming read: e.g.
+        # torch.softmax's default decomposition (amax, sub, exp, sum, div)
+        # reads its own input tensor directly from two sibling ops (amax
+        # and sub both read the pre-decomposition placeholder), so a
+        # for_each_tile tile whose body calls softmax on the whole,
+        # untiled tile (test_softmax_row_tiled_multi_stick/_small) produces
+        # a marker with two independent ComputedBuffer consumers rather
+        # than one op chained through another. Each consuming read is
+        # resolved independently below -- inlining the marker's transform
+        # into each ComputedBuffer consumer in turn, or (for a StarDep
+        # consumer) redirecting each such reference -- and the marker
+        # itself is erased only once every consuming read has been
+        # resolved.
+        any_star_dep_consumer = False
+        for consumer_op, consumer_dep in consumers:
+            if hasattr(consumer_op, "data"):
+                new_consumer = _inline_marker_into_consumer(
+                    consumer_op, marker_op, operations
                 )
-            new_dep = new_reads[0]
+                # _inline_marker_into_consumer swaps `operations[op_idx]` in
+                # place but returns a new object whose reads no longer include
+                # `consumer_dep` at all -- the marker's own inner_fn (its
+                # genuine per-iteration coordinate transform, e.g. an extra
+                # `+ 24*u0` advance term) is now composed directly into the
+                # consumer's read of `marker_input_name`, replacing the old,
+                # marker-relative read. lookup_marker_dim looks up entries
+                # keyed by the CURRENT read it finds on `op` at lookup time, so
+                # the map must be keyed by that post-inline dep (the one now
+                # naming `marker_input_name`, with the marker's own index
+                # composed in), not by the stale pre-inline `consumer_dep`
+                # (which named the marker itself and will never appear among
+                # new_consumer's reads again).
+                new_reads = [
+                    d
+                    for d in new_consumer.get_read_writes().reads
+                    if isinstance(d, MemoryDep) and d.name == marker_input_name
+                ]
+                if len(new_reads) != 1:
+                    raise AssertionError(
+                        f"consumer {consumer_op.get_name()!r} has "
+                        f"{len(new_reads)} post-inline MemoryDep reads named "
+                        f"{marker_input_name!r}; expected exactly 1 (the "
+                        "inlined read that used to go through erased marker "
+                        f"{marker_name!r})."
+                    )
+                new_dep = new_reads[0]
+            else:
+                # StarDep-shaped consumer (ExternKernelOut/FallbackKernel/
+                # ConcatKernel/... -- including a nested ir.WhileLoop, whose own
+                # .carried_inputs/.additional_inputs are the read shape
+                # _substitute_direct_input_refs's docstring calls its "fourth
+                # read shape"): no inner_fn to wrap, so
+                # redirect_computed_buffer_reads does not apply, and there is no
+                # load index to compose the marker's own transform into the way
+                # _inline_marker_into_consumer does for a ComputedBuffer
+                # consumer above.
+                #
+                # The marker's own ComputedBuffer performs a genuine,
+                # non-identity per-iteration coordinate transform (the tile's
+                # slice/offset -- see lower_tile_dim_marker's docstring), the
+                # same as for the ComputedBuffer-consumer branch above. Pointing
+                # the consumer's reference at the marker's own upstream input
+                # (marker_input_name, e.g. arg0_1 -- what an earlier version of
+                # this branch did via V.graph.try_get_buffer) discards that
+                # transform entirely: every consumer read then sees the raw,
+                # untiled operand with no per-iteration offset at all. Confirmed
+                # empirically on a nested for_each_tile (map/map) on the real
+                # Spyre device: the inner loop's captured outer-tile operand
+                # silently stayed pinned to outer trip 0's slice on every trip,
+                # corrupting every outer iteration after the first (~48% wrong
+                # elements) while remaining invisible on CPU eager/CPU Inductor,
+                # since neither exercises Spyre-specific codegen for a
+                # StarDep-shaped nested-WhileLoop marker consumer.
+                #
+                # The correct erasure-equivalent for this read shape is to keep
+                # the marker's ComputedBuffer materialized (never remove it from
+                # group_ops/operations) and redirect the consumer's reference to
+                # the marker ITSELF rather than to its upstream input --
+                # equivalent in effect to _inline_marker_into_consumer's
+                # per-load composition, just realized as a standalone buffer
+                # instead of fused into the consumer's own body, since a
+                # StarDep-shaped consumer has no body to fuse into. Only a
+                # stale-by-identity, same-name reference (confirmed empirically:
+                # splice_while_loop's own upstream passes can leave a consumer's
+                # direct object reference pointing at an object that predates
+                # the marker's final reconstruction, even though it already
+                # names the marker correctly) needs patching at all --
+                # _substitute_direct_input_refs's name-based resolve() is a
+                # no-op for any reference that already points at marker_op by
+                # identity, and safely repoints any reference that doesn't.
+                _substitute_direct_input_refs([consumer_op], {marker_name: marker_op})
+                new_consumer = consumer_op
+                # No object reconstruction happened (unlike the ComputedBuffer
+                # branch) -- consumer_op's own identity is unchanged, and its
+                # dep still names marker_name (the marker is not erased, so
+                # nothing renamed it) -- unlike the erase-and-redirect path this
+                # replaced, there is no post-substitution name change to
+                # re-derive a new dep from.
+                new_dep = consumer_dep
+                any_star_dep_consumer = True
+
+            marker_map[(new_consumer.get_name(), new_dep)] = dim
+            if id(consumer_op) in group_op_ids:
+                group_op_ids.discard(id(consumer_op))
+                group_op_ids.add(id(new_consumer))
+                group_ops[group_ops.index(consumer_op)] = new_consumer
+
+        # Only erase the marker once every consuming read has been resolved
+        # above -- with multiple consumers, erasing after the first would
+        # leave later consumers' MemoryDep/StarDep reads dangling (naming a
+        # marker no longer present in `operations`).
+        #
+        # If ANY consumer reached the marker via a StarDep, the marker must
+        # stay materialized for that consumer's sake (see the StarDep branch
+        # above) -- even when OTHER consumers were ComputedBuffers and had
+        # the marker's transform inlined into them directly. Erasing here
+        # would only be safe if every consumer was inlined.
+        if any_star_dep_consumer:
+            marker_op.tile_marker_resolution = MarkerResolution.STAR_DEP_KEPT
         else:
-            # StarDep-shaped consumer (ExternKernelOut/FallbackKernel/
-            # ConcatKernel/... -- including a nested ir.WhileLoop, whose own
-            # .carried_inputs/.additional_inputs are the read shape
-            # _substitute_direct_input_refs's docstring calls its "fourth
-            # read shape"): no inner_fn to wrap, so
-            # redirect_computed_buffer_reads does not apply, and there is no
-            # load index to compose the marker's own transform into the way
-            # _inline_marker_into_consumer does for a ComputedBuffer
-            # consumer above.
-            #
-            # The marker's own ComputedBuffer performs a genuine,
-            # non-identity per-iteration coordinate transform (the tile's
-            # slice/offset -- see lower_tile_dim_marker's docstring), the
-            # same as for the ComputedBuffer-consumer branch above. Pointing
-            # the consumer's reference at the marker's own upstream input
-            # (marker_input_name, e.g. arg0_1 -- what an earlier version of
-            # this branch did via V.graph.try_get_buffer) discards that
-            # transform entirely: every consumer read then sees the raw,
-            # untiled operand with no per-iteration offset at all. Confirmed
-            # empirically on a nested for_each_tile (map/map) on the real
-            # Spyre device: the inner loop's captured outer-tile operand
-            # silently stayed pinned to outer trip 0's slice on every trip,
-            # corrupting every outer iteration after the first (~48% wrong
-            # elements) while remaining invisible on CPU eager/CPU Inductor,
-            # since neither exercises Spyre-specific codegen for a
-            # StarDep-shaped nested-WhileLoop marker consumer.
-            #
-            # The correct erasure-equivalent for this read shape is to keep
-            # the marker's ComputedBuffer materialized (never remove it from
-            # group_ops/operations) and redirect the consumer's reference to
-            # the marker ITSELF rather than to its upstream input --
-            # equivalent in effect to _inline_marker_into_consumer's
-            # per-load composition, just realized as a standalone buffer
-            # instead of fused into the consumer's own body, since a
-            # StarDep-shaped consumer has no body to fuse into. Only a
-            # stale-by-identity, same-name reference (confirmed empirically:
-            # splice_while_loop's own upstream passes can leave a consumer's
-            # direct object reference pointing at an object that predates
-            # the marker's final reconstruction, even though it already
-            # names the marker correctly) needs patching at all --
-            # _substitute_direct_input_refs's name-based resolve() is a
-            # no-op for any reference that already points at marker_op by
-            # identity, and safely repoints any reference that doesn't.
-            _substitute_direct_input_refs([consumer_op], {marker_name: marker_op})
-            new_consumer = consumer_op
-            # No object reconstruction happened (unlike the ComputedBuffer
-            # branch) -- consumer_op's own identity is unchanged, and its
-            # dep still names marker_name (the marker is not erased, so
-            # nothing renamed it) -- unlike the erase-and-redirect path this
-            # replaced, there is no post-substitution name change to
-            # re-derive a new dep from.
-            new_dep = consumer_dep
-
-        marker_map[(new_consumer.get_name(), new_dep)] = dim
-        if id(consumer_op) in group_op_ids:
-            group_op_ids.discard(id(consumer_op))
-            group_op_ids.add(id(new_consumer))
-            group_ops[group_ops.index(consumer_op)] = new_consumer
-
-        if hasattr(consumer_op, "data"):
             # Only the ComputedBuffer/inline branch actually fuses the
             # marker's transform into the consumer and erases the marker;
             # the StarDep branch below deliberately keeps marker_op alive
@@ -913,8 +989,6 @@ def _consume_tile_dim_markers(
             if marker_op in group_ops:
                 group_ops.remove(marker_op)
             group_op_ids.discard(id(marker_op))
-        else:
-            marker_op.tile_marker_resolution = MarkerResolution.STAR_DEP_KEPT
 
     _MARKER_MAPS.setdefault(id(operations), {}).update(marker_map)
     return marker_map
