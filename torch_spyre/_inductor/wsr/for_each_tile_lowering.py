@@ -1126,10 +1126,9 @@ def _stamp_direct_loop_info(
     Sec4.2a for why: zero consumers outside coarse_tile.py's own Pass
     1/2/3, which while_loop groups skip entirely).
 
-    Called once per while_loop nesting level, in outermost-first order,
-    after every level has been spliced (see splice_while_loops's own
-    docstring for why stamping is deferred this way): extends whatever
-    single CoarseTileInfo a strictly-outer level's own call already
+    Called once per while_loop nesting level, innermost first (splice
+    order; see splice_while_loops's own docstring): extends whatever
+    single CoarseTileInfo a strictly-inner level's own call already
     stamped, never overwriting it. ``op.loop_info`` is
     ALWAYS a single ``CoarseTileInfo`` (never a list of them) -- confirmed
     against every other stamping site in the codebase (coarse_tile.py's own
@@ -1142,12 +1141,14 @@ def _stamp_direct_loop_info(
     (loop_group_id/loop_count/loop_tiled_dims/loop_tiled_reduction_dims/
     tiled_dims_per_read's and output_tiled_dims's per-level entries) already
     encode every nesting level inside ONE object -- outermost first, per
-    loop_info.py's docstring. Since this function is called innermost
-    level first, a second (outer) call must PREPEND its own level's
-    contribution onto the front of an inner call's already-stamped lists
-    (not append onto the end, and not wrap the whole object in a new outer
-    list) -- otherwise levels end up ordered innermost-first, the reverse
-    of every consumer's assumption (scheduler.py's and coarse_tile.py's
+    loop_info.py's docstring. Since this function is called INNERMOST
+    level first, the first call for a given op sets its lists with that
+    inner level already at index 0 (existing=None branch below), and every
+    later, strictly-outer call must PREPEND its own level's contribution
+    onto the front of the already-stamped lists (not append onto the end,
+    and not wrap the whole object in a new outer list) -- appending here
+    would leave the inner call's own level at index 0, the reverse of
+    every consumer's assumption (scheduler.py's and coarse_tile.py's
     reliance on loop_group_id[0] being the outermost level, in
     particular).
 
@@ -1184,8 +1185,107 @@ def _stamp_direct_loop_info(
     """
     from torch._inductor.dependencies import MemoryDep
 
+    from torch_spyre._inductor.errors import Unsupported
     from torch_spyre._inductor.loop_info import CoarseTileInfo
     from torch_spyre._inductor.propagate_hints import DimHint
+    from torch_spyre._inductor.wsr.coarse_tile import (
+        _loop_var_to_ranges_pos,
+        op_out_coords,
+    )
+
+    def _structural_resolve(dep: "MemoryDep") -> "tuple[int, sympy.Expr] | None":
+        """Structural fallback: resolve (pos, extent) for dep without a
+        marker, when lookup_marker_dim's op-level resolution didn't apply
+        or didn't cover this particular dep.
+
+        Only attempted when dep.index actually carries loop_var (per-dep,
+        not per-op, since reads and the write can each independently need
+        it -- Step 1.1 of the brief). Uses op's own output coordinates
+        (ground truth for the op's own tiled-dim positions) to find
+        loop_var's ranges position, then derives this dep's own per-trip
+        extent from its own coefficient on loop_var divided by the mapped
+        symbol's coefficient in this SAME dep's index -- reusing trip_count
+        here would be wrong whenever structural_pos's own per-trip step in
+        THIS dep differs from loop_var's per-trip step (Defect 1: confirmed
+        4x wrong, 4 vs 64, on the real repro).
+
+        op_out_coords can raise Unsupported for >=3 levels of nesting, when
+        an outer level's own loop_var is not yet covered by this op's
+        dim_hints (Defect 3) -- caught here and treated identically to "no
+        structural match", i.e. no stamp for this dep, not a crash. This is
+        strictly more permissive than pre-fallback behavior (every dep hit
+        the no-stamp outcome before), so it cannot regress a case that
+        worked before this fallback existed.
+
+        _loop_var_to_ranges_pos matches a position two ways: loop_var is the
+        coordinate's SOLE free symbol (a genuine, distinct tiled dim of this
+        op), or loop_var merely has a nonzero coefficient inside a coordinate
+        that already has OTHER free symbols too -- its own docstring's
+        "WhileLoop-splice case", e.g. coordinate ``d0 + 64*u5`` for an
+        in-place carry target whose splice offset landed on the same host
+        dim d0 already tiles. That second branch means loop_var is not a
+        distinct tiling level at all -- it is already folded into d0's own
+        existing coordinate/level. Stamping a SEPARATE (structural_pos,
+        extent) level for it would double that dim's per-trip advance once
+        this op also carries its real (marker-resolved) level for d0: two
+        separate output_tiled_dims entries, each minted its own independent
+        level_symbol in _general_tile_advance, so the SAME device dim
+        advances twice per trip instead of once (confirmed on op23 in
+        test_nested_for_each_tile_value_correct: outer level's structural
+        fallback stamped (pos=0, extent=64) for the outer splice loop_var
+        u5, duplicating the inner K-tile level's own real (pos=0, extent=64)
+        entry for the same d0/device dim 0). So only accept a match here
+        when loop_var is that coordinate's sole free symbol; the splice-
+        folded case is exactly what _general_tile_advance's own
+        uncovered_splice_vars/tiled_device_dims machinery already handles
+        correctly as a single contribution, and must not also get a second,
+        structurally-stamped level here.
+        """
+        dep_loop_var_coeff = dep.index.coeff(loop_var)
+        if dep_loop_var_coeff == 0:
+            return None
+        try:
+            out_coords = op_out_coords(op)
+        except Unsupported:
+            return None
+        structural_pos = _loop_var_to_ranges_pos(out_coords, loop_var)
+        if structural_pos is None:
+            return None
+        # Reject the "WhileLoop-splice case" branch of
+        # _loop_var_to_ranges_pos's own OR (loop_var sharing a coordinate
+        # with other free symbols via a nonzero coefficient): that branch
+        # means loop_var is not a distinct tiling level at all -- it is
+        # already folded into that coordinate's own existing dim, and
+        # _general_tile_advance's uncovered_splice_vars/tiled_device_dims
+        # machinery already accounts for it as a single contribution. Only
+        # a coordinate where loop_var is the SOLE free symbol is a genuine,
+        # distinct structural level worth stamping here -- see this
+        # function's own docstring for the confirmed double-advance bug
+        # (op23 in test_nested_for_each_tile_value_correct) this guards
+        # against.
+        if out_coords[structural_pos].free_symbols != {loop_var}:
+            return None
+        # mapped_sym: this SAME dep's own index variable occupying
+        # structural_pos -- resolved the same convention
+        # _loop_var_to_ranges_pos itself uses (a var's position is where it
+        # is found in op_out_coords), scanning dep.ranges (this dep's own
+        # iteration variables, positionally aligned with op.data.ranges by
+        # construction) rather than loop_var, mirroring lookup_marker_dim's
+        # own dep.ranges.items() scan above.
+        mapped_sym = None
+        for var in dep.ranges:
+            if _loop_var_to_ranges_pos(out_coords, var) == structural_pos:
+                mapped_sym = var
+                break
+        if mapped_sym is None:
+            return None
+        mapped_coeff = dep.index.coeff(mapped_sym)
+        if mapped_coeff == 0:
+            return None
+        if sympy.Mod(dep_loop_var_coeff, mapped_coeff) != 0:
+            return None
+        extent = dep_loop_var_coeff / mapped_coeff
+        return structural_pos, extent
 
     for op in group_ops:
         existing: CoarseTileInfo | None = getattr(op, "loop_info", None)
@@ -1225,6 +1325,10 @@ def _stamp_direct_loop_info(
             per_level: list[tuple[int, sympy.Expr]] = []
             if resolved_pos is not None and dep.index.coeff(loop_var) != 0:
                 per_level.append((resolved_pos, trip_count))
+            else:
+                structural = _structural_resolve(dep)
+                if structural is not None:
+                    per_level.append(structural)
             new_tiled_dims_per_read.append(per_level)
 
         output_tiled_dims_level: list[tuple[int, sympy.Expr]] = []
@@ -1233,6 +1337,10 @@ def _stamp_direct_loop_info(
             write_dep = writes[0]
             if resolved_pos is not None and write_dep.index.coeff(loop_var) != 0:
                 output_tiled_dims_level.append((resolved_pos, trip_count))
+            else:
+                structural = _structural_resolve(write_dep)
+                if structural is not None:
+                    output_tiled_dims_level.append(structural)
 
         if existing is None:
             op.loop_info = CoarseTileInfo(
@@ -1246,14 +1354,17 @@ def _stamp_direct_loop_info(
                 output_tiled_dims=[output_tiled_dims_level],
             )
         else:
-            # Stamping runs innermost-first (splice order), but every
-            # per-level list field's documented convention is
-            # outermost-first (loop_info.py's own docstring; the design
-            # spec; scheduler.py's and coarse_tile.py's reliance on
-            # loop_group_id[0] being the outermost level). So this call's
-            # (outer) contribution must be PREPENDED onto whatever an
-            # inner call already stamped, not appended -- appending would
-            # put levels in innermost-first order, the wrong way round.
+            # Stamping runs innermost-first (splice order; see
+            # splice_while_loops's own docstring), so the first call for a
+            # given op already put that inner level at index 0 (the
+            # existing=None branch above). Every per-level list field's
+            # documented convention is outermost-first (loop_info.py's own
+            # docstring; the design spec; scheduler.py's and
+            # coarse_tile.py's reliance on loop_group_id[0] being the
+            # outermost level), so this call's (strictly outer) contribution
+            # must be PREPENDED onto the front of what an inner call already
+            # stamped, not appended -- appending would leave the inner
+            # level at index 0, the wrong way round.
             merged_tiled_dims_per_read = list(existing.tiled_dims_per_read)
             if merged_tiled_dims_per_read and len(merged_tiled_dims_per_read) == len(
                 new_tiled_dims_per_read

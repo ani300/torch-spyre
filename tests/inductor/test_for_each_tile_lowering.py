@@ -58,15 +58,23 @@ from torch_spyre._inductor.wsr.for_each_tile_lowering import (
 class TestNestedForEachTileFixture(unittest.TestCase):
     """Eager-mode sanity check for the nested for_each_tile fixture's reference."""
 
+    # matmul_inputs() is fp32 at M,K,N=256,256,64: chunking K into 4 tiles
+    # of 64 and summing the partial products reorders fp32 accumulation
+    # relative to a single whole matmul, producing rounding noise beyond
+    # assert_close's tight fp32 defaults (atol=1e-05, rtol=1.3e-06) -- not a
+    # logic bug. Loosened explicitly rather than left at the default.
+    ATOL = 2e-4
+    RTOL = 1e-3
+
     def test_reference_matches_plain_matmul(self):
         (X, Y), expected = matmul_inputs()
         actual = nested_split_m_then_k_reference(X, Y)
-        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual, expected, atol=self.ATOL, rtol=self.RTOL)
 
     def test_eager_fn_matches_plain_matmul(self):
         (X, Y), expected = matmul_inputs()
         actual = nested_split_m_then_k_fn(X, Y)
-        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual, expected, atol=self.ATOL, rtol=self.RTOL)
 
 
 class TestCarryBindingsFor(unittest.TestCase):
@@ -1650,8 +1658,8 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.exc import InductorError
 
-        X = torch.randn(8, 12, device=DEVICE_NAME, dtype=torch.float16)
-        Y = torch.randn(12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        X = torch.randn(256, 256, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(256, 64, device=DEVICE_NAME, dtype=torch.float16)
 
         captured = {}
         original_splice_while_loops = passes_mod.splice_while_loops
@@ -1769,8 +1777,8 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
         from torch._inductor.exc import InductorError
 
-        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
-        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        X = torch.randn(2, 256, 256, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 256, 64, device=DEVICE_NAME, dtype=torch.float16)
         try:
             capture_post_grad_while_loop(triple_nested_stardep_outer_fn, (X, Y))
         except InductorError as exc:
@@ -1801,8 +1809,8 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
         from torch._inductor.exc import InductorError
 
-        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
-        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        X = torch.randn(2, 256, 256, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 256, 64, device=DEVICE_NAME, dtype=torch.float16)
         try:
             capture_post_grad_while_loop(triple_nested_stardep_middle_fn, (X, Y))
         except InductorError as exc:
@@ -1833,8 +1841,8 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
         from torch._inductor.exc import InductorError
 
-        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
-        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        X = torch.randn(2, 256, 256, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 256, 64, device=DEVICE_NAME, dtype=torch.float16)
         try:
             capture_post_grad_while_loop(triple_nested_stardep_inner_fn, (X, Y))
         except InductorError as exc:
@@ -1876,8 +1884,8 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
         from torch._inductor.exc import InductorError
 
-        X = torch.randn(2, 8, 12, device=DEVICE_NAME, dtype=torch.float16)
-        Y = torch.randn(2, 12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        X = torch.randn(2, 256, 256, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(2, 256, 64, device=DEVICE_NAME, dtype=torch.float16)
         try:
             capture_post_grad_while_loop(triple_nested_stardep_multilevel_fn, (X, Y))
         except InductorError as exc:
@@ -1917,8 +1925,8 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             sibling_nested_reference,
         )
 
-        X = torch.randn(8, 12, dtype=torch.float16)
-        Y = torch.randn(12, 6, dtype=torch.float16)
+        X = torch.randn(256, 256, dtype=torch.float16)
+        Y = torch.randn(256, 64, dtype=torch.float16)
         expected = sibling_nested_reference(X, Y)
         actual = sibling_nested_fn(X, Y)
         torch.testing.assert_close(actual, expected)
@@ -1959,8 +1967,8 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             sibling_nested_stardep_reference,
         )
 
-        X = torch.randn(8, 12, dtype=torch.float16)
-        Y = torch.randn(12, 6, dtype=torch.float16)
+        X = torch.randn(256, 256, dtype=torch.float16)
+        Y = torch.randn(256, 64, dtype=torch.float16)
         expected = sibling_nested_stardep_reference(X, Y)
         actual = sibling_nested_stardep_fn(X, Y)
         torch.testing.assert_close(actual, expected)
@@ -2017,8 +2025,8 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         from torch._inductor import ir
         from torch._inductor.exc import InductorError
 
-        X = torch.randn(8, 12, device=DEVICE_NAME, dtype=torch.float16)
-        Y = torch.randn(12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        X = torch.randn(256, 256, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(256, 64, device=DEVICE_NAME, dtype=torch.float16)
 
         captured = {}
         original_splice_while_loops = passes_mod.splice_while_loops
@@ -2099,8 +2107,8 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
         from torch._inductor.exc import InductorError
 
-        X = torch.randn(8, 12, device=DEVICE_NAME, dtype=torch.float16)
-        Y = torch.randn(12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        X = torch.randn(256, 256, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(256, 64, device=DEVICE_NAME, dtype=torch.float16)
 
         captured = {}
         original_splice_while_loops = passes_mod.splice_while_loops
@@ -2188,14 +2196,24 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         # The marker_resolution-aware guard in
         # _synthesize_dim_hints_for_group (issue #4581's fix) makes real
         # progress -- the pipeline now runs past the original codegen-time
-        # "indirect symbol" lookup failure -- but compilation still fails
-        # one stage further in, during op_spec_validation's OS-5
-        # symbol-consistency check on a synthetic `identity` op inserted by
-        # splice_while_loops's carry/tile-read redirect -- a distinct,
-        # not-yet-filed follow-up gap to #4581. test_carry_mode_split_k
-        # (test_for_each_tile_e2e.py) remains xfailed on the original #4460
-        # gap for its own shape (a StarDep-shaped matmul consumer, which
-        # does not hit #4581 or this OS-5 gap).
+        # "indirect symbol" lookup failure. The follow-up OS-5
+        # symbol-consistency gap on splice_while_loops's synthetic
+        # `identity` op (create_tensor_arg now strips WhileLoop-splice
+        # loop_var symbols like u5 out of the static device_coordinates
+        # and folds their contribution into device_tile_advance_expr
+        # instead) is fixed too. Compilation, scheduling, and codegen now
+        # all complete -- but the test still fails at the final numeric
+        # assertion, and the failure is nondeterministic run-to-run on
+        # this same fixed-seed-free fixture (confirmed via repeated clean-
+        # cache runs). This points to a memory-safety-class bug (a stale
+        # or aliased HBM read, likely in hbm_pool allocation lifetime or
+        # carry read/write scheduling order) rather than a deterministic
+        # addressing/indexing bug in the tiled_symbols/splice-var binding
+        # layer -- see issue #4701 for the full investigation writeup and
+        # next steps. test_carry_mode_split_k (test_for_each_tile_e2e.py)
+        # remains xfailed on the original #4460 gap for its own shape (a
+        # StarDep-shaped matmul consumer, which does not hit #4581 or the
+        # OS-5 gap).
         import torch
         import torch_spyre  # noqa: F401  registers the "spyre" device
         from torch_spyre.constants import DEVICE_NAME
@@ -2206,8 +2224,8 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         )
 
         torch._dynamo.reset()
-        X = torch.randn(8, 12, device=DEVICE_NAME, dtype=torch.float16)
-        Y = torch.randn(12, 6, device=DEVICE_NAME, dtype=torch.float16)
+        X = torch.randn(256, 256, device=DEVICE_NAME, dtype=torch.float16)
+        Y = torch.randn(256, 64, device=DEVICE_NAME, dtype=torch.float16)
         expected = nested_split_m_then_k_reference(X.cpu(), Y.cpu()).to(DEVICE_NAME)
 
         compiled = torch.compile(
