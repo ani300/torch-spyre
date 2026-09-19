@@ -1418,6 +1418,33 @@ def _stamp_direct_loop_info(
                 structural = _structural_resolve(write_dep, prior_output_levels)
                 if structural is not None:
                     output_tiled_dims_level.append(structural)
+                    # No marker resolved this op's own tiled position (the
+                    # `resolved_pos is None` branch above left
+                    # loop_tiled_dims empty), but the write dep structurally
+                    # resolves to a real tiled position at this level --
+                    # e.g. a stacking-carry write-out op (buf13/op13 in
+                    # test_add_tiled_multi_stick) that is neither a marker
+                    # nor a marker's consumer, so lookup_marker_dim/
+                    # _marker_dim both return None for it, yet its write
+                    # genuinely advances per trip. loop_tiled_dims must
+                    # record this position too: it feeds
+                    # spyre_kernel.py's create_op_spec (gated on
+                    # loop_tiled_dims, independently of output_tiled_dims)
+                    # as well as several coarse_tile.py consumers (e.g.
+                    # the reduction/consumer tiling check at
+                    # coarse_tile.py:960) that compare loop_tiled_dims
+                    # directly. Leaving it empty here caused the minted
+                    # advance symbol to appear in
+                    # TensorArg.device_tile_advance_expr (built from
+                    # output_tiled_dims via _general_tile_advance) but
+                    # never in OpSpec.tiled_symbols (built from
+                    # loop_tiled_dims via create_op_spec) -- exactly the
+                    # failure mode create_op_spec's own comment warns
+                    # about, silently pinning this op's write address
+                    # across every trip instead of advancing it.
+                    structural_pos, _ = structural
+                    if structural_pos not in loop_tiled_dims:
+                        loop_tiled_dims.append(structural_pos)
 
         if existing is None:
             op.loop_info = CoarseTileInfo(
