@@ -27,14 +27,26 @@ Minimum coverage per docs/superpowers/specs/2026-09-09-while-loop-lowering-desig
    page per trip from inside the body the way paged attention does.
 4. Multiple independent carries: covered by test_carry_mode_online_softmax
    (carry = (m, denom, acc), an online-softmax flash-attention inner loop).
-Cases 5 and 6 (nested for_each_tile and the deliberate-decline case) are
-follow-on work -- tracked as open items rather than duplicated here, since
-each needs its own fixture beyond what's vendored so far.
+Case 5 (nested for_each_tile) has partial coverage: TestForEachTileNestedMapE2E
+covers the pure map/map (no carry) two-level shape, both at a small debug
+size and at a multi-stick tile size; the carry-bearing nested shapes remain
+in test_for_each_tile_lowering.py's TestConsumeTileDimMarkers (IR-level) and
+this file's test_carry_mode_split_k. Case 6 (deliberate-decline) is still
+open, tracked as a follow-on item.
 
 test_map_mode_split_m (map mode: Kind.SLICE + Kind.INVARIANT operands, a
 stacking carry, no user carry) passes end to end with verified numerics and
 is the case that exercises the full splice -> DimHint synthesis ->
 coarse-tile -> single scf.for pipeline.
+
+TestForEachTilePointwiseE2E adds simpler single-level pointwise/softmax
+coverage (add, abs, a 3-operand abs(a+b)*c chain, row-tiled softmax),
+ported down from test_coarse_tile_e2e.py's HINT-driven test_add_*/test_abs_*
+and test_hint_softmax_row_tiling families -- for_each_tile doesn't need
+coarse_tile's exhaustive combinatorial coverage, but benefits from its own
+easy-to-debug cases, including a multi-stick tile_size variant of each
+(multi-stick tiling has been a historical source of bugs; see
+test_hint_softmax_row_tiling's docstring on the device_size[1] invariant).
 """
 
 import unittest
@@ -45,13 +57,26 @@ import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
 
 from tests.inductor.for_each_tile_fixtures import (
+    STICK_COLS,
+    STICK_ROWS,
+    abs_add_mul_tiled_fn,
+    abs_add_mul_tiled_reference,
+    abs_tiled_fn,
+    abs_tiled_reference,
+    add_tiled_fn,
+    add_tiled_reference,
     attention_inputs,
     matmul_inputs,
+    nested_add_outer_row_inner_col_fn,
+    nested_add_outer_row_inner_col_reference,
     online_softmax_fn,
     online_softmax_reference,
     paged_gather_fn,
     paged_gather_inputs,
     paged_gather_reference,
+    pointwise_inputs,
+    softmax_row_tiled_fn,
+    softmax_row_tiled_reference,
     split_k_fn,
     split_m_fn,
 )
@@ -191,6 +216,193 @@ class TestForEachTileE2E(unittest.TestCase):
         # score-weighted pages of magnitude ~sqrt(head_size), so fp16 matmul
         # rounding alone reaches a couple of absolute units here.
         torch.testing.assert_close(out.cpu().float(), ref, atol=2.0, rtol=0.05)
+
+
+class TestForEachTilePointwiseE2E(unittest.TestCase):
+    """Single-level map-mode pointwise/softmax fixtures, simpler than TestForEachTileE2E.
+
+    for_each_tile doesn't need coarse_tile_e2e's exhaustive combinatorial
+    coverage (see test_add_*/test_abs_* there); these cases exist to give
+    the lowering pipeline easy-to-debug pointwise/reduction coverage of its
+    own. Each op is tested at a small, single-stick debug size and again at
+    a tile_size that spans multiple 64-fp16-element sticks -- multi-stick
+    tiling has historically been a source of bugs (see
+    test_hint_softmax_row_tiling's device_size[1] docstring in
+    test_coarse_tile_e2e.py), so both sizes are kept as separate tests
+    rather than only covering the large one.
+    """
+
+    ATOL = 0.1
+    RTOL = 0.1
+
+    def test_add_tiled_small(self):
+        A, B, _ = pointwise_inputs()
+        A_spyre, B_spyre = A.half().to(DEVICE_NAME), B.half().to(DEVICE_NAME)
+        ref = add_tiled_reference(A.half().float(), B.half().float())
+
+        compiled = torch.compile(add_tiled_fn, backend="inductor", fullgraph=True)
+        out = compiled(A_spyre, B_spyre, 2)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_add_tiled_multi_stick(self):
+        A = torch.randn(STICK_ROWS, STICK_COLS)
+        B = torch.randn(STICK_ROWS, STICK_COLS)
+        A_spyre, B_spyre = A.half().to(DEVICE_NAME), B.half().to(DEVICE_NAME)
+        ref = add_tiled_reference(A.half().float(), B.half().float())
+
+        compiled = torch.compile(add_tiled_fn, backend="inductor", fullgraph=True)
+        # tile_size=128 rows, full 128-col width -> 2 sticks/row per tile.
+        out = compiled(A_spyre, B_spyre, 128)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_abs_tiled_small(self):
+        A, _, _ = pointwise_inputs()
+        A_spyre = A.half().to(DEVICE_NAME)
+        ref = abs_tiled_reference(A.half().float())
+
+        compiled = torch.compile(abs_tiled_fn, backend="inductor", fullgraph=True)
+        out = compiled(A_spyre, 2)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_abs_tiled_multi_stick(self):
+        A = torch.randn(STICK_ROWS, STICK_COLS)
+        A_spyre = A.half().to(DEVICE_NAME)
+        ref = abs_tiled_reference(A.half().float())
+
+        compiled = torch.compile(abs_tiled_fn, backend="inductor", fullgraph=True)
+        out = compiled(A_spyre, 128)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_abs_add_mul_tiled_small(self):
+        A, B, C = pointwise_inputs()
+        A_spyre = A.half().to(DEVICE_NAME)
+        B_spyre = B.half().to(DEVICE_NAME)
+        C_spyre = C.half().to(DEVICE_NAME)
+        ref = abs_add_mul_tiled_reference(
+            A.half().float(), B.half().float(), C.half().float()
+        )
+
+        compiled = torch.compile(
+            abs_add_mul_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(A_spyre, B_spyre, C_spyre, 2)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_abs_add_mul_tiled_multi_stick(self):
+        A = torch.randn(STICK_ROWS, STICK_COLS)
+        B = torch.randn(STICK_ROWS, STICK_COLS)
+        C = torch.randn(STICK_ROWS, STICK_COLS)
+        A_spyre, B_spyre, C_spyre = (
+            A.half().to(DEVICE_NAME),
+            B.half().to(DEVICE_NAME),
+            C.half().to(DEVICE_NAME),
+        )
+        ref = abs_add_mul_tiled_reference(
+            A.half().float(), B.half().float(), C.half().float()
+        )
+
+        compiled = torch.compile(
+            abs_add_mul_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(A_spyre, B_spyre, C_spyre, 128)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_softmax_row_tiled_small(self):
+        X, _, _ = pointwise_inputs()
+        X_spyre = X.half().to(DEVICE_NAME)
+        ref = softmax_row_tiled_reference(X.half().float())
+
+        compiled = torch.compile(
+            softmax_row_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 2)
+
+        torch.testing.assert_close(out.cpu().float(), ref, atol=0.02, rtol=0.1)
+
+    def test_softmax_row_tiled_multi_stick(self):
+        """Row-tile size spans 2 sticks/row -- see test_hint_softmax_row_tiling."""
+        X = torch.rand(STICK_ROWS, STICK_COLS)
+        X_spyre = X.half().to(DEVICE_NAME)
+        ref = softmax_row_tiled_reference(X.half().float())
+
+        compiled = torch.compile(
+            softmax_row_tiled_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(X_spyre, 128)
+
+        # Tight atol, same rationale as test_hint_softmax_row_tiling: a
+        # per-tile device_size bug that shrinks the row-stride dim would
+        # corrupt stick groups after the first with an error far exceeding
+        # fp16 rounding noise on random inputs in [0, 1).
+        torch.testing.assert_close(out.cpu().float(), ref, atol=0.02, rtol=0.1)
+
+
+class TestForEachTileNestedMapE2E(unittest.TestCase):
+    """Two-level nested for_each_tile, both levels pure map mode (no carry).
+
+    Separate tier from the carry-based nested fixtures in
+    for_each_tile_fixtures.py (nested_split_m_then_k_fn,
+    triple_nested_stardep_*): here the outer loop tiles one dimension and
+    the inner loop tiles a DIFFERENT dimension of the same operands, and
+    neither level carries a reduction -- the simplest shape that still
+    requires dimension-provenance resolution across two nesting levels.
+    """
+
+    ATOL = 0.1
+    RTOL = 0.1
+
+    def test_nested_add_outer_row_inner_col_small(self):
+        A, B, _ = pointwise_inputs(rows=4, cols=8)
+        A_spyre, B_spyre = A.half().to(DEVICE_NAME), B.half().to(DEVICE_NAME)
+        ref = nested_add_outer_row_inner_col_reference(
+            A.half().float(), B.half().float()
+        )
+
+        compiled = torch.compile(
+            nested_add_outer_row_inner_col_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(A_spyre, B_spyre, 2, 2)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_nested_add_outer_row_inner_col_multi_stick(self):
+        A = torch.randn(STICK_ROWS, STICK_COLS)
+        B = torch.randn(STICK_ROWS, STICK_COLS)
+        A_spyre, B_spyre = A.half().to(DEVICE_NAME), B.half().to(DEVICE_NAME)
+        ref = nested_add_outer_row_inner_col_reference(
+            A.half().float(), B.half().float()
+        )
+
+        compiled = torch.compile(
+            nested_add_outer_row_inner_col_fn, backend="inductor", fullgraph=True
+        )
+        # Outer tiles 128 rows at a time; inner tiles 128 cols (2 sticks) at
+        # a time within each outer row-tile.
+        out = compiled(A_spyre, B_spyre, 128, 128)
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
 
 
 if __name__ == "__main__":
