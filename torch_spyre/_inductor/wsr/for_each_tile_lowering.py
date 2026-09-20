@@ -1922,6 +1922,7 @@ def splice_while_loops(graph) -> None:
     """
     from torch._inductor import ir
 
+    from torch_spyre._inductor.wsr.coarse_tile import _rebase_point_splice_reads
     from torch_spyre._inductor.wsr.while_loop_bridge import (
         carry_bindings_for,
         splice_while_loop,
@@ -1987,3 +1988,20 @@ def splice_while_loops(graph) -> None:
         _stamp_direct_loop_info(
             resolved_ops, None, loop_var, trip_count, level_group_idx
         )
+
+    # Read-side counterpart of the stamping above: _stamp_direct_loop_info
+    # records a point-shaped splice read's per-trip step in
+    # squeezed_advance_per_read (mirroring coarse_tile.py's own
+    # _point_splice_advance_for_dep -- see that function's docstring), but
+    # leaves the read's index itself unrebased (e.g. paged attention's
+    # in-body page index, dep.index == 32*u0). main reaches
+    # _rebase_point_splice_reads for this same shape via
+    # coarse_tile_pre_stickify (_coarse_tile_common calls it unconditionally
+    # at the end of planning), which this branch never calls for
+    # WhileLoop-splice groups -- see this function's own docstring. Without
+    # this call the raw indirect symbol survives into
+    # propagate_spyre_tensor_layouts, which rejects it (not an
+    # iteration_space key). Run once, after every level's stamping has been
+    # merged in above, so squeezed_advance_per_read reflects each op's final,
+    # fully-merged state rather than a partially-stamped intermediate.
+    _rebase_point_splice_reads(graph.operations)
