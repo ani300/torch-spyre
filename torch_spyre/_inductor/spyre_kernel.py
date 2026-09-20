@@ -524,26 +524,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._general_tile_advance_seen: dict[str, int] = {}
         self._tile_advance_symbols: dict[int, sympy.Symbol] = {}
         self._alignment_repeat_info: dict[sympy.Symbol, dict[str, Any]] = {}
-        # Splice loop_vars _general_tile_advance's most recent call folded
-        # into a per-level term instead of an independent additive term (see
-        # _general_tile_advance's own "subsumed_splice_vars" side channel --
-        # mirrors _general_tile_advance_seen's per-call side-channel shape).
-        # create_tensor_arg unions this into covered_splice_vars because
-        # such a var is absent from device_tile_advance_expr.free_symbols
-        # (the per-level substitution zeroes it) even though it IS covered.
-        self._subsumed_splice_vars: set[sympy.Symbol] = set()
-        # Splice loop_vars _general_tile_advance folded in as their own
-        # independent additive term (the uncovered_splice_vars branch,
-        # complementary to _subsumed_splice_vars above) across every
-        # create_tensor_arg call for the op currently being built. These
-        # never correspond to a loop_info-tiled level -- op23 in
-        # test_nested_for_each_tile_value_correct has none -- so the
-        # tiled_syms-building loop below (which only walks loop_info's own
-        # levels) would otherwise never register them, leaving
-        # device_tile_advance_expr's own u5 term absent from
-        # OpSpec.tiled_symbols and silently dropped by generate_sdsc's
-        # affine-stride extraction (which only walks tiled_symbols).
-        self._uncovered_splice_vars_seen: dict[sympy.Symbol, int] = {}
         self.scheduled_nodes: list[SchedulerNode] = []
         self.failed_node: SchedulerNode | None = None
         self.pool_size: int = pool_size
@@ -675,14 +655,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         without loop_info/coarse tiling.
         """
         ir_node = self.current_node.node
-        # Reset this call's "subsumed splice var" side channel unconditionally
-        # up front, before any of this function's several early `return
-        # None`s below -- create_tensor_arg reads self._subsumed_splice_vars
-        # right after calling this function for the SAME tensor/name, so a
-        # stale value from a prior tensor's call within the same op (store()/
-        # store_reduction() only reset this once per op, not once per
-        # create_tensor_arg call) must never leak into this call's result.
-        self._subsumed_splice_vars = set()
         loop_info = getattr(ir_node, "loop_info", None)
         if loop_info is None:
             return None
@@ -752,69 +724,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         device_size = tensor.layout.device_layout.device_size
         stride_map = tensor.layout.device_layout.stride_map
 
-        # A WhileLoop-splice loop_var (e.g. from an outer-scope splice
-        # unrelated to whichever dim(s) this dep has tiled) can be a free
-        # symbol in dep.index alongside a genuinely tiled dim -- these are
-        # NOT mutually exclusive on the same dep. Each per-level
-        # substitution below zeroes every free symbol not tied to that
-        # level's own tiled dims -- including splice symbols -- which is
-        # correct per-level (a splice symbol isn't part of any tiling
-        # level's advance and must not appear inside a per-level term, or
-        # it would be double-counted once per level). Its own dep-level
-        # (not level-level) contribution is folded in exactly once after
-        # the loop, as an independent additive term, the same way
-        # squeezed_pairs' terms are.
-        splice_loop_vars = set(loop_var_ranges_from_dim_hints(ir_node))
-        splice_vars_present = splice_loop_vars & dep.index.free_symbols
-
-        def _primary_device_dim(step: "sympy.Expr | int") -> int:
-            """Device dim tiling_expr_to_device_expr would pick for `step`.
-
-            Mirrors tiling_expr_to_device_expr's own dim-selection rule
-            (largest stride_map[i] <= step among dims with device_size[i] >
-            1) so a collision between a splice symbol's device dim and an
-            already-tiled host dim's device dim can be detected without
-            duplicating that projection itself.
-            """
-            concrete_step = int(step) if isinstance(step, int) or step.is_number else -1
-            j = -1
-            for i in range(len(stride_map)):
-                if (
-                    device_size[i] > 1
-                    and stride_map[i] > (stride_map[j] if j != -1 else 0)
-                    and stride_map[i] <= concrete_step
-                ):
-                    j = i
-            return j
-
         if not per_level_dims and not any(squeezed_advance_per_level):
-            # loop_info covers nothing for this arg (no tiled level, no
-            # squeezed advance): a live splice loop_var here is the SOLE
-            # source of this arg's per-trip advance, not a residual on top
-            # of some level's own term -- fold it in directly rather than
-            # going through the "already claimed by a tiled level" dance
-            # below, which has nothing to compare against.
-            if not splice_vars_present:
-                return None
-            self._uncovered_splice_vars_seen.update(
-                {
-                    var: int(loop_var_ranges_from_dim_hints(ir_node)[var])
-                    for var in splice_vars_present
-                }
-            )
-            static_index = dep.index.xreplace(
-                {var: sympy.S.Zero for var in splice_vars_present}
-            )
-            splice_host_expr = dep.index - static_index
-            return tiling_expr_to_device_expr(device_size, stride_map, splice_host_expr)
-
-        tiled_device_dims: set[int] = set()
-        for level_dim_extent_pairs in per_level_dims:
-            for host_dim, _extent in level_dim_extent_pairs:
-                host_sym = self._host_dim_to_index_symbol(ir_node, host_dim)
-                step = dep.index.coeff(host_sym)
-                if step != 0:
-                    tiled_device_dims.add(_primary_device_dim(step))
+            return None
 
         total_device_expr: "sympy.Expr | None" = None
         n_levels = max(len(per_level_dims), len(squeezed_advance_per_level))
@@ -852,38 +763,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                 device_expr
                 if total_device_expr is None
                 else total_device_expr + device_expr
-            )
-
-        # A splice symbol's own device dim can coincide with a device dim a
-        # tiled host dim already claims (both project to the same
-        # stride_map entry even though their host-index symbols differ) --
-        # in that case the per-level term above already advances that
-        # device dim once per trip on the scheduler's behalf, and adding
-        # the splice symbol's own term would double it. Only fold in a
-        # splice var's residual for a dim no per-level term has already
-        # claimed.
-        uncovered_splice_vars = {
-            var
-            for var in splice_vars_present
-            if _primary_device_dim(dep.index.coeff(var)) not in tiled_device_dims
-        }
-        if uncovered_splice_vars:
-            splice_loop_var_ranges = loop_var_ranges_from_dim_hints(ir_node)
-            for var in uncovered_splice_vars:
-                self._uncovered_splice_vars_seen[var] = int(splice_loop_var_ranges[var])
-        self._subsumed_splice_vars = splice_vars_present - uncovered_splice_vars
-        if uncovered_splice_vars:
-            static_index = dep.index.xreplace(
-                {var: sympy.S.Zero for var in uncovered_splice_vars}
-            )
-            splice_host_expr = dep.index - static_index
-            splice_device_expr = tiling_expr_to_device_expr(
-                device_size, stride_map, splice_host_expr
-            )
-            total_device_expr = (
-                splice_device_expr
-                if total_device_expr is None
-                else total_device_expr + splice_device_expr
             )
 
         return total_device_expr
@@ -940,13 +819,14 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         # A WhileLoop-splice loop variable describes the address advance from
         # one counted-loop trip to the next, not an in-tile iteration axis.
-        # _general_tile_advance converts it to the backend's dedicated
-        # device_tile_advance_expr below -- covering both the "subsumed"
-        # (folded into an existing tiled level) and "uncovered" (its own
-        # additive term) cases, see that method's docstring. Pin every
-        # splice loop_var to trip zero in the base coordinates so the raw
-        # unbacked symbol neither leaks into the OpSpec iteration space nor
-        # applies the same advance a second time.
+        # Its advance is already explicit in loop_info (tiled_dims_per_read/
+        # output_tiled_dims or squeezed_advance_per_read/squeezed_advance_
+        # output, stamped by the WhileLoop-lowering pass -- see
+        # _general_tile_advance's docstring), which that method folds into
+        # device_tile_advance_expr below. Pin every splice loop_var to trip
+        # zero in the base coordinates so the raw unbacked symbol neither
+        # leaks into the OpSpec iteration space nor applies the same
+        # advance a second time.
         device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         loop_var_ranges = loop_var_ranges_from_dim_hints(operation)
         base_index = sympy_subs(
@@ -1099,38 +979,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                         tiled_symbol_trip_counts[sym] = trip_count
             # Reverse so index 0 = innermost level.
             tiled_syms = list(reversed(tiled_syms_per_level_outermost))
-
-        # A WhileLoop-splice loop_var (e.g. u5) that _general_tile_advance
-        # covered via its uncovered_splice_vars mechanism (see that
-        # function's own comment) has a real, correct term in some arg's
-        # device_tile_advance_expr, but is not one of this op's own
-        # loop_info-tiled levels -- op23 in test_nested_for_each_tile_value_
-        # correct has none at all (every level in raw_tiled_dims/
-        # raw_tiled_red_dims/squeezed-advance is empty, so no level above
-        # ever minted a symbol). Such a var would otherwise never reach
-        # OpSpec.tiled_symbols, and generate_sdsc's affine-stride extraction
-        # only walks tiled_symbols, so the address would silently never
-        # advance at runtime for it.
-        #
-        # Only append this extra level when loop_info genuinely supplies
-        # none of its own (every existing level came back with no minted
-        # symbol) -- when it does supply real levels, loop_group_id/
-        # output_tiled_dims already give the op the correct LoopSpec
-        # nesting/ancestor count, and adding one more tiled_symbols level on
-        # top would exceed the real number of enclosing loops (see
-        # op_spec_validation's "affine_strides has N levels but only M
-        # enclosing loop(s)" check in bundle.py's _collect_affine_maps).
-        has_any_real_tiled_level = any(tiled_syms)
-        if self._uncovered_splice_vars_seen and not has_any_real_tiled_level:
-            splice_level_syms = sorted(
-                self._uncovered_splice_vars_seen, key=sympy.default_sort_key
-            )
-            # The splice loop wraps this op's own tiling entirely, so it is
-            # the outermost level -- appended last, since tiled_syms is
-            # ordered innermost-first.
-            tiled_syms.append(splice_level_syms)
-            for sym in splice_level_syms:
-                tiled_symbol_trip_counts[sym] = self._uncovered_splice_vars_seen[sym]
 
         # Collect (max, granularity) bounds for any symbolic iteration-space
         # dims. These are passed through OpSpec so SDSC codegen can emit
@@ -1287,8 +1135,6 @@ class SpyreKernel(Kernel[CSEVariable]):
     ) -> None:
         self._general_tile_advance_seen = {}
         self._tile_advance_symbols = {}
-        self._subsumed_splice_vars = set()
-        self._uncovered_splice_vars_seen = {}
         self._alignment_repeat_info = {}
         # mutation_real_name maps mutation aliases to their real destination buffer. Resolve that here,
         # and mark the buf name as removed so the wrapper does not allocate it separately.
@@ -1419,8 +1265,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         """Convert an RValue"""
         self._general_tile_advance_seen = {}
         self._tile_advance_symbols = {}
-        self._subsumed_splice_vars = set()
-        self._uncovered_splice_vars_seen = {}
         self._alignment_repeat_info = {}
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()

@@ -142,34 +142,34 @@ class TestForEachTileE2E(_DynamoResetTestCase):
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
 
-    @unittest.expectedFailure
     def test_carry_mode_split_k(self):
         """Carry mode: accumulate a split-K matmul across tiles.
 
-        XFAIL on a gap in read-copy layout reconciliation, downstream of and
-        distinct from everything this test's own lowering path needs -- the
-        accumulator carry itself is wired correctly and WSR's own tiled-
-        reduction accumulator (coarse_tile_fill/combine on the K level) picks
-        the K accumulation up as intended. Tracked as issue #4460.
-
-        The gap: ``for_each_tile``'s ``xs`` leaves for ``dims=(-1, 0)`` are
-        3-D, transposed, ``movedim``-derived views of the operands
+        Previously XFAIL (issue #4460) on a gap in read-copy layout
+        reconciliation: ``for_each_tile``'s ``xs`` leaves for ``dims=(-1,
+        0)`` are 3-D, transposed, ``movedim``-derived views of the operands
         (``[4, 3, 8]`` stride ``[3, 1, 12]`` for X, ``[4, 3, 6]`` stride
         ``[18, 6, 1]`` for Y). The K-advancing reads of those leaves route
-        through ``coarse_tile.py``'s read-copy machinery, which builds tile
+        through ``coarse_tile.py``'s read-copy machinery, which built tile
         buffers whose own layouts (e.g. ``[8, 6, 3]`` stride ``[0, 1, 6]`` --
-        a broadcast leading dim over transposed inner dims) then fail stick
-        reconciliation in ``optimize_restickify.py``/``propagate_layouts.py``
-        ("No mechanism to scatter elements from one stick to multiple
-        sticks"). The equivalent HINT-driven K-tiled matmul (same M/K/N,
-        ``spyre_hint(num_tiles_per_dim={"K": 4})``) compiles and is
-        numerically correct, and needs no read copies at all -- it reads the
-        2-D operands directly. So this is a read-copy/stick-layout gap
-        surfaced by the 3-D stacked-leaf shape, not a while_loop-lowering
-        one, and it needs the same kind of layout work that the map-mode
-        carry's own ``[4, 2, 6] -> [8, 6]`` fold needed (see
-        ``while_loop_bridge.fold_stacked_carry_layout``) applied to the
-        read side.
+        a broadcast leading dim over transposed inner dims) then failed
+        stick reconciliation in
+        ``optimize_restickify.py``/``propagate_layouts.py`` ("No mechanism
+        to scatter elements from one stick to multiple sticks").
+
+        Now passes: confirmed via isolated stash/pop bisection that this is
+        fixed by the splice-var/``loop_info`` symbol-consistency work in
+        ``spyre_kernel.py``/``for_each_tile_lowering.py`` (the same
+        OS-5/``_synthesize_dim_hints_for_group`` fixes described in
+        ``test_nested_for_each_tile_value_correct``'s docstring, which
+        closed the original stick-reconciliation crash for this fixture
+        family) -- not by ``insert_restickify.py``'s unrelated online-
+        softmax K-advance fix (issue #4581), which this test passes with or
+        without. Without the ``spyre_kernel.py``/``for_each_tile_lowering.py``
+        fixes, this now fails as a silent-wrong-answer (96% mismatched
+        elements) rather than the original compile-time crash, confirming
+        the stick-reconciliation gap itself is closed and any remaining
+        exposure is in a different, already-covered layer.
         """
         X_spyre, Y_spyre, ref = self._operands()
 

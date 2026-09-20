@@ -986,12 +986,11 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         """IR-level value assertion for split_k_fn's reduction-dim marker.
 
         Uses self._run_graph (this class's own established pattern, see its
-        docstring above) rather than a full torch.compile capture: driving
-        split_k_fn through real codegen hits a pre-existing, out-of-scope
-        read-copy/stick-layout gap in propagate_layouts.py (tracked as issue
-        #4460, see test_carry_mode_split_k's own XFAIL docstring in
-        test_for_each_tile_e2e.py) that has nothing to do with marker
-        resolution.
+        docstring above) rather than a full torch.compile capture: this
+        keeps the test focused on marker resolution alone, independent of
+        the full lowering/codegen pipeline (see test_carry_mode_split_k in
+        test_for_each_tile_e2e.py, issue #4460, for that pipeline's own
+        now-passing end-to-end coverage of this fixture family).
 
         split_k_fn's matmul lowers on this CPU fixture as an aten-fallback
         ExternKernelOut -- a StarDep-shaped consumer, same as split_m_fn's
@@ -1611,9 +1610,9 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         pass in the pipeline (propagate_named_dims, assign_dim_hints, ...,
         propagate_spyre_tensor_layouts, codegen) runs after it and is
         irrelevant to what this test checks. Issue #4460's stick-layout/
-        read-copy gap (the same gap test_carry_mode_split_k is xfailed
-        for in test_for_each_tile_e2e.py) is now fixed for this fixture's
-        shape. The marker_resolution-aware guard in
+        read-copy gap (the same gap test_carry_mode_split_k in
+        test_for_each_tile_e2e.py now passes against) is now fixed for
+        this fixture's shape. The marker_resolution-aware guard in
         _synthesize_dim_hints_for_group (this task's fix) makes the
         STAR_DEP_KEPT outer marker get a synthesized dim hint it
         previously lacked -- confirmed real progress, since the pipeline
@@ -2216,9 +2215,11 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         # addressing/indexing bug in the tiled_symbols/splice-var binding
         # layer -- see issue #4701 for the full investigation writeup and
         # next steps. test_carry_mode_split_k (test_for_each_tile_e2e.py)
-        # remains xfailed on the original #4460 gap for its own shape (a
-        # StarDep-shaped matmul consumer, which does not hit #4581 or the
-        # OS-5 gap).
+        # now passes: its StarDep-shaped matmul consumer turned out to hit
+        # the same OS-5 symbol-consistency layer as this fixture, and does
+        # not hit the #4701 nondeterministic memory-safety gap this test
+        # remains xfailed on (confirmed via isolated stash/pop bisection --
+        # see that test's own docstring).
         import torch
         import torch_spyre  # noqa: F401  registers the "spyre" device
         from torch_spyre.constants import DEVICE_NAME

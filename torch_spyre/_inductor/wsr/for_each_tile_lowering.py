@@ -1259,9 +1259,25 @@ def _stamp_direct_loop_info(
     order regardless of which level's call invokes it (it is a pure
     function of the op's own current IR, not of loop_info), so appending
     this level's per-read entry at the same read-index an outer call already
-    populated is positionally safe. squeezed_advance_per_read/
-    squeezed_advance_output are left at their [] defaults -- Task 5's
-    concern, not this one's.
+    populated is positionally safe.
+
+    squeezed_advance_per_read/squeezed_advance_output cover a dep whose
+    index carries a nonzero coefficient on loop_var that neither
+    _extent_at_pos nor _structural_resolve could attribute to one of this
+    op's own tiled dims (e.g. a point-shaped or already-resolved-elsewhere
+    read/write) -- mirroring coarse_tile.py's own
+    _point_splice_advance_for_dep, which records the identical
+    (coefficient, 1) shape for its own splice-only advances. This is
+    stamped explicitly here, at ground-truth time, specifically so
+    SpyreKernel._general_tile_advance never needs to re-derive whether a
+    splice symbol merely appearing in dep.index implies a real per-trip
+    advance -- it does not in general (see the confirmed bug on a
+    restickified V-tile pool read, which is genuinely pinned across trips
+    despite loop_var being a free symbol of its dep.index by construction,
+    found via test_carry_mode_online_softmax). A dep whose coefficient on
+    loop_var is exactly zero gets no entry at all here, which is itself the
+    explicit "pinned, do not advance" verdict -- not a gap for
+    _general_tile_advance to fill in.
 
     Also appends a minimal ``DimHint(loop_var=loop_var,
     loop_var_range=trip_count)`` onto ``op.dim_hints``. This is NOT a
@@ -1281,6 +1297,7 @@ def _stamp_direct_loop_info(
     once already fixed for the old mechanism.
     """
     from torch._inductor.dependencies import MemoryDep
+    from torch._inductor.ir import Reduction
 
     from torch_spyre._inductor.errors import Unsupported
     from torch_spyre._inductor.loop_info import CoarseTileInfo
@@ -1288,6 +1305,7 @@ def _stamp_direct_loop_info(
     from torch_spyre._inductor.wsr.coarse_tile import (
         _loop_var_to_ranges_pos,
         op_out_coords,
+        reduction_loop_vars,
     )
 
     def _structural_resolve(
@@ -1382,7 +1400,9 @@ def _stamp_direct_loop_info(
         extent = dep_loop_var_coeff / mapped_coeff
         return structural_pos, extent
 
-    def _extent_at_pos(dep: "MemoryDep", pos: int) -> "sympy.Expr | None":
+    def _extent_at_pos(
+        dep: "MemoryDep", pos: int, is_reduction: bool
+    ) -> "sympy.Expr | None":
         """This dep's own per-trip tile extent at marker-resolved `pos`.
 
         lookup_marker_dim resolves POSITION only (via a coefficient-
@@ -1399,21 +1419,50 @@ def _stamp_direct_loop_info(
         for a row-stride-64 buffer), silently reading past/aliasing wrong
         rows on later trips.
 
+        `pos` is in the same namespace lookup_marker_dim resolved it in:
+        op_out_coords positions when is_reduction is False, or this op's
+        own reduction_loop_vars positions when True (mirrors
+        lookup_marker_dim's own out_coords/red_vars split). Using
+        op_out_coords unconditionally here previously made this function
+        always miss for a reduction-position resolution -- op_out_coords
+        is scoped to the op's WRITE dep only (see pass_utils.op_out_coords)
+        and never contains a reduction position -- so a dep that
+        genuinely tiles along a reduction dim (e.g. a K/V tile read
+        inside an online-softmax reduction) fell through to the
+        squeezed-advance fallback below, which is only valid for
+        point-shaped reads (see that branch's comment) and silently
+        produced a wrong device advance for a real, multi-element tiled
+        read. Found via test_carry_mode_online_softmax.
+
         Re-derives the same coefficient-coincidence equation
         lookup_marker_dim used to find pos in the first place
         (dep.index.coeff(var) * dep.ranges[var] == dep.index.coeff(
         loop_var)), scoped to dep's own ranges rather than trusting
-        `pos` alone -- `pos` is an op_out_coords position, and more than
-        one dep.ranges var can share it only when they're genuinely the
-        same tiled dim, so re-matching here is safe and mirrors
-        _structural_resolve's identical pattern just above.
+        `pos` alone -- `pos` is a position in the relevant namespace, and
+        more than one dep.ranges var can share it only when they're
+        genuinely the same tiled dim, so re-matching here is safe and
+        mirrors _structural_resolve's identical pattern just above.
         """
-        out_coords = op_out_coords(op)
-        if pos >= len(out_coords):
-            return None
+        if is_reduction:
+            red_vars = (
+                reduction_loop_vars(op)
+                if isinstance(getattr(op, "data", None), Reduction)
+                else []
+            )
+            if pos >= len(red_vars):
+                return None
+            target_var = red_vars[pos]
+        else:
+            out_coords = op_out_coords(op)
+            if pos >= len(out_coords):
+                return None
+            target_var = None
         dep_loop_var_coeff = dep.index.coeff(loop_var)
         for var, rng in dep.ranges.items():
-            if _loop_var_to_ranges_pos(out_coords, var) != pos:
+            if is_reduction:
+                if var != target_var:
+                    continue
+            elif _loop_var_to_ranges_pos(out_coords, var) != pos:
                 continue
             var_coeff = dep.index.coeff(var)
             if var_coeff == 0:
@@ -1441,13 +1490,31 @@ def _stamp_direct_loop_info(
         loop_tiled_dims: list[int] = []
         loop_tiled_reduction_dims: list[int] = []
         resolved_pos: int | None = None
+        resolved_is_reduction = False
+        # tiled_dims_per_read/output_tiled_dims (unlike loop_tiled_dims/
+        # loop_tiled_reduction_dims, which are separate lists and always
+        # store a raw op.data.reduction_ranges index) use ONE shared
+        # position space where a reduction dim is offset by
+        # n_output_dims == len(op.data.ranges) -- see loop_info.py's
+        # tiled_dims_per_read docstring ("n_output_dims + reduction_pos
+        # for reduction dims") and spyre_kernel.py's
+        # _host_dim_to_index_symbol, which decodes exactly that offset.
+        # _extent_at_pos operates in this same shared space (its
+        # is_reduction branch indexes reduction_loop_vars directly, which
+        # is reduction_pos, not the offset value), so resolved_pos must be
+        # converted here before being passed to it or stored below.
+        tiled_dims_per_read_pos: int | None = None
         if resolved is not None:
             ranges_pos, is_reduction = resolved
             resolved_pos = ranges_pos
+            resolved_is_reduction = is_reduction
             if is_reduction:
                 loop_tiled_reduction_dims.append(ranges_pos)
+                n_output_dims = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
+                tiled_dims_per_read_pos = n_output_dims + ranges_pos
             else:
                 loop_tiled_dims.append(ranges_pos)
+                tiled_dims_per_read_pos = ranges_pos
         elif (marker_dim := _marker_dim(op)) is not None:
             # op is itself a tile_dim_marker (not a marker CONSUMER, which
             # lookup_marker_dim above already covers) that survived splicing
@@ -1466,6 +1533,7 @@ def _stamp_direct_loop_info(
             # marker-to-consumer case, since the marker IS this op).
             resolved_pos = marker_dim
             loop_tiled_dims.append(resolved_pos)
+            tiled_dims_per_read_pos = marker_dim
 
         rw = op.get_read_writes()
         # StarDep has no .index (raises NotImplementedError, not
@@ -1475,15 +1543,17 @@ def _stamp_direct_loop_info(
         reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
         existing_per_read = list(existing.tiled_dims_per_read) if existing else []
         new_tiled_dims_per_read: list[list[tuple[int, sympy.Expr]]] = []
+        new_squeezed_advance_per_read: list[list[tuple[sympy.Expr, sympy.Expr]]] = []
         for read_idx, dep in enumerate(reads):
             per_level: list[tuple[int, sympy.Expr]] = []
+            squeezed_level: list[tuple[sympy.Expr, sympy.Expr]] = []
             extent = (
-                _extent_at_pos(dep, resolved_pos)
+                _extent_at_pos(dep, resolved_pos, resolved_is_reduction)
                 if resolved_pos is not None and dep.index.coeff(loop_var) != 0
                 else None
             )
-            if extent is not None and resolved_pos is not None:
-                per_level.append((resolved_pos, extent))
+            if extent is not None and tiled_dims_per_read_pos is not None:
+                per_level.append((tiled_dims_per_read_pos, extent))
             else:
                 prior_levels = (
                     [entry for level in existing_per_read[read_idx] for entry in level]
@@ -1493,19 +1563,48 @@ def _stamp_direct_loop_info(
                 structural = _structural_resolve(dep, prior_levels)
                 if structural is not None:
                     per_level.append(structural)
+                else:
+                    # loop_var is a genuine free symbol of this dep's index
+                    # but neither a marker nor op_out_coords could resolve
+                    # it to one of this op's own tiled dims -- e.g. a
+                    # ReStickifyOpHBM/pool read whose dep.index carries no
+                    # loop_var term at all (dep genuinely pinned: coeff==0,
+                    # nothing to record here), or -- the case this branch
+                    # exists for -- a point-shaped or otherwise dim-less
+                    # dependency where loop_var is the SOLE source of the
+                    # per-trip address step (mirrors coarse_tile.py's
+                    # _point_splice_advance_for_dep, which records the
+                    # identical shape for its own splice-only advances).
+                    # Stamp that coefficient explicitly into
+                    # squeezed_advance_per_read/output rather than leaving
+                    # it for SpyreKernel._general_tile_advance to re-derive
+                    # from raw dep.index.free_symbols -- that re-derivation
+                    # cannot distinguish "loop_var present but this dep is
+                    # pinned" from "loop_var present and this dep genuinely
+                    # advances," which silently corrupted a restickified
+                    # V-tile pool buffer's address on trip 2+ (issue found
+                    # via test_carry_mode_online_softmax). A zero
+                    # coefficient here means this dep's address truly does
+                    # not depend on loop_var -- leave squeezed_level empty,
+                    # an explicit "pinned" verdict, not an omission.
+                    coeff = dep.index.coeff(loop_var)
+                    if coeff != 0:
+                        squeezed_level.append((coeff, sympy.Integer(1)))
             new_tiled_dims_per_read.append(per_level)
+            new_squeezed_advance_per_read.append(squeezed_level)
 
         output_tiled_dims_level: list[tuple[int, sympy.Expr]] = []
+        squeezed_advance_output_level: list[tuple[sympy.Expr, sympy.Expr]] = []
         writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
         if writes:
             write_dep = writes[0]
             write_extent = (
-                _extent_at_pos(write_dep, resolved_pos)
+                _extent_at_pos(write_dep, resolved_pos, resolved_is_reduction)
                 if resolved_pos is not None and write_dep.index.coeff(loop_var) != 0
                 else None
             )
-            if write_extent is not None and resolved_pos is not None:
-                output_tiled_dims_level.append((resolved_pos, write_extent))
+            if write_extent is not None and tiled_dims_per_read_pos is not None:
+                output_tiled_dims_level.append((tiled_dims_per_read_pos, write_extent))
             else:
                 prior_output_levels = (
                     [entry for level in existing.output_tiled_dims for entry in level]
@@ -1542,6 +1641,17 @@ def _stamp_direct_loop_info(
                     structural_pos, _ = structural
                     if structural_pos not in loop_tiled_dims:
                         loop_tiled_dims.append(structural_pos)
+                else:
+                    # Same explicit-stamping rationale as the read-side
+                    # else-branch above: record a genuinely splice-var-only
+                    # write advance directly, rather than leaving it for
+                    # _general_tile_advance to re-derive from raw
+                    # dep.index.free_symbols.
+                    write_coeff = write_dep.index.coeff(loop_var)
+                    if write_coeff != 0:
+                        squeezed_advance_output_level.append(
+                            (write_coeff, sympy.Integer(1))
+                        )
 
         if existing is None:
             op.loop_info = CoarseTileInfo(
@@ -1553,6 +1663,10 @@ def _stamp_direct_loop_info(
                     [per_read] for per_read in new_tiled_dims_per_read
                 ],
                 output_tiled_dims=[output_tiled_dims_level],
+                squeezed_advance_per_read=[
+                    [per_read] for per_read in new_squeezed_advance_per_read
+                ],
+                squeezed_advance_output=[squeezed_advance_output_level],
             )
         else:
             # Stamping actually runs outermost-first: splice_while_loops
@@ -1596,6 +1710,27 @@ def _stamp_direct_loop_info(
                     [per_read] for per_read in new_tiled_dims_per_read
                 ]
 
+            # Same outermost-first append convention as tiled_dims_per_read
+            # above, kept in its own block since it has an independent
+            # existing-shape guard (squeezed_advance_per_read can be empty
+            # on `existing` even when tiled_dims_per_read is not, e.g. an
+            # outer level that resolved every dep structurally and stamped
+            # no splice-only advances at all).
+            existing_squeezed_per_read = list(existing.squeezed_advance_per_read)
+            if existing_squeezed_per_read and len(existing_squeezed_per_read) == len(
+                new_squeezed_advance_per_read
+            ):
+                merged_squeezed_advance_per_read = [
+                    [*prior_levels, new_level]
+                    for prior_levels, new_level in zip(
+                        existing_squeezed_per_read, new_squeezed_advance_per_read
+                    )
+                ]
+            else:
+                merged_squeezed_advance_per_read = [
+                    [per_read] for per_read in new_squeezed_advance_per_read
+                ]
+
             op.loop_info = dataclasses.replace(
                 existing,
                 loop_group_id=(*existing.loop_group_id, group_idx),
@@ -1609,6 +1744,11 @@ def _stamp_direct_loop_info(
                 output_tiled_dims=[
                     *existing.output_tiled_dims,
                     output_tiled_dims_level,
+                ],
+                squeezed_advance_per_read=merged_squeezed_advance_per_read,
+                squeezed_advance_output=[
+                    *existing.squeezed_advance_output,
+                    squeezed_advance_output_level,
                 ],
             )
 
