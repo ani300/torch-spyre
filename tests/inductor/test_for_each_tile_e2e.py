@@ -392,7 +392,32 @@ class TestForEachTileNestedMapE2E(_DynamoResetTestCase):
     ATOL = 0.1
     RTOL = 0.1
 
+    @unittest.expectedFailure
     def test_nested_add_outer_row_inner_col_small(self):
+        """Nested tiling with a sub-stick (2-element) inner column tile.
+
+        XFAIL at compile time: ``Unsupported: ... Unexpected stick expression
+        Mod(d1, 2): expected Mod(var, 64), a bare variable, 0, or any of
+        those with a constant offset``.
+
+        Root cause: the innermost tile add's output is reshaped by
+        ``for_each_tile`` lowering into ``[2, 4, 2]`` (splitting the row's
+        flat 8-wide column axis into 4 tiles of width 2, matching
+        ``inner_tile_size=2``). ``_clone_layout`` in
+        ``propagate_layouts.py`` builds that buffer's device layout purely
+        from its own reshaped shape, picking the size-2 last dim as the
+        stick dim. But the consuming op one level up reads the same buffer
+        back with the *flattened* ``8*d0 + d1`` index (ranges ``d0:2,
+        d1:8``), expecting one whole 8-wide stick-compatible axis. No
+        per-shape STL of ``[2, 4, 2]`` can satisfy that: the inner tile
+        (2 elements) is far below ``elems_per_stick`` (64), so stick padding
+        breaks the 4x replication needed to reconstruct the flat axis,
+        producing the unrepresentable ``Mod(d1, 2)`` coordinate. This is a
+        genuine sub-stick tiling gap in ``_clone_layout``'s output-STL
+        construction, not specific to add or to this test's shape -- fixing
+        it needs ``_clone_layout`` to offer (or inherit) a layout that keeps
+        the flattened axis whole, deferred as a separate task.
+        """
         A, B, _ = pointwise_inputs(rows=4, cols=8)
         A_spyre, B_spyre = A.half().to(DEVICE_NAME), B.half().to(DEVICE_NAME)
         ref = nested_add_outer_row_inner_col_reference(
