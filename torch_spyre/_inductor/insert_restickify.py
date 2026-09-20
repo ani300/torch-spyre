@@ -365,7 +365,8 @@ def insert_restickify_on_node_inputs(
         # from the consumer with nothing on the restickify side to replace it
         # (the restickify's own inner_fn has no loop_var dependence to
         # advance), silently pinning the consumer's read to one address for
-        # every trip (issue #4581's carried-online-softmax K case).
+        # every trip (see test_carry_mode_online_softmax's carried-online-
+        # softmax K case).
         old_name_buf = V.graph.try_get_buffer(old_name)
         old_name_is_tiled_stage = old_name_buf is not None and hasattr(
             old_name_buf, "loop_info"

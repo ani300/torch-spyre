@@ -164,8 +164,9 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         ``test_nested_for_each_tile_value_correct``'s docstring, which
         closed the original stick-reconciliation crash for this fixture
         family) -- not by ``insert_restickify.py``'s unrelated online-
-        softmax K-advance fix (issue #4581), which this test passes with or
-        without. Without the ``spyre_kernel.py``/``for_each_tile_lowering.py``
+        softmax K-advance fix (see ``test_carry_mode_online_softmax``), which
+        this test passes with or without. Without the
+        ``spyre_kernel.py``/``for_each_tile_lowering.py``
         fixes, this now fails as a silent-wrong-answer (96% mismatched
         elements) rather than the original compile-time crash, confirming
         the stick-reconciliation gap itself is closed and any remaining
