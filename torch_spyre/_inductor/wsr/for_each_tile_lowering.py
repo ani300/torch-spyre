@@ -891,6 +891,19 @@ def _consume_tile_dim_markers(
         any_star_dep_consumer = False
         for consumer_op, consumer_dep in consumers:
             if hasattr(consumer_op, "data"):
+                # A consumer can independently read marker_input_name BEFORE
+                # inlining too -- e.g. a body op shaped like
+                # `x @ tile_dim_marker(x)` reads the marker's own input
+                # directly as one operand and through the marker as the
+                # other. Snapshot those pre-existing reads so the check below
+                # only requires exactly one NEW read of marker_input_name
+                # (the one _inline_marker_into_consumer just composed in),
+                # not exactly one in total.
+                pre_inline_reads = [
+                    d
+                    for d in consumer_op.get_read_writes().reads
+                    if isinstance(d, MemoryDep) and d.name == marker_input_name
+                ]
                 new_consumer = _inline_marker_into_consumer(
                     consumer_op, marker_op, operations
                 )
@@ -912,15 +925,17 @@ def _consume_tile_dim_markers(
                     for d in new_consumer.get_read_writes().reads
                     if isinstance(d, MemoryDep) and d.name == marker_input_name
                 ]
-                if len(new_reads) != 1:
+                brand_new_reads = [d for d in new_reads if d not in pre_inline_reads]
+                if len(brand_new_reads) != 1:
                     raise AssertionError(
                         f"consumer {consumer_op.get_name()!r} has "
-                        f"{len(new_reads)} post-inline MemoryDep reads named "
-                        f"{marker_input_name!r}; expected exactly 1 (the "
-                        "inlined read that used to go through erased marker "
-                        f"{marker_name!r})."
+                        f"{len(brand_new_reads)} newly-inlined MemoryDep reads "
+                        f"named {marker_input_name!r} (of {len(new_reads)} "
+                        f"total, {len(pre_inline_reads)} pre-existing); "
+                        "expected exactly 1 new one (the inlined read that "
+                        f"used to go through erased marker {marker_name!r})."
                     )
-                new_dep = new_reads[0]
+                new_dep = brand_new_reads[0]
             else:
                 # StarDep-shaped consumer (ExternKernelOut/FallbackKernel/
                 # ConcatKernel/... -- including a nested ir.WhileLoop, whose own
@@ -1180,7 +1195,6 @@ def lookup_marker_dim(
 
 def _stamp_direct_loop_info(
     group_ops: list["ir.Operation"],
-    while_op: "ir.WhileLoop",
     loop_var: sympy.Symbol,
     trip_count: sympy.Expr,
     group_idx: int,
@@ -1356,7 +1370,15 @@ def _stamp_direct_loop_info(
         mapped_coeff = dep.index.coeff(mapped_sym)
         if mapped_coeff == 0:
             return None
-        if sympy.Mod(dep_loop_var_coeff, mapped_coeff) != 0:
+        # sympy.Mod(a, b) only evaluates to a concrete integer when both a
+        # and b are numeric; with a symbolic coefficient (e.g. an
+        # as-yet-unbound trip-count symbol) it stays an unevaluated Mod
+        # expression, which is truthy under `!= 0` and would reject a
+        # structurally valid resolution. Only apply the divisibility check
+        # when both coefficients are actually numbers; otherwise fall
+        # through and accept the structural resolution as-is.
+        mod_check = sympy.Mod(dep_loop_var_coeff, mapped_coeff)
+        if mod_check.is_number and mod_check != 0:
             return None
         extent = dep_loop_var_coeff / mapped_coeff
         return structural_pos, extent
@@ -1555,6 +1577,14 @@ def _stamp_direct_loop_info(
         output_tiled_dims_level: list[tuple[int, sympy.Expr]] = []
         squeezed_advance_output_level: list[tuple[sympy.Expr, sympy.Expr]] = []
         writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
+        if len(writes) > 1:
+            from torch_spyre._inductor.errors import Unsupported
+
+            raise Unsupported(
+                f"op {op.get_name()!r} has {len(writes)} MemoryDep writes; "
+                "_stamp_direct_loop_info assumes at most one so it can stamp "
+                "a single output_tiled_dims/squeezed_advance_output entry"
+            )
         if writes:
             write_dep = writes[0]
             write_extent = (
@@ -1903,7 +1933,6 @@ def splice_while_loops(graph) -> None:
                 while_op,
                 carries,
                 trip_count=result.trip_count,
-                loop_var=loop_var,
             )
 
             _consume_tile_dim_markers(group_ops, graph.operations)
@@ -1930,12 +1959,19 @@ def splice_while_loops(graph) -> None:
     # objects recorded during the splice phase above, which may have gone
     # stale (see this function's own docstring) -- and stamp in level order
     # (group_idx ascending, i.e. outermost first).
+    from torch_spyre._inductor.errors import Unsupported
+
     name_to_op = {op.get_name(): op for op in graph.operations}
     for loop_var, trip_count, level_group_idx, op_names in pending_levels:
+        missing = [name for name in op_names if name not in name_to_op]
+        if missing:
+            raise Unsupported(
+                f"for_each_tile level {level_group_idx} recorded op(s) "
+                f"{missing} that no longer exist in graph.operations at "
+                "stamp time"
+            )
         resolved_ops = [name_to_op[name] for name in op_names]
-        _stamp_direct_loop_info(
-            resolved_ops, None, loop_var, trip_count, level_group_idx
-        )
+        _stamp_direct_loop_info(resolved_ops, loop_var, trip_count, level_group_idx)
 
     # Read-side counterpart of the stamping above: _stamp_direct_loop_info
     # records a point-shaped splice read's per-trip step in

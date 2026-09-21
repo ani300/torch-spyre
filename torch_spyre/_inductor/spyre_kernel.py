@@ -721,11 +721,11 @@ class SpyreKernel(Kernel[CSEVariable]):
                 getattr(loop_info, "squeezed_advance_output", None) or []
             )
 
-        device_size = tensor.layout.device_layout.device_size
-        stride_map = tensor.layout.device_layout.stride_map
-
         if not per_level_dims and not any(squeezed_advance_per_level):
             return None
+
+        device_size = tensor.layout.device_layout.device_size
+        stride_map = tensor.layout.device_layout.stride_map
 
         total_device_expr: "sympy.Expr | None" = None
         n_levels = max(len(per_level_dims), len(squeezed_advance_per_level))

@@ -413,7 +413,7 @@ def insert_restickify_on_node_inputs(
                         f"occurrence {restick_arg_info['occurrence']} cannot "
                         "transfer advancing read metadata independently"
                     )
-                restick_li = copy.copy(consumer_li)
+                restick_li = copy.deepcopy(consumer_li)
                 restick_li.tiled_dims_per_read = [dep_advance]
                 restick_li.squeezed_advance_per_read = (
                     [dep_squeezed] if any(dep_squeezed) else []
@@ -441,7 +441,7 @@ def insert_restickify_on_node_inputs(
             # copy of old_name, made once) nor its output (consumed at a
             # fixed address by every trip) advance -- the consumer keeps
             # whatever per-trip advance it already had.
-            restick_li = copy.copy(op.loop_info)
+            restick_li = copy.deepcopy(op.loop_info)
             n_levels = len(getattr(restick_li, "loop_count", []) or [])
             restick_li.tiled_dims_per_read = [[[] for _ in range(n_levels)]]
             restick_li.squeezed_advance_per_read = []

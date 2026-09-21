@@ -2463,9 +2463,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
                 graph, while_op, carries, trip_count=result.trip_count
             )
 
-            _stamp_direct_loop_info(
-                group_ops, while_op, loop_var, result.trip_count, group_idx=0
-            )
+            _stamp_direct_loop_info(group_ops, loop_var, result.trip_count, group_idx=0)
 
         stamped = [op for op in group_ops if getattr(op, "loop_info", None)]
         self.assertTrue(stamped, "no op received a loop_info stamp")
@@ -2527,9 +2525,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             )
             _consume_tile_dim_markers(group_ops, graph.operations)
 
-            _stamp_direct_loop_info(
-                group_ops, while_op, loop_var, result.trip_count, group_idx=0
-            )
+            _stamp_direct_loop_info(group_ops, loop_var, result.trip_count, group_idx=0)
 
         tiled_ops = [
             op
@@ -2598,9 +2594,7 @@ class TestStampDirectLoopInfo(unittest.TestCase):
             )
             _consume_tile_dim_markers(group_ops, graph.operations)
 
-            _stamp_direct_loop_info(
-                group_ops, while_op, loop_var, result.trip_count, group_idx=0
-            )
+            _stamp_direct_loop_info(group_ops, loop_var, result.trip_count, group_idx=0)
 
             # op.get_read_writes() needs the live GraphLowering (V.graph)
             # context, same as the stamping call above -- stays inside the
