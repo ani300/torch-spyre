@@ -12,19 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""for_each_tile-specific WhileLoop prover.
+"""for_each_tile WhileLoop recognition, splicing, and direct loop-info stamping.
 
-Recognizes the exact WhileLoop shape torch-spyre#4136's for_each_tile
-frontend (via decompose_scan_to_while_loop) produces, derives a provable
-trip count, and -- once accepted -- hands off to the generic bridge
-(while_loop_bridge.py) to splice the body, then directly constructs and
-stamps CoarseTileInfo from ground truth (see _stamp_direct_loop_info).
-This module owns every for_each_tile-specific assumption;
-while_loop_bridge.py knows none of them.
+This module recognizes the exact WhileLoop shape torch-spyre#4136's
+for_each_tile frontend (via decompose_scan_to_while_loop) produces, and owns
+every step of turning one into tiled, schedulable ops:
 
-Real cond-graph shape (confirmed empirically against a live compiled graph
-for both split_m_fn (map mode) and split_k_fn (carry mode) -- see the task-4
-report for the full investigation): decompose_scan_to_while_loop always
+1. Prove: try_prove_for_each_tile inspects a WhileLoop's cond_subgraph and
+   decides whether it is for_each_tile-shaped, deriving a provable trip
+   count. Every for_each_tile-specific assumption lives in this module;
+   while_loop_bridge.py (the generic splice mechanism) knows none of them.
+
+2. Splice: once accepted, splice_while_loops hands the WhileLoop to
+   while_loop_bridge.splice_while_loop, which flattens the loop body into
+   graph.operations in place. For a nested for_each_tile, splicing runs to a
+   fixed point, outermost level first -- an inner WhileLoop only becomes
+   visible once the outer splice has flattened its body in.
+
+3. Identify the tile: each tile's real read/write is marked by a
+   tile_dim_marker op (lowering.py's lower_tile_dim_marker).
+   _consume_tile_dim_markers finds every marker's consuming op(s), inlines
+   the marker's own per-iteration coordinate transform directly into each
+   ComputedBuffer consumer (or, for a StarDep-shaped consumer with no
+   inner_fn to inline into, redirects the reference and keeps the marker
+   materialized), and erases the marker where possible. This produces the
+   ground truth lookup_marker_dim later uses to say which read/write of an
+   op is the tile and which of its own index variables is the tiled one.
+
+4. Stamp: _stamp_direct_loop_info directly constructs and stamps a
+   CoarseTileInfo on every op in a spliced group, one nesting level at a
+   time, from ground truth already available at this point -- trip count
+   (from the prover), loop var (from the spliced body), and tiled-dim
+   position (from lookup_marker_dim, or a structural fallback anchored on
+   the op's own output coordinates when no marker resolves it). This never
+   calls coarse_tile_pre_stickify: re-deriving tiling from index
+   coefficients independently at each nesting level risks a level's already-
+   committed metadata going stale once a later-spliced, more-deeply-nested
+   level renames or rewires the buffers that metadata depended on.
+   splice_while_loops defers every stamp call to a single final phase, after
+   every level of a nested for_each_tile has been spliced, so every op that
+   will ever exist for this compile is present before any stamping happens
+   -- see splice_while_loops's own docstring for why per-iteration stamping
+   cannot work for a nested for_each_tile.
+
+Real cond-graph shape (against a live compiled graph for both split_m_fn
+(map mode) and split_k_fn (carry mode)): decompose_scan_to_while_loop always
 lowers for_each_tile's cond_fn to a cond_subgraph.graph with exactly one
 ir.Operation -- a scalar (size=[]) bool ComputedBuffer -- whose inner_fn
 does exactly:
@@ -45,8 +77,8 @@ torch._inductor.ir.make_pointwise/ops_wrapper), this module *runs* inner_fn
 once under a small recording ops handler that intercepts `load`/`constant`
 and returns opaque placeholders for everything else. This is the same "wrap
 the ops handler, don't reconstruct index expressions" pattern CLAUDE.md
-mandates for ComputedBuffer.inner_fn elsewhere in this codebase, applied
-here for read-only shape recognition rather than mutation.
+mandates for ComputedBuffer.inner_fn elsewhere in this codebase (see issue
+#2797), applied here for read-only shape recognition rather than mutation.
 """
 
 from __future__ import annotations
@@ -244,14 +276,11 @@ _MARKER_MAPS: dict[int, dict[tuple[str, "Dep"], int]] = {}
 
 NOT safe to let outlive one compile: CPython aggressively reuses a freed
 list's id, so a stale entry left behind by a prior compile can collide
-with -- and be silently mistaken for -- a live compile's own entry
-sharing the same buffer-name/dep-shape (confirmed empirically: running
-the same for_each_tile fixture twice in one process produces
-byte-identical (op.get_name(), dep) keys across both compiles).
-clear_marker_maps() must be called once per compile, before
-_consume_tile_dim_markers runs, to guarantee this never happens --
-passes.py's per-compile pipeline entry point does this, alongside the
-analogous reset_provenance_warnings() call, for the same "each compile
+with -- and be silently mistaken for -- a live compile's own entry sharing
+the same buffer-name/dep-shape key. clear_marker_maps() must be called once
+per compile, before _consume_tile_dim_markers runs, to guarantee this never
+happens -- passes.py's per-compile pipeline entry point does this, alongside
+the analogous reset_provenance_warnings() call, for the same "each compile
 starts from a clean slate" reason.
 """
 
@@ -261,17 +290,11 @@ def clear_marker_maps() -> None:
 
     Must be called exactly once per compile, before _consume_tile_dim_markers
     runs for that compile (passes.py's per-compile pipeline __call__ does
-    this, right alongside reset_provenance_warnings(), which exists for the
-    identical "each compile starts fresh" reason). Without this,
-    _MARKER_MAPS leaks for the process's entire lifetime (nothing else ever
-    deletes an entry), and -- more seriously than the leak itself --
-    id(operations) can be reused by CPython for an unrelated later compile's
-    operations list, letting that later compile's lookup_marker_dim call
-    silently resolve against a dead compile's stale entry instead of
-    raising or returning None. Confirmed empirically: two successive
-    compiles of the same fixture in one process produced identical
-    (op.get_name(), dep) keys; it happened to be harmless there only because
-    both entries stored the same dim, which is not a general guarantee.
+    this). See _MARKER_MAPS's own docstring for why skipping this is unsafe,
+    not just leaky: id(operations) can be reused by CPython for an unrelated
+    later compile's operations list, letting that later compile silently
+    resolve against a dead compile's stale entry instead of raising or
+    returning None.
     """
     _MARKER_MAPS.clear()
 
@@ -311,10 +334,8 @@ def _stacking_carry_indices(
        the fold arithmetic relies on. EXCEPT when ``trip_count == 1``: a
        single-trip loop's write offset has only one possible value, so
        Inductor's own symbolic simplification legitimately drops
-       ``loop_var`` from it entirely (confirmed empirically: a real
-       ``ys``-stacking carry at trip_count=1, e.g. an inner for_each_tile
-       whose tile_size spans a whole dimension, shows offset=0 rather than
-       an expression mentioning ``loop_var``). Treat that case as
+       ``loop_var`` from it entirely, leaving offset=0 rather than an
+       expression mentioning ``loop_var``. Treat that case as
        satisfying evidence 3 too, rather than falling through to the
        pass-through-leaf classification -- ``fold_stacked_carry_layout``
        already documents and handles this same trip_count=1 degeneracy on
@@ -378,8 +399,7 @@ def _marker_dim(op: "ir.Operation") -> "int | None":
     ``op`` object in ``graph.operations``/``group_ops``. So the attribute
     lives on ``op`` itself, not on ``op.data`` (``op.data`` is one level
     deeper still -- the ``Pointwise``/``Reduction`` IR expression node, which
-    never carries it). Confirmed empirically: checking ``op.data`` here
-    always misses, even for a genuine marker op.
+    never carries it).
     """
     return getattr(op, "tile_marker_dim", None)
 
@@ -484,10 +504,10 @@ def _marker_substitution(
     identity (it can carry an extra per-iteration advance term, e.g.
     ``+ 24*u0``). Rather than re-executing that ``inner_fn`` live (which
     would replay a stale FX ``Proxy``/``OpsValue`` captured from whatever
-    trace built the marker in the first place, crashing or silently
-    reusing the wrong graph node when spliced into a different consumer's
-    live retrace -- confirmed empirically: ``LightTracer.create_arg``
-    raises ``NotImplementedError`` on the leaked ``OpsValue``), extract the
+    trace built the marker in the first place -- crashing
+    (``LightTracer.create_arg`` raises ``NotImplementedError`` on the
+    leaked ``OpsValue``) or silently reusing the wrong graph node when
+    spliced into a different consumer's live retrace), extract the
     marker's own read as a pure symbolic expression via
     ``get_read_writes()`` and let the caller substitute into it -- the same
     "index expressions are symbolic, substitute don't re-execute"
@@ -540,10 +560,7 @@ class _InlineMarkerHandler(WrapperHandler):
     see). Swapping only the name and keeping the consumer's own flat index
     silently drops that offset term entirely -- every trip reads the SAME
     window of the underlying tensor instead of advancing, a silent
-    wrong-answer bug confirmed empirically against test_map_mode_split_m
-    and test_carry_mode_online_softmax's real-device matmul consumers (see
-    _consume_tile_dim_markers's own docstring and this module's task-5
-    report for the full trace).
+    wrong-answer bug rather than a crash.
 
     The correct erasure substitutes the CONSUMER's own load-site index
     (delinearized back into per-dim coordinates by ``_delinearize_index``,
@@ -604,11 +621,11 @@ class _InlineMarkerHandler(WrapperHandler):
             # applies substitutions sequentially, one symbol at a time, so a
             # dict like {d0: d1, d1: d2} first rewrites d0->d1 and THEN
             # rewrites that same fresh d1 -> d2, silently merging two
-            # distinct coordinates into one (confirmed empirically: this
-            # produced a wrong composed index, e.g. 129*d2 instead of the
-            # correct 128*d1 + d2, for test_carry_mode_online_softmax's
-            # transposed k_tile read, since its coordinate permutation's
-            # target set overlaps its source set: {d0: d1, d1: d2}).
+            # distinct coordinates into one wrong composed index (e.g.
+            # {d0: d1, d1: d2} applied sequentially to `d0 + 2*d1` yields
+            # `3*d1` instead of the correct `d1 + 2*d2`) whenever the
+            # substitution's target set overlaps its source set, which a
+            # coordinate permutation (e.g. a transposed tile read) does.
             composed = self._marker_read_index.subs(subs, simultaneous=True)
             return super().load(self._marker_input_name, composed)
         return super().load(name, index)
@@ -676,10 +693,8 @@ def _consume_tile_dim_markers(
     pre-decomposition value, per torch._inductor.decomposition's aten
     softmax decomp), so a for_each_tile tile whose body calls softmax on
     the whole tile produces a marker read by two independent ComputedBuffer
-    consumers rather than one op chained through another. Confirmed via
-    test_softmax_row_tiled_multi_stick/_small, which raised
-    "has 2 consuming reads ... expected exactly one" before this was
-    handled. Each consuming read is resolved independently -- inlining the
+    consumers rather than one op chained through another. Each consuming
+    read is resolved independently -- inlining the
     marker's transform into each ComputedBuffer consumer in turn, or
     redirecting each StarDep-shaped consumer's reference -- and the marker
     itself is erased only once every consuming read has been resolved (see
@@ -706,12 +721,10 @@ def _consume_tile_dim_markers(
       extra ``+ 24*u0`` advance term baked into the marker's own read index
       by ``lower_tile_dim_marker``), which a bare name-swap would silently
       drop, since ``NameSwapHandler.load`` passes the consumer's own index
-      straight through unchanged. Confirmed empirically (see
-      ``lookup_marker_dim``'s own docstring and this module's task-5
-      report): a plain rename produced silently wrong device-side numerics
-      on ``test_map_mode_split_m``/``test_carry_mode_online_softmax``,
-      because every loop trip ended up reading the identical (tile-0-only)
-      slice of the underlying tensor instead of advancing through it.
+      straight through unchanged. A plain rename produces silently wrong
+      device-side numerics: every loop trip ends up reading the identical
+      (tile-0-only) slice of the underlying tensor instead of advancing
+      through it.
     - An ``InputsKernel``-family consumer (``ExternKernelOut``,
       ``FallbackKernel``, ``ConcatKernel``, ... -- no inner_fn, e.g. the CPU
       aten-fallback matmul for a for_each_tile tile read on a
@@ -755,12 +768,10 @@ def _consume_tile_dim_markers(
     AGAIN via ``replace_computed_buffer_body`` -- for a completely
     unrelated read of the same op -- minting a new object with a new
     ``id()`` before ``lookup_marker_dim`` is ever called from
-    ``_hint_ranges_pos``. Confirmed empirically
-    (test_carry_mode_online_softmax): the marker map's ``id()``-keyed entry
-    for the K-tile-marker's consumer went stale exactly this way once a
-    read-copy for its *other* read (``arg0_1``/Q, unrelated to the marker)
-    was inserted, silently orphaning an otherwise-correct, otherwise-still-
-    matching map entry. ``op.get_name()`` (the buffer name) is what stays
+    ``_hint_ranges_pos`` -- silently orphaning an otherwise-still-matching
+    map entry keyed by the old ``id()``, even when the rebuild was for a
+    completely unrelated read of the same op. ``op.get_name()`` (the
+    buffer name) is what stays
     stable across such a reconstruction -- every rebuild-via-
     ``replace_computed_buffer_body`` site in this package (this one
     included) preserves the original name, and other Spyre metadata
@@ -826,12 +837,11 @@ def _consume_tile_dim_markers(
         # sibling_nested_fn/sibling_nested_stardep_fn in
         # for_each_tile_fixtures.py (issue #4581). Redirecting each StarDep
         # consumer's reference to marker_op independently (the StarDep branch
-        # below) is only proven correct for a single such consumer; empirical
-        # end-to-end testing of the two-sibling-WhileLoop shape (bypassing
-        # this guard) produced silently wrong numerics (~99.9% mismatched
-        # elements), not a crash -- so this must keep raising rather than
-        # silently accept a shape the resolution logic doesn't actually
-        # handle correctly. Only count StarDep consumers here; multiple
+        # below) is only proven correct for a single such consumer; the
+        # two-sibling-WhileLoop shape produces silently wrong numerics, not a
+        # crash, if this guard is bypassed -- so this must keep raising
+        # rather than silently accept a shape the resolution logic doesn't
+        # actually handle correctly. Only count StarDep consumers here; multiple
         # ComputedBuffer consumers remain supported by the loop below.
         star_dep_consumer_count = sum(
             1 for consumer_op, _ in consumers if not hasattr(consumer_op, "data")
@@ -849,9 +859,9 @@ def _consume_tile_dim_markers(
         # ComputedBuffer has no plain `.inputs` list attribute (that
         # attribute belongs to the InputsKernel family -- FallbackKernel,
         # ConcatKernel, etc). A ComputedBuffer's own upstream reads instead
-        # come from its inner_fn, surfaced via get_read_writes().reads --
-        # confirmed empirically against a live tile_dim_marker op, which has
-        # exactly one MemoryDep read (the tile it marks).
+        # come from its inner_fn, surfaced via get_read_writes().reads. A
+        # tile_dim_marker op has exactly one MemoryDep read (the tile it
+        # marks).
         marker_reads = [
             dep
             for dep in marker_op.get_read_writes().reads
@@ -869,10 +879,10 @@ def _consume_tile_dim_markers(
         # torch.softmax's default decomposition (amax, sub, exp, sum, div)
         # reads its own input tensor directly from two sibling ops (amax
         # and sub both read the pre-decomposition placeholder), so a
-        # for_each_tile tile whose body calls softmax on the whole,
-        # untiled tile (test_softmax_row_tiled_multi_stick/_small) produces
-        # a marker with two independent ComputedBuffer consumers rather
-        # than one op chained through another. Each consuming read is
+        # for_each_tile tile whose body calls softmax on the whole, untiled
+        # tile produces a marker with two independent ComputedBuffer
+        # consumers rather than one op chained through another. Each
+        # consuming read is
         # resolved independently below -- inlining the marker's transform
         # into each ComputedBuffer consumer in turn, or (for a StarDep
         # consumer) redirecting each such reference -- and the marker
@@ -925,19 +935,18 @@ def _consume_tile_dim_markers(
                 # The marker's own ComputedBuffer performs a genuine,
                 # non-identity per-iteration coordinate transform (the tile's
                 # slice/offset -- see lower_tile_dim_marker's docstring), the
-                # same as for the ComputedBuffer-consumer branch above. Pointing
-                # the consumer's reference at the marker's own upstream input
-                # (marker_input_name, e.g. arg0_1 -- what an earlier version of
-                # this branch did via V.graph.try_get_buffer) discards that
-                # transform entirely: every consumer read then sees the raw,
-                # untiled operand with no per-iteration offset at all. Confirmed
-                # empirically on a nested for_each_tile (map/map) on the real
-                # Spyre device: the inner loop's captured outer-tile operand
-                # silently stayed pinned to outer trip 0's slice on every trip,
-                # corrupting every outer iteration after the first (~48% wrong
-                # elements) while remaining invisible on CPU eager/CPU Inductor,
-                # since neither exercises Spyre-specific codegen for a
-                # StarDep-shaped nested-WhileLoop marker consumer.
+                # same as for the ComputedBuffer-consumer branch above.
+                # Pointing the consumer's reference at the marker's own
+                # upstream input (marker_input_name) instead of at the
+                # marker itself discards that transform entirely: every
+                # consumer read then sees the raw, untiled operand with no
+                # per-iteration offset at all -- on a nested for_each_tile
+                # (map/map), the inner loop's captured outer-tile operand
+                # stays pinned to outer trip 0's slice on every trip,
+                # corrupting every outer iteration after the first. This is
+                # Spyre-codegen-specific and stays invisible on CPU
+                # eager/CPU Inductor, which never exercises a StarDep-shaped
+                # nested-WhileLoop marker consumer's codegen.
                 #
                 # The correct erasure-equivalent for this read shape is to keep
                 # the marker's ComputedBuffer materialized (never remove it from
@@ -947,11 +956,11 @@ def _consume_tile_dim_markers(
                 # per-load composition, just realized as a standalone buffer
                 # instead of fused into the consumer's own body, since a
                 # StarDep-shaped consumer has no body to fuse into. Only a
-                # stale-by-identity, same-name reference (confirmed empirically:
-                # splice_while_loop's own upstream passes can leave a consumer's
-                # direct object reference pointing at an object that predates
-                # the marker's final reconstruction, even though it already
-                # names the marker correctly) needs patching at all --
+                # stale-by-identity, same-name reference (splice_while_loop's
+                # own upstream passes can leave a consumer's direct object
+                # reference pointing at an object that predates the marker's
+                # final reconstruction, even though it already names the
+                # marker correctly) needs patching at all --
                 # _substitute_direct_input_refs's name-based resolve() is a
                 # no-op for any reference that already points at marker_op by
                 # identity, and safely repoints any reference that doesn't.
@@ -992,10 +1001,9 @@ def _consume_tile_dim_markers(
             # still codegen as a real, addressable buffer for the StarDep
             # consumer to read, and _validate_contiguous (coarse_tile.py)
             # requires every group's ops to occupy a gapless block of
-            # `operations`, so removing it from `operations` alone while
-            # keeping it out of `group_ops` (tried and reverted -- see git
-            # history) breaks that contiguity check for any group whose
-            # block the marker sits inside. Passes that must not treat a
+            # `operations`, so removing it from `operations` while keeping
+            # it out of `group_ops` breaks that contiguity check for any
+            # group whose block the marker sits inside. Passes that must not treat a
             # surviving marker as an ordinary tile op instead guard on
             # `_marker_dim(op) is not None` individually (see
             # _plan_read_copies in coarse_tile.py for the first such guard)
@@ -1035,50 +1043,35 @@ def lookup_marker_dim(
     the tile's own shape ordering differs from the consumer's -- e.g. a
     matmul reading a stacked tile leaf, where the marker's dim indexes the
     2-D tile [rows, cols] but the matmul's own output/reduction dims are
-    numbered differently. Confirmed empirically: this exact bug produced
-    silently wrong (not raising) numerics on test_map_mode_split_m and
-    test_carry_mode_online_softmax's real-device matmul consumers, whose
-    CPU-fixture-based unit-test counterparts never caught it because a CPU
-    aten-fallback matmul is a StarDep consumer (see below), which never
-    reaches this position-mapping code at all.
+    numbered differently. A CPU aten-fallback matmul never surfaces this
+    because it is a StarDep consumer (see below), which never reaches this
+    position-mapping code at all -- so this class of bug is only visible
+    on real Spyre-device codegen paths.
 
     So instead of trusting the map's stored int, re-derive the consumer's
-    own position the same way the deleted _loop_var_pos_from_reads did, but
-    scoped to exactly the one dep the marker map already identified as the
-    tile read -- no CROSS-READ ambiguity/corroboration logic is needed the
-    way that heuristic's cross-read guessing required, since the marker is
-    ground truth about which read is the tile: find the read's own index
+    own position directly, scoped to exactly the one dep the marker map
+    already identified as the tile read: find the read's own index
     variable `var` whose extent matches loop_var's per-trip advance
     (dep.index.coeff(loop_var) == dep.index.coeff(var) * dep.ranges[var]),
     then map `var` into op's own output coordinates
     (_loop_var_to_ranges_pos) or, if that misses and op is a Reduction,
     into op's own reduction vars (reduction_loop_vars.index).
 
-    A narrower, WITHIN-ONE-DEP ambiguity the deleted heuristic also guarded
-    against still applies here, and is NOT made moot by having a ground-
-    truth marker: more than one var in dep.ranges can satisfy the same
-    coefficient-coincidence equation on the SAME read (the heuristic's own
-    docstring names the motivating shape -- a reduction dim whose extent
-    numerically coincides with the tile size, e.g. flash-attention's
-    online-softmax body where D == SOFTMAX_TILE_SIZE). The deleted
-    heuristic resolved this via cross-read corroboration (trust a lone
-    per-read candidate; require a second, independently-agreeing read
-    before trusting a reduction-channel match when a read had more than
-    one candidate). That corroboration mechanism doesn't carry over as-is
-    (this function deliberately looks at only the one marker-identified
-    dep, not every read), but the underlying risk -- picking an arbitrary
-    one of several equally-plausible candidates -- is exactly what
-    "markers are authoritative, raise on gap, no fallback heuristic"
-    rules out. So: collect EVERY candidate var on the marker-identified
-    dep (don't return on the first one found), and if more than one
-    survives, raise the same actionable gap error _hint_ranges_pos raises
-    elsewhere rather than silently guess. (This has not been observed to
-    trigger against any test fixture in this repo, including
-    online-softmax's own D == SOFTMAX_TILE_SIZE coincidence -- that
-    coincidence lands on a read the marker map does NOT identify as the
-    tile, so it never reaches this per-dep candidate collection at all --
-    but the check must still exist so a future shape that does collide on
-    the marker's own dep fails loudly instead of guessing.)
+    More than one var in dep.ranges can satisfy the same coefficient-
+    coincidence equation on the SAME read -- e.g. a reduction dim whose
+    extent numerically coincides with the tile size (flash-attention's
+    online-softmax body, where D == SOFTMAX_TILE_SIZE). Because markers are
+    authoritative and there is no fallback heuristic once a marker has
+    identified the read, this ambiguity cannot be resolved by guessing:
+    collect EVERY candidate var on the marker-identified dep (don't return
+    on the first one found), and if more than one survives, raise rather
+    than silently pick one. (This has not been observed to trigger against
+    any fixture in this repo, including online-softmax's own D ==
+    SOFTMAX_TILE_SIZE coincidence -- that coincidence lands on a read the
+    marker map does NOT identify as the tile, so it never reaches this
+    per-dep candidate collection at all -- but the check must still exist
+    so a future shape that does collide on the marker's own dep fails
+    loudly instead of guessing.)
 
     A mapped dep can be either a MemoryDep (ComputedBuffer/inner_fn-backed
     consumer) or a StarDep (InputsKernel-family consumer, e.g.
@@ -1095,27 +1088,12 @@ def lookup_marker_dim(
 
     Scoped to ONLY the marker map belonging to the CURRENT compile's own
     ``V.graph.operations`` list -- never every entry in the module-level
-    ``_MARKER_MAPS`` registry. ``_MARKER_MAPS`` is keyed by
-    ``id(operations)``, and CPython aggressively reuses a freed list's
-    id; two unrelated compiles in the same process can (and, confirmed
-    empirically, do) end up with byte-identical
-    ``(op.get_name(), dep)`` keys whenever they share a buffer-naming/dep
-    shape (e.g. two runs of the same for_each_tile fixture). Searching
-    every map in the registry, as an earlier version of this function
-    did, risks resolving a live compile's lookup against a DIFFERENT,
-    unrelated compile's stale entry -- silently returning the wrong
-    position whenever that stale entry happens to disagree (harmless only
-    by accident when the two happen to agree, as they did for the
-    same-fixture-twice repro that surfaced this). ``V.graph`` is the live
-    ``GraphLowering`` for whichever compile is currently running this
-    pass pipeline (already relied on elsewhere in this module, e.g.
-    ``V.graph.try_get_buffer`` in ``_consume_tile_dim_markers``), so
-    ``V.graph.operations`` is guaranteed to be the SAME list object
-    ``_consume_tile_dim_markers`` was given for this exact compile.
-    ``clear_marker_maps()`` (called once per compile from
-    ``passes.py``'s pipeline entry point, alongside the analogous
-    ``reset_provenance_warnings()``) additionally guarantees no entry
-    from a past compile can outlive it even under id reuse.
+    ``_MARKER_MAPS`` registry (see ``_MARKER_MAPS``'s own docstring for why
+    searching every entry in the registry would be unsafe). ``V.graph`` is
+    the live ``GraphLowering`` for whichever compile is currently running
+    this pass pipeline, so ``V.graph.operations`` is guaranteed to be the
+    SAME list object ``_consume_tile_dim_markers`` was given for this exact
+    compile.
     """
     from torch._inductor.dependencies import Dep, MemoryDep
     from torch._inductor.ir import Reduction
@@ -1211,21 +1189,24 @@ def _stamp_direct_loop_info(
 
     Ground truth only -- trip count from try_prove_for_each_tile, loop_var
     from _body_loop_var, per-op tiled-dim resolution from
-    lookup_marker_dim. Never calls coarse_tile_pre_stickify. propagation
-    is never produced; every CoarseTileInfo built here leaves it None (see
-    docs/superpowers/specs/2026-09-17-while-loop-direct-loop-info-design.md
-    Sec4.2a for why: zero consumers outside coarse_tile.py's own Pass
-    1/2/3, which while_loop groups skip entirely).
+    lookup_marker_dim. Never calls coarse_tile_pre_stickify: the program
+    already states trip count, loop var, tile dim, and carry roles as
+    ground truth, so re-deriving them via double-blind per-level
+    coarse_tile_pre_stickify inference is unnecessary and unsafe -- one
+    level's committed metadata (e.g. tiled_dims_per_read computed against a
+    provisional buffer name) can go stale once a later-spliced nested level
+    renames or rewires the buffers it depended on. propagation is never
+    produced -- every CoarseTileInfo built here leaves it None -- because
+    PropagationPlan has zero consumers outside coarse_tile.py's own Pass
+    1/2/3, which while_loop groups skip entirely.
 
-    Called once per while_loop nesting level, OUTERMOST first: splice_while_loops
-    defers every call to a final phase that iterates pending_levels in
-    splice-ACCEPTANCE order, and the outer while_loop is always accepted
-    (and appended to pending_levels) before a nested while_loop can even
-    become visible -- see splice_while_loops's own docstring. Each call
-    extends whatever single CoarseTileInfo a strictly-outer level's own
-    call already stamped, never overwriting it. ``op.loop_info`` is
-    ALWAYS a single ``CoarseTileInfo`` (never a list of them) -- confirmed
-    against every other stamping site in the codebase (coarse_tile.py's own
+    Called once per while_loop nesting level, in group_idx-ascending
+    (outermost-first) order -- see splice_while_loops's own docstring for
+    why stamping is deferred to a single final phase in this order. Each
+    call extends whatever single CoarseTileInfo a strictly-outer level's
+    own call already stamped, never overwriting it. ``op.loop_info`` is
+    ALWAYS a single ``CoarseTileInfo`` (never a list of them) -- consistent
+    with every other stamping site in the codebase (coarse_tile.py's own
     ``op.loop_info = dataclasses.replace(info, ...)``, padding.py,
     read_copy_elision.py, insert_restickify.py, and
     work_division_constraints.py's own reader, which does
@@ -1234,20 +1215,10 @@ def _stamp_direct_loop_info(
     anywhere). ``CoarseTileInfo``'s own per-level list fields
     (loop_group_id/loop_count/loop_tiled_dims/loop_tiled_reduction_dims/
     tiled_dims_per_read's and output_tiled_dims's per-level entries) already
-    encode every nesting level inside ONE object -- outermost first, per
-    loop_info.py's docstring. Since this function is called OUTERMOST
-    level first, the first call for a given op sets its lists with that
-    outer level already at index 0 (existing=None branch below), and every
-    later, strictly-inner call must APPEND its own level's contribution
-    onto the end of the already-stamped lists (not prepend onto the front,
-    and not wrap the whole object in a new outer list) -- prepending here
-    would shift the outer call's own level out of index 0, the reverse of
-    every consumer's assumption (scheduler.py's and coarse_tile.py's
-    reliance on loop_group_id[0] being the outermost level, in
-    particular; confirmed by a real bug this fixed, where an inner-nested
-    op's loop_group_id[0] disagreed with its outer siblings', splitting one
-    nested for_each_tile group into sibling, not nested,
-    CountedLoopSchedulerNodes -- see scheduler.py's _build_loop_group).
+    encode every nesting level inside ONE object, outermost first (per
+    loop_info.py's docstring). See the `existing is not None` branch below
+    for the append-not-prepend convention this relies on when a later,
+    strictly-inner call extends an already-stamped op.
 
     tiled_dims_per_read/output_tiled_dims are filled from
     ``op.get_read_writes()`` ground truth: a dep advances at this level iff
@@ -1271,10 +1242,9 @@ def _stamp_direct_loop_info(
     stamped explicitly here, at ground-truth time, specifically so
     SpyreKernel._general_tile_advance never needs to re-derive whether a
     splice symbol merely appearing in dep.index implies a real per-trip
-    advance -- it does not in general (see the confirmed bug on a
-    restickified V-tile pool read, which is genuinely pinned across trips
-    despite loop_var being a free symbol of its dep.index by construction,
-    found via test_carry_mode_online_softmax). A dep whose coefficient on
+    advance -- it does not in general (a restickified V-tile pool read is
+    genuinely pinned across trips despite loop_var being a free symbol of
+    its dep.index by construction). A dep whose coefficient on
     loop_var is exactly zero gets no entry at all here, which is itself the
     explicit "pinned, do not advance" verdict -- not a gap for
     _general_tile_advance to fill in.
@@ -1317,48 +1287,40 @@ def _stamp_direct_loop_info(
 
         Only attempted when dep.index actually carries loop_var (per-dep,
         not per-op, since reads and the write can each independently need
-        it -- Step 1.1 of the brief). Uses op's own output coordinates
-        (ground truth for the op's own tiled-dim positions) to find
-        loop_var's ranges position, then derives this dep's own per-trip
-        extent from its own coefficient on loop_var divided by the mapped
-        symbol's coefficient in this SAME dep's index -- reusing trip_count
-        here would be wrong whenever structural_pos's own per-trip step in
-        THIS dep differs from loop_var's per-trip step (Defect 1: confirmed
-        4x wrong, 4 vs 64, on the real repro).
+        it). Uses op's own output coordinates (ground truth for the op's
+        own tiled-dim positions) to find loop_var's ranges position, then
+        derives this dep's own per-trip extent from its own coefficient on
+        loop_var divided by the mapped symbol's coefficient in this SAME
+        dep's index -- reusing trip_count here would be wrong whenever this
+        dep's own per-trip step differs from loop_var's per-trip step.
 
         op_out_coords can raise Unsupported for >=3 levels of nesting, when
         an outer level's own loop_var is not yet covered by this op's
-        dim_hints (Defect 3) -- caught here and treated identically to "no
-        structural match", i.e. no stamp for this dep, not a crash. This is
-        strictly more permissive than pre-fallback behavior (every dep hit
-        the no-stamp outcome before), so it cannot regress a case that
-        worked before this fallback existed.
+        dim_hints -- caught here and treated identically to "no structural
+        match", i.e. no stamp for this dep, not a crash. This is strictly
+        more permissive than the no-fallback behavior (every dep hit the
+        no-stamp outcome before this fallback existed), so it cannot
+        regress a case that worked before.
 
         `prior_levels` is this SAME dep's own already-stamped (pos, extent)
         entries, flattened across every strictly-inner level a prior call
         already stamped (``existing.tiled_dims_per_read[i]`` /
         ``existing.output_tiled_dims`` flattened, before this level's own
-        entry is prepended -- None/empty on the first, innermost call). Only
-        used to
-        detect the confirmed op23 double-advance bug in
-        test_nested_for_each_tile_value_correct: an outer level's structural
-        fallback there matched the SAME position (pos=0) an inner level's
-        own marker-resolved call had already claimed for this exact dep,
-        producing two independent output_tiled_dims entries for one device
-        dim -- each minted its own level_symbol in _general_tile_advance, so
-        the dim advanced twice per trip instead of once. That is a real
-        collision, keyed on "this dep already has a stamp at this position
-        from another level", not merely on "loop_var shares this coordinate
-        with another free symbol" -- the latter also fires for e.g. a
-        WhileLoop-splice-folded write index (coordinate ``d0 + 2*u5``) where
-        d0 is this SAME op's own local tile coordinate and there is no
-        competing claim on pos 0 at all (confirmed on buf24 in
-        test_nested_add_outer_row_inner_col_small: lookup_marker_dim returns
-        None and prior_levels is empty, so rejecting there was a false
-        positive that left output_tiled_dims empty and broke codegen
-        addressing). So reject only when structural_pos is already present
-        among prior_levels' own positions for this dep -- not unconditionally
-        whenever the coordinate has extra free symbols.
+        entry is appended -- None/empty on the first, outermost call).
+        Reject a candidate `structural_pos` only when THIS dep already has
+        a stamped level at that same position from a strictly-inner call --
+        that is a genuine collision: two independent levels both claiming
+        the same device dim, each minting its own advance symbol in
+        _general_tile_advance, so the dim would advance twice per trip
+        instead of once. Rejecting merely because `loop_var` shares free
+        symbols with another coordinate is NOT safe: a WhileLoop-splice-
+        folded write index (e.g. coordinate ``d0 + 2*u5``, where ``d0`` is
+        this op's own local tile coordinate) can legitimately have that
+        shape with no real collision at all -- rejecting unconditionally
+        there leaves output_tiled_dims empty and breaks codegen addressing.
+        So the check is scoped precisely to "this dep already has a stamped
+        level at this exact position from another level," never to "this
+        coordinate has extra free symbols."
         """
         dep_loop_var_coeff = dep.index.coeff(loop_var)
         if dep_loop_var_coeff == 0:
@@ -1371,11 +1333,10 @@ def _stamp_direct_loop_info(
         if structural_pos is None:
             return None
         # Reject only a genuine collision: this dep already carries a
-        # stamped level at structural_pos from a strictly-inner call (the
-        # confirmed op23 double-advance case -- see this function's own
-        # docstring). A coordinate where loop_var shares free symbols with
-        # another var (the WhileLoop-splice case) is NOT by itself a reason
-        # to reject -- see buf24 in the same docstring.
+        # stamped level at structural_pos from a strictly-inner call -- see
+        # this function's own docstring. A coordinate where loop_var shares
+        # free symbols with another var is NOT by itself a reason to
+        # reject -- see the same docstring.
         if prior_levels and any(pos == structural_pos for pos, _ in prior_levels):
             return None
         # mapped_sym: this SAME dep's own index variable occupying
@@ -1413,26 +1374,25 @@ def _stamp_direct_loop_info(
         the extent tiled_dims_per_read/output_tiled_dims must carry is
         the tile's own per-trip size in the dim's host-range units (see
         loop_info.py's tiled_dims_per_read docstring) -- these coincide
-        only when tile_size==1. Confirmed wrong on add_tiled_fn' tile_size=2
-        case: stamping trip_count (4) instead of the real per-trip extent
-        (2) doubled the read-side device advance (256 vs the correct 128
-        for a row-stride-64 buffer), silently reading past/aliasing wrong
-        rows on later trips.
+        only when tile_size==1. Stamping trip_count instead of the real
+        per-trip extent doubles (or otherwise miscomputes) the read-side
+        device advance, silently reading past/aliasing wrong rows on
+        later trips whenever tile_size != 1.
 
         `pos` is in the same namespace lookup_marker_dim resolved it in:
         op_out_coords positions when is_reduction is False, or this op's
         own reduction_loop_vars positions when True (mirrors
         lookup_marker_dim's own out_coords/red_vars split). Using
-        op_out_coords unconditionally here previously made this function
-        always miss for a reduction-position resolution -- op_out_coords
-        is scoped to the op's WRITE dep only (see pass_utils.op_out_coords)
-        and never contains a reduction position -- so a dep that
-        genuinely tiles along a reduction dim (e.g. a K/V tile read
-        inside an online-softmax reduction) fell through to the
+        op_out_coords unconditionally here would always miss for a
+        reduction-position resolution -- op_out_coords is scoped to the
+        op's WRITE dep only (see pass_utils.op_out_coords) and never
+        contains a reduction position -- so a dep that genuinely tiles
+        along a reduction dim (e.g. a K/V tile read inside an
+        online-softmax reduction) would fall through to the
         squeezed-advance fallback below, which is only valid for
-        point-shaped reads (see that branch's comment) and silently
-        produced a wrong device advance for a real, multi-element tiled
-        read. Found via test_carry_mode_online_softmax.
+        point-shaped reads (see that branch's comment), silently
+        producing a wrong device advance for a real, multi-element tiled
+        read.
 
         Re-derives the same coefficient-coincidence equation
         lookup_marker_dim used to find pos in the first place
@@ -1581,12 +1541,11 @@ def _stamp_direct_loop_info(
                     # from raw dep.index.free_symbols -- that re-derivation
                     # cannot distinguish "loop_var present but this dep is
                     # pinned" from "loop_var present and this dep genuinely
-                    # advances," which silently corrupted a restickified
-                    # V-tile pool buffer's address on trip 2+ (issue found
-                    # via test_carry_mode_online_softmax). A zero
-                    # coefficient here means this dep's address truly does
-                    # not depend on loop_var -- leave squeezed_level empty,
-                    # an explicit "pinned" verdict, not an omission.
+                    # advances," which would silently corrupt a
+                    # restickified V-tile pool buffer's address on trip 2+.
+                    # A zero coefficient here means this dep's address truly
+                    # does not depend on loop_var -- leave squeezed_level
+                    # empty, an explicit "pinned" verdict, not an omission.
                     coeff = dep.index.coeff(loop_var)
                     if coeff != 0:
                         squeezed_level.append((coeff, sympy.Integer(1)))
@@ -1618,9 +1577,8 @@ def _stamp_direct_loop_info(
                     # `resolved_pos is None` branch above left
                     # loop_tiled_dims empty), but the write dep structurally
                     # resolves to a real tiled position at this level --
-                    # e.g. a stacking-carry write-out op (buf13/op13 in
-                    # test_add_tiled_multi_stick) that is neither a marker
-                    # nor a marker's consumer, so lookup_marker_dim/
+                    # e.g. a stacking-carry write-out op that is neither a
+                    # marker nor a marker's consumer, so lookup_marker_dim/
                     # _marker_dim both return None for it, yet its write
                     # genuinely advances per trip. loop_tiled_dims must
                     # record this position too: it feeds
@@ -1669,28 +1627,29 @@ def _stamp_direct_loop_info(
                 squeezed_advance_output=[squeezed_advance_output_level],
             )
         else:
-            # Stamping actually runs outermost-first: splice_while_loops
-            # defers every _stamp_direct_loop_info call to a final phase
-            # that iterates pending_levels in splice-acceptance order, and
-            # the outer while_loop is always accepted (and so appended to
-            # pending_levels) before a nested while_loop can become visible
-            # (see splice_while_loops's own docstring: "the outer WhileLoop
-            # is visible in graph.operations immediately, while an inner
-            # WhileLoop only becomes visible once the outer splice flattens
-            # its body in"). So the FIRST call for a given op is the
-            # OUTERMOST level, and already correctly occupies index 0 (the
-            # existing=None branch above). Every per-level list field's
-            # documented convention is outermost-first (loop_info.py's own
-            # docstring; the design spec; scheduler.py's and coarse_tile.py's
-            # reliance on loop_group_id[0] being the outermost level), so
-            # each later, strictly-inner call's own contribution must be
-            # APPENDED onto the end of what an outer call already stamped --
-            # prepending here would shift the outer level's own key out of
-            # index 0, making an inner-nested op's loop_group_id[0] disagree
-            # with its outer siblings' loop_group_id[0] and breaking
-            # scheduler.py's _build_loop_group grouping (confirmed: this
-            # produced sibling, not nested, CountedLoopSchedulerNodes for
-            # test_nested_add_outer_row_inner_col_multi_stick).
+            # CANONICAL explanation of the outermost-first append-not-prepend
+            # convention (other docstrings in this module cross-reference
+            # this comment rather than re-stating it):
+            #
+            # _stamp_direct_loop_info is called once per while_loop nesting
+            # level, in group_idx-ascending (outermost-first) order --
+            # splice_while_loops defers every call to a final phase that
+            # iterates pending_levels in splice-acceptance order, and the
+            # outer while_loop is always accepted (and so appended to
+            # pending_levels) before a nested while_loop can become visible.
+            # So the FIRST call for a given op is the OUTERMOST level, and
+            # already correctly occupies index 0 (the existing=None branch
+            # above). Every per-level list field's documented convention is
+            # outermost-first (loop_info.py's own docstring; scheduler.py's
+            # and coarse_tile.py's reliance on loop_group_id[0] being the
+            # outermost level), so each later, strictly-inner call's own
+            # contribution must be APPENDED onto the end of what an outer
+            # call already stamped -- prepending here would shift the outer
+            # level's own key out of index 0, making an inner-nested op's
+            # loop_group_id[0] disagree with its outer siblings'
+            # loop_group_id[0] and breaking scheduler.py's _build_loop_group
+            # grouping, which would produce sibling, not nested,
+            # CountedLoopSchedulerNodes.
             merged_tiled_dims_per_read = list(existing.tiled_dims_per_read)
             if merged_tiled_dims_per_read and len(merged_tiled_dims_per_read) == len(
                 new_tiled_dims_per_read
@@ -1774,10 +1733,9 @@ def _recordable_op_names(group_ops: list["ir.Operation"]) -> list[str]:
     exist as a distinct object yet -- already has a fixed, predictable name:
     while_op.body_subgraph.graph.operations is the body subgraph's own op
     list, already carrying its final (fully-prefixed) names before its own
-    splice ever runs (confirmed empirically: a doubly-nested body's ops
-    already read as
+    splice ever runs -- e.g. a doubly-nested body's ops already read as
     "..._while_loop_body_graph_0_0_while_loop_body_graph_0_bufN" even before
-    the inner WhileLoop's own splice_while_loop call). So this level's
+    the inner WhileLoop's own splice_while_loop call. So this level's
     op_names must recurse into any nested ir.WhileLoop's own
     body_subgraph.graph.operations (arbitrarily deep, for >2 nesting
     levels) and record ITS names instead of the WhileLoop's own -- that is
@@ -1859,11 +1817,11 @@ def splice_while_loops(graph) -> None:
     Directly constructs and stamps CoarseTileInfo per accepted group from
     ground truth (trip count, loop var, tile_dim_marker resolution, carry
     roles) via _stamp_direct_loop_info -- never hands the group to
-    coarse_tile_pre_stickify for re-inference. See
-    docs/superpowers/specs/2026-09-17-while-loop-direct-loop-info-design.md
-    for why: coarse_tile_pre_stickify's index-coefficient inference runs
-    once per nesting level, blind to prior runs, and metadata goes stale
-    between them (the op23/buf7 bug).
+    coarse_tile_pre_stickify for re-inference, since coarse_tile_pre_stickify's
+    index-coefficient inference runs once per nesting level, blind to prior
+    runs, and a level's committed metadata can go stale once a later-spliced
+    nested level renames or rewires the buffers it depended on (see
+    _stamp_direct_loop_info's own docstring for the full rationale).
 
     Splicing itself runs outermost-first for a nested for_each_tile: the
     outer WhileLoop is visible in graph.operations immediately, while an
@@ -1903,22 +1861,12 @@ def splice_while_loops(graph) -> None:
     names are already fixed and predictable ahead of that later splice.
 
     Stamping itself still proceeds level-0-first (outermost first) within
-    the single final phase, preserving the existing outermost-first
-    convention _stamp_direct_loop_info's own per-level list fields rely on
-    (see its docstring). _stamp_direct_loop_info's own call order matches:
-    level 0's call stamps first (existing=None, loop_group_id=(0,)), and a
-    strictly-inner level's later call resolves the SAME live object again
-    by name and APPENDS -- e.g. level 1 onto level 0 yields
-    loop_group_id=(0, 1). See _stamp_direct_loop_info's own docstring for
-    why this append, not prepend, is what keeps loop_group_id/loop_count/
-    etc. consistent with every consumer's outermost-first-at-index-0
-    assumption. (A prior version of this code prepended instead, which
-    silently disagreed with the real outermost-first call order and gave a
-    nested for_each_tile's own group_idx=1 loop_group_id=(1, 0) --
-    loop_group_id[0]=1, disagreeing with its outer siblings'
-    loop_group_id[0]=0 -- splitting one nested group into sibling
-    CountedLoopSchedulerNodes instead of a nested one; see
-    scheduler.py's _build_loop_group.)
+    the single final phase: level 0's call stamps first (existing=None,
+    loop_group_id=(0,)), and a strictly-inner level's later call resolves
+    the SAME live object again by name and APPENDS -- e.g. level 1 onto
+    level 0 yields loop_group_id=(0, 1). See the `existing is not None`
+    branch inside _stamp_direct_loop_info for why append, not prepend, is
+    required here.
     """
     from torch._inductor import ir
 
