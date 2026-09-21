@@ -1621,9 +1621,9 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         completion: it now fails one stage further in, during
         op_spec_validation's symbol-consistency check ("OS-5") on a
         synthetic `identity` op inserted by splice_while_loops's carry/
-        tile-read redirect -- a distinct, not-yet-filed follow-up gap to
-        issue #4581 (see this test's tolerant except below for the exact
-        error and origin-tag lead). This test monkeypatches
+        tile-read redirect -- a distinct follow-up gap to issue #4581,
+        filed as issue #4706 (see this test's tolerant except below for
+        the exact error and origin-tag lead). This test monkeypatches
         splice_while_loops itself (the
         name torch_spyre._inductor.passes imports and calls directly) to
         capture a *snapshot* of graph.operations right as it returns, and
@@ -1687,21 +1687,20 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             capture_post_grad_while_loop(nested_split_m_then_k_fn, (X, Y))
         except InductorError as exc:
             # Expected: op_spec_validation (much later, unrelated to
-            # splicing) hits a distinct, not-yet-filed follow-up gap to
-            # issue #4581 -- an OpSpecValidationError ("OS-5" symbol-
-            # consistency check) on a synthetic `identity` op tagged
-            # reason='redirect while_loop carry/tile reads to persistent
-            # scratch' (from splice_while_loops's carry/tile-read
-            # redirect) -- after splice_while_loops has already completed
-            # and this test's capture has already fired. Any OTHER
-            # exception -- including the original "indirect symbol"
+            # splicing) hits issue #4706 -- an OpSpecValidationError
+            # ("OS-5" symbol-consistency check) on a synthetic `identity`
+            # op tagged reason='redirect while_loop carry/tile reads to
+            # persistent scratch' (from splice_while_loops's carry/
+            # tile-read redirect) -- after splice_while_loops has already
+            # completed and this test's capture has already fired. Any
+            # OTHER exception -- including the original "indirect symbol"
             # error, which this guard fix should have moved the pipeline
             # past -- is a real, unexpected finding; do not swallow it.
             self.assertIn(
                 "OpSpecValidationError",
                 str(exc),
-                "expected the known #4581 follow-up OS-5 symbol-"
-                f"consistency gap, got a different InductorError: {exc!r}",
+                "expected the known issue #4706 OS-5 symbol-consistency "
+                f"gap, got a different InductorError: {exc!r}",
             )
         finally:
             passes_mod.splice_while_loops = original_splice_while_loops
@@ -1759,18 +1758,18 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         markers survive correctly-tagged, but compilation later fails one
         stage further in, during op_spec_validation's OS-5 symbol-
         consistency check on a synthetic `identity` op inserted by
-        splice_while_loops's carry/tile-read redirect -- the SAME
-        not-yet-filed follow-up gap to issue #4581 documented on that test
-        and on test_nested_for_each_tile_value_correct, now independently
-        confirmed to also block depth=3 nesting (not just depth=2). Per
-        this plan's Task 2 ruling, this OS-5 gap is tracked follow-on scope,
-        not a blocker for the marker_resolution fix itself. This test
-        tolerates specifically that error (asserting "OpSpecValidationError"
-        is in the message -- narrower than a bare except, so a regression
-        to a *different* error, e.g. the original pre-fix "indirect symbol"
-        failure, still fails loudly) rather than asserting full end-to-end
-        numeric correctness, which is not currently reachable for this
-        fixture.
+        splice_while_loops's carry/tile-read redirect -- issue #4706, the
+        SAME gap documented on test_nested_for_each_tile_markers_resolve_
+        correctly and on test_nested_for_each_tile_value_correct, now
+        independently confirmed to also block depth=3 nesting (not just
+        depth=2). Per this plan's Task 2 ruling, this OS-5 gap is tracked
+        follow-on scope, not a blocker for the marker_resolution fix
+        itself. This test tolerates specifically that error (asserting
+        "OpSpecValidationError" is in the message -- narrower than a bare
+        except, so a regression to a *different* error, e.g. the original
+        pre-fix "indirect symbol" failure, still fails loudly) rather than
+        asserting full end-to-end numeric correctness, which is not
+        currently reachable for this fixture.
         """
         import torch
         import torch_spyre  # noqa: F401
@@ -1789,7 +1788,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             self.assertIn(
                 "OpSpecValidationError",
                 str(exc),
-                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                "expected the known issue #4706 OS-5 symbol-consistency "
                 f"gap, got a different InductorError: {exc!r}",
             )
 
@@ -1821,7 +1820,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             self.assertIn(
                 "OpSpecValidationError",
                 str(exc),
-                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                "expected the known issue #4706 OS-5 symbol-consistency "
                 f"gap, got a different InductorError: {exc!r}",
             )
 
@@ -1853,7 +1852,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             self.assertIn(
                 "OpSpecValidationError",
                 str(exc),
-                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                "expected the known issue #4706 OS-5 symbol-consistency "
                 f"gap, got a different InductorError: {exc!r}",
             )
 
@@ -1896,7 +1895,7 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
             self.assertIn(
                 "OpSpecValidationError",
                 str(exc),
-                "expected the known #4581 follow-up OS-5 symbol-consistency "
+                "expected the known issue #4706 OS-5 symbol-consistency "
                 f"gap, got a different InductorError: {exc!r}",
             )
 
@@ -2200,26 +2199,27 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         # The marker_resolution-aware guard in
         # _synthesize_dim_hints_for_group (issue #4581's fix) makes real
         # progress -- the pipeline now runs past the original codegen-time
-        # "indirect symbol" lookup failure. The follow-up OS-5
+        # "indirect symbol" lookup failure. Issue #4706's OS-5
         # symbol-consistency gap on splice_while_loops's synthetic
         # `identity` op (create_tensor_arg now strips WhileLoop-splice
         # loop_var symbols like u5 out of the static device_coordinates
         # and folds their contribution into device_tile_advance_expr
-        # instead) is fixed too. Compilation, scheduling, and codegen now
-        # all complete -- but the test still fails at the final numeric
-        # assertion, and the failure is nondeterministic run-to-run on
-        # this same fixed-seed-free fixture (confirmed via repeated clean-
-        # cache runs). This points to a memory-safety-class bug (a stale
-        # or aliased HBM read, likely in hbm_pool allocation lifetime or
-        # carry read/write scheduling order) rather than a deterministic
-        # addressing/indexing bug in the tiled_symbols/splice-var binding
-        # layer -- see issue #4701 for the full investigation writeup and
-        # next steps. test_carry_mode_split_k (test_for_each_tile_e2e.py)
-        # now passes: its StarDep-shaped matmul consumer turned out to hit
-        # the same OS-5 symbol-consistency layer as this fixture, and does
-        # not hit the #4701 nondeterministic memory-safety gap this test
-        # remains xfailed on (confirmed via isolated stash/pop bisection --
-        # see that test's own docstring).
+        # instead) is fixed too, for this fixture's shape. Compilation,
+        # scheduling, and codegen now all complete -- but the test still
+        # fails at the final numeric assertion, and the failure is
+        # nondeterministic run-to-run on this same fixed-seed-free fixture
+        # (confirmed via repeated clean-cache runs). This points to a
+        # memory-safety-class bug (a stale or aliased HBM read, likely in
+        # hbm_pool allocation lifetime or carry read/write scheduling
+        # order) rather than a deterministic addressing/indexing bug in
+        # the tiled_symbols/splice-var binding layer -- see issue #4701
+        # for the full investigation writeup and next steps.
+        # test_carry_mode_split_k (test_for_each_tile_e2e.py) now passes:
+        # its StarDep-shaped matmul consumer turned out to hit the same
+        # issue #4706 OS-5 symbol-consistency layer as this fixture, and
+        # does not hit the #4701 nondeterministic memory-safety gap this
+        # test remains xfailed on (confirmed via isolated stash/pop
+        # bisection -- see that test's own docstring).
         import torch
         import torch_spyre  # noqa: F401  registers the "spyre" device
         from torch_spyre.constants import DEVICE_NAME

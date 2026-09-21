@@ -159,8 +159,8 @@ class TestForEachTileE2E(_DynamoResetTestCase):
 
         Now passes: confirmed via isolated stash/pop bisection that this is
         fixed by the splice-var/``loop_info`` symbol-consistency work in
-        ``spyre_kernel.py``/``for_each_tile_lowering.py`` (the same
-        OS-5/``_synthesize_dim_hints_for_group`` fixes described in
+        ``spyre_kernel.py``/``for_each_tile_lowering.py`` (the same issue
+        #4706 OS-5/``_synthesize_dim_hints_for_group`` fixes described in
         ``test_nested_for_each_tile_value_correct``'s docstring, which
         closed the original stick-reconciliation crash for this fixture
         family) -- not by ``insert_restickify.py``'s unrelated online-
