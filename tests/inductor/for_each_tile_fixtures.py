@@ -920,6 +920,76 @@ def paged_gather_reference(pages: torch.Tensor, q: torch.Tensor) -> torch.Tensor
     return acc
 
 
+def paged_gather_kv_inputs() -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """(k pages, v pages, block table, query) -- two pools, one shared index."""
+    torch.manual_seed(0)
+    k_pages = torch.randn(PAGE_POOL, PAGE_SIZE, PAGE_HS, dtype=torch.float16)
+    v_pages = torch.randn(PAGE_POOL, PAGE_SIZE, PAGE_HS, dtype=torch.float16)
+    q = torch.randn(PAGE_LQ, PAGE_HS, dtype=torch.float16)
+    table = torch.zeros(PAGE_BLOCKS, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    for i, page in enumerate(PAGE_ORDER):
+        table[i, 0] = page
+    return k_pages, v_pages, table, q
+
+
+def paged_gather_kv_fn(
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    table: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """paged_gather_fn with separate K and V pools -- ONE marker, TWO consumers.
+
+    The only structural difference from paged_gather_fn is the one that
+    matters to _consume_tile_dim_markers: the page index sliced out of the
+    tiled block table feeds two ``index_select``s (K's page and V's page)
+    instead of one, so the block table's single dim=0 tile_dim_marker ends up
+    with two consuming reads, both ComputedBuffer/MemoryDep-shaped. That is
+    exactly what spyre-inference's page_attn_kernel does, and the same
+    multi-ComputedBuffer-consumer shape softmax_row_tiled_fn reaches through
+    torch.softmax's amax/sub siblings -- reached here through a second real
+    consumer op rather than a decomposition, and with a per-trip advance on
+    the marker that a dropped consumer turns into wrong numerics.
+
+    Keeping K and V in separate matmuls (Q@K^T, then P@V) matters too: with
+    one shared pool, or with both gathers feeding a single elementwise
+    expression, Inductor fuses the two gathers into one pointwise
+    ComputedBuffer whose two identical marker deps dedupe to a single read --
+    which silently does not exercise the multi-consumer path at all.
+    """
+
+    def body(acc, tiles):
+        table_row, k_all, v_all, q_whole = tiles
+        page_idx = table_row[0, 0:1]
+        k_page = k_all.index_select(0, page_idx).squeeze(0)
+        v_page = v_all.index_select(0, page_idx).squeeze(0)
+        scores = q_whole @ k_page.transpose(0, 1)
+        return acc + scores @ v_page, None
+
+    acc0 = torch.zeros(PAGE_LQ, PAGE_HS, device=q.device, dtype=q.dtype)
+    final, _ = for_each_tile(
+        body,
+        (table, k_pages, v_pages, q),
+        dims=(0, None, None, None),
+        tile_size=1,
+        init=acc0,
+    )
+    return final
+
+
+def paged_gather_kv_reference(
+    k_pages: torch.Tensor, v_pages: torch.Tensor, q: torch.Tensor
+) -> torch.Tensor:
+    """The same accumulation in fp32 on CPU, looped in Python over PAGE_ORDER."""
+    kf, vf, qf = k_pages.float(), v_pages.float(), q.float()
+    acc = torch.zeros(PAGE_LQ, PAGE_HS)
+    for p in PAGE_ORDER:
+        acc = acc + (qf @ kf[p].transpose(0, 1)) @ vf[p]
+    return acc
+
+
 @contextlib.contextmanager
 def _post_grad_graphs():
     """Capture each post-grad graph right after decompose_scan_to_while_loop runs.

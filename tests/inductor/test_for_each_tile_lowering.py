@@ -721,11 +721,21 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 break
         assert fake_mode is not None, "could not recover a fake_mode from gm node.meta"
 
+        # Lowered on the captured graph's OWN placeholders, not on `args`:
+        # dynamo/AOT order the post-grad graph's placeholders by nothing the
+        # caller controls (paged_gather_kv_fn's q, table, k, v arrive in a
+        # different order than they are passed), so feeding `args`
+        # positionally binds inputs to the wrong placeholders and blows up in
+        # lowering on a shape mismatch. Fake tensors are what the real
+        # Inductor pipeline runs GraphLowering on anyway.
+        placeholders = [
+            node.meta["val"] for node in gm.graph.nodes if node.op == "placeholder"
+        ]
         graph = GraphLowering(
-            gm, example_inputs=list(args), shape_env=fake_mode.shape_env
+            gm, example_inputs=placeholders, shape_env=fake_mode.shape_env
         )
         with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
-            graph.run(*args)
+            graph.run(*placeholders)
         return graph
 
     def test_marker_erased_and_mapped_after_split_m_splice(self):
@@ -981,6 +991,151 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
                 "real coordinate transform through unchanged, not some "
                 "other (e.g. renamed-and-unchanged, or miscomposed) value.",
             )
+
+    def test_marker_with_two_computed_buffer_consumers_maps_both(self):
+        """Paged attention's shape: one marker, two ComputedBuffer consumers.
+
+        paged_gather_kv_fn slices one page index out of the tiled block table
+        and hands it to two ``index_select``s (K's page and V's), so the
+        table's single dim=0 marker has two consuming reads, both
+        inline-branch shaped. This is the same supported multi-consumer shape
+        softmax_row_tiled_fn reaches through torch.softmax's amax/sub
+        siblings, pinned here at the IR level rather than only end to end,
+        and on a marker that carries a real per-trip advance.
+
+        Asserts more than "it no longer raises". Each consumer must get its
+        OWN map entry (dropping either silently loses that op's tiled-dim
+        provenance), each post-inline read must still carry the marker's own
+        per-trip advance term with the marker's own coefficient (the
+        silent-wrong-numerics regression
+        test_marker_inlined_preserves_advance_term_on_computed_buffer_
+        consumer pins for one consumer -- composing the transform into the
+        first consumer and merely renaming past the second would satisfy a
+        weaker check), and the marker must end up erased, since every one of
+        its consumers took the inline branch.
+        """
+        from torch._inductor import ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            MarkerResolution,
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _marker_resolution,
+            _stacking_carry_indices,
+            try_prove_for_each_tile,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        from tests.inductor.for_each_tile_fixtures import (
+            paged_gather_kv_fn,
+            paged_gather_kv_inputs,
+        )
+
+        args = paged_gather_kv_inputs()
+        graph = self._run_graph(paged_gather_kv_fn, args)
+
+        while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
+        self.assertEqual(len(while_ops), 1)
+        while_op = while_ops[0]
+
+        result = try_prove_for_each_tile(while_op)
+        self.assertTrue(result.accepted)
+        loop_var = _body_loop_var(while_op)
+        self.assertIsNotNone(loop_var)
+
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group_ops = splice_while_loop(
+                graph, while_op, carries, trip_count=result.trip_count
+            )
+
+            markers = [
+                op
+                for op in group_ops
+                if getattr(op, "tile_marker_dim", None) is not None
+            ]
+            self.assertEqual(
+                len(markers),
+                1,
+                "fixture assumption violated: only the block table is "
+                f"tiled here, so exactly one marker is expected; got {markers!r}",
+            )
+            marker_op = markers[0]
+            marker_name = marker_op.get_name()
+
+            marker_reads = [
+                d for d in marker_op.get_read_writes().reads if isinstance(d, MemoryDep)
+            ]
+            self.assertEqual(len(marker_reads), 1)
+            marker_input_name = marker_reads[0].name
+            marker_own_index = marker_reads[0].index
+            self.assertIn(
+                loop_var,
+                marker_own_index.free_symbols,
+                "fixture assumption violated: expected the marker's own "
+                f"read index to carry the per-trip advance ({loop_var}); "
+                f"got {marker_own_index!r}",
+            )
+
+            consumer_names = {
+                op.get_name()
+                for op in group_ops
+                if isinstance(op, ir.ComputedBuffer)
+                and op is not marker_op
+                and any(
+                    isinstance(d, MemoryDep) and d.name == marker_name
+                    for d in op.get_read_writes().reads
+                )
+            }
+            self.assertEqual(
+                len(consumer_names),
+                2,
+                "fixture assumption violated: expected the page index to "
+                "be read by two separate ComputedBuffer gathers (K's and "
+                f"V's index_select); got {sorted(consumer_names)}",
+            )
+
+            marker_map = _consume_tile_dim_markers(group_ops, graph.operations)
+
+        mapped_names = {name for name, _dep in marker_map}
+        self.assertEqual(
+            mapped_names,
+            consumer_names,
+            "every consumer of the marker must get its own map entry",
+        )
+        self.assertEqual(set(marker_map.values()), {0})
+
+        for (name, dep), _dim in marker_map.items():
+            self.assertEqual(
+                dep.name,
+                marker_input_name,
+                f"{name}'s mapped dep must name the marker's own upstream "
+                "input, i.e. be the post-inline read",
+            )
+            self.assertEqual(
+                dep.index.coeff(loop_var),
+                marker_own_index.coeff(loop_var),
+                f"{name}'s post-inline read lost or altered the marker's "
+                f"own per-trip advance term ({loop_var}) -- got "
+                f"{dep.index!r}, marker's own index is {marker_own_index!r}. "
+                "Every consumer must have the marker's real coordinate "
+                "transform composed in, not just the first one.",
+            )
+
+        self.assertEqual(
+            _marker_resolution(marker_op),
+            MarkerResolution.INLINE_ERASED,
+            "with both consumers inlined, the marker no longer needs to be "
+            "materialized",
+        )
+        self.assertNotIn(marker_op, graph.operations)
+        self.assertNotIn(marker_op, group_ops)
 
     def test_split_k_marker_resolves_reduction_dim(self):
         """IR-level value assertion for split_k_fn's reduction-dim marker.
