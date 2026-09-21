@@ -49,6 +49,7 @@ easy-to-debug cases, including a multi-stick tile_size variant of each
 test_hint_softmax_row_tiling's docstring on the device_size[1] invariant).
 """
 
+import functools
 import unittest
 
 import torch
@@ -82,6 +83,17 @@ from tests.inductor.for_each_tile_fixtures import (
 )
 
 
+def _with_dynamo_reset(test_fn):
+    """Wrap a test method to reset Dynamo immediately before it runs."""
+
+    @functools.wraps(test_fn)
+    def wrapper(self, *args, **kwargs):
+        torch._dynamo.reset()
+        return test_fn(self, *args, **kwargs)
+
+    return wrapper
+
+
 class _DynamoResetTestCase(unittest.TestCase):
     """Resets Dynamo before each test.
 
@@ -98,11 +110,22 @@ class _DynamoResetTestCase(unittest.TestCase):
     reset() before each test fixes it. This mirrors the reset
     capture_post_grad_while_loop (for_each_tile_fixtures.py) already does
     for the same reason.
+
+    The reset is applied via a per-method decorator (__init_subclass__ below)
+    rather than setUp(), because setUp() is not reliable here: the OOT test
+    harness's instantiate_device_type_tests() builds each device-specific
+    test class as type(name, (DeviceTypeTestBase, YourTestCase), {}), and
+    DeviceTypeTestBase's own setUp() -- which never calls super().setUp() --
+    wins the MRO over this class's setUp(), silently skipping the reset.
+    A method decorator has no such hazard: it wraps the test function object
+    itself, which survives instantiate_test()'s copy.deepcopy() untouched.
     """
 
-    def setUp(self):
-        super().setUp()
-        torch._dynamo.reset()
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        for name, value in list(vars(cls).items()):
+            if name.startswith("test") and callable(value):
+                setattr(cls, name, _with_dynamo_reset(value))
 
 
 class TestForEachTileE2E(_DynamoResetTestCase):
