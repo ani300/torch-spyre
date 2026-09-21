@@ -586,6 +586,46 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 self.assertIs(records_by_name[record.update_name], record)
                 self.assertEqual(records_by_name[storage_name], record)
 
+    def test_nested_late_created_ops_inherit_ancestor_loop_info(self):
+        """Inner splice-created markers and snapshots belong to both loops."""
+        from torch._inductor import ir
+        from torch._inductor.virtualized import V
+
+        from tests.inductor.for_each_tile_fixtures import (
+            attention_inputs,
+            nested_online_softmax_fn,
+        )
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            splice_while_loops,
+        )
+
+        graph = self._run_graph(nested_online_softmax_fn, attention_inputs())
+        with V.set_graph_handler(graph):
+            splice_while_loops(graph)
+
+        self.assertFalse(any(isinstance(op, ir.WhileLoop) for op in graph.operations))
+
+        markers = [
+            op
+            for op in graph.operations
+            if getattr(op, "tile_marker_dim", None) is not None
+        ]
+        self.assertTrue(markers, "expected surviving STAR_DEP_KEPT markers")
+        self.assertIn(
+            (0, 1),
+            {op.loop_info.loop_group_id for op in markers},
+            "an inner marker synthesized during its splice lost the outer level",
+        )
+
+        snapshots = [
+            op
+            for op in graph.operations
+            if "while_loop_carry_snapshot" in op.get_name()
+        ]
+        self.assertTrue(snapshots, "expected the online-softmax carry snapshot")
+        for op in snapshots:
+            self.assertEqual(op.loop_info.loop_group_id, (0, 1))
+
 
 class TestTryProveForEachTile(unittest.TestCase):
     def test_map_mode_accepted_with_trip_count(self):

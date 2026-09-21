@@ -1890,6 +1890,15 @@ def splice_while_loops(graph) -> None:
     object yet. See `_recordable_op_names`'s own docstring for why those
     names are already fixed and predictable ahead of that later splice.
 
+    Some operations have no predictable pre-splice name: a nested level's
+    splice can create carry snapshots, and a marker excluded from an
+    ancestor's prospective names can survive as STAR_DEP_KEPT. Each nested
+    WhileLoop therefore carries the indices of its accepted ancestors. When
+    that loop is later spliced, its final recordable names are appended to
+    every ancestor's pending name list. This makes those late-created ops
+    members of the complete loop nest instead of a sibling group containing
+    only their immediate level.
+
     Stamping itself still proceeds level-0-first (outermost first) within
     the single final phase: level 0's call stamps first (existing=None,
     loop_group_id=(0,)), and a strictly-inner level's later call resolves
@@ -1924,6 +1933,16 @@ def splice_while_loops(graph) -> None:
             if loop_var is None:
                 continue  # body shape doesn't match; leave untouched
 
+            # Operations synthesized while splicing this loop (notably a
+            # carry snapshot and STAR_DEP_KEPT tile markers) did not exist
+            # when any enclosing level recorded its prospective body names.
+            # Remember the actual ancestor chain on each still-nested
+            # WhileLoop so these late-created operations can be added to all
+            # enclosing levels before the final stamping phase.
+            ancestor_level_indices = tuple(
+                getattr(while_op, "_for_each_tile_ancestor_level_indices", ())
+            )
+
             carries = carry_bindings_for(
                 while_op,
                 _stacking_carry_indices(while_op, loop_var, result.trip_count),
@@ -1937,12 +1956,28 @@ def splice_while_loops(graph) -> None:
 
             _consume_tile_dim_markers(group_ops, graph.operations)
 
+            recordable_names = _recordable_op_names(group_ops)
+            for ancestor_idx in ancestor_level_indices:
+                ancestor_names = pending_levels[ancestor_idx][3]
+                ancestor_name_set = set(ancestor_names)
+                for name in recordable_names:
+                    if name not in ancestor_name_set:
+                        ancestor_names.append(name)
+                        ancestor_name_set.add(name)
+
+            for op in group_ops:
+                if isinstance(op, ir.WhileLoop):
+                    op._for_each_tile_ancestor_level_indices = (
+                        *ancestor_level_indices,
+                        group_idx,
+                    )
+
             pending_levels.append(
                 (
                     loop_var,
                     result.trip_count,
                     group_idx,
-                    _recordable_op_names(group_ops),
+                    recordable_names,
                 )
             )
 
