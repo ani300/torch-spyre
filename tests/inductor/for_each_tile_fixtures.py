@@ -685,6 +685,25 @@ def online_softmax_fn(
     return acc / denom
 
 
+def nested_online_softmax_fn(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
+) -> torch.Tensor:
+    """Map query rows around the carry-based online-softmax loop."""
+
+    def body(_, tiles):
+        (q_tile,) = tiles
+        return None, online_softmax_fn(q_tile, K, V)
+
+    _, out = for_each_tile(
+        body,
+        (Q,),
+        dims=(0,),
+        tile_size=64,
+        out_dim=0,
+    )
+    return out
+
+
 def online_softmax_reference(
     Q: torch.Tensor,
     K: torch.Tensor,
