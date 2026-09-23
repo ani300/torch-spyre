@@ -652,6 +652,7 @@ def test_repeated_restickify_penalizes_the_slow_split_shape():
     fast = _looped_restickify(8)
     slow = _looped_restickify(8, 2)
     equally_wide_but_slow = _looped_restickify(4, 2)
+    proven_one_by_one = _looped_restickify(1, 1)
     assert cost_model._restickify_loop_split_ns([fast], params) == 0
     assert cost_model._restickify_loop_split_ns([slow], params) == pytest.approx(
         8_320_000
@@ -659,6 +660,9 @@ def test_repeated_restickify_penalizes_the_slow_split_shape():
     assert cost_model._restickify_loop_split_ns(
         [equally_wide_but_slow], params
     ) == pytest.approx(16_640_000)
+    assert cost_model._restickify_loop_split_ns(
+        [proven_one_by_one], params
+    ) == pytest.approx(58_240_000)
     assert cost_model.predict_ops([fast], params) < cost_model.predict_ops(
         [slow], params
     )
@@ -714,8 +718,32 @@ def test_restickify_split_cost_does_not_change_other_pointwise_costs():
     params = CostParams()
     plain = _looped_restickify(8, 2, pattern="")
     standalone = _looped_restickify(8, 2, loop_trip=1)
+    uncalibrated_size = _looped_restickify(8, 2)
+    uncalibrated_size.out_elems //= 2
     assert cost_model._restickify_loop_split_ns([plain], params) == 0
     assert cost_model._restickify_loop_split_ns([standalone], params) == 0
+    assert cost_model._restickify_loop_split_ns([uncalibrated_size], params) == 0
+
+
+def test_restickify_split_cost_skips_legacy_records_without_shape():
+    record = cost_model.op_to_dict(_looped_restickify(8, 1))
+    record.pop("restickify_outer_split")
+    record.pop("restickify_inner_split")
+    restored = cost_model.op_from_dict(record)
+    assert restored.restickify_outer_split is None
+    assert restored.restickify_inner_split is None
+    assert cost_model._restickify_loop_split_ns([restored], CostParams()) == 0
+
+
+def test_restickify_split_cost_is_not_scaled_by_bandwidth_adjustments(monkeypatch):
+    params = CostParams()
+    without_split_cost = CostParams(restickify_loop_split_penalty_ns=0)
+    slow = _looped_restickify(8, 2)
+    expected = cost_model._restickify_loop_split_ns([slow], params)
+    monkeypatch.setattr(cost_model, "_lx_spill_bw_derate", lambda *_: 0.5)
+    assert cost_model.predict_ops([slow], params) - cost_model.predict_ops(
+        [slow], without_split_cost
+    ) == pytest.approx(expected)
 
 
 def test_extractor_records_restickify_outer_and_inner_splits(monkeypatch):
@@ -732,6 +760,29 @@ def test_extractor_records_restickify_outer_and_inner_splits(monkeypatch):
     features = dcm.extract_op_features(op, {c0: 8, c1: 2, c2: 1})
     assert features.restickify_outer_split == 8
     assert features.restickify_inner_split == 2
+
+
+def test_extractor_leaves_unavailable_restickify_split_shape_unknown(monkeypatch):
+    c0 = sympy.symbols("c0", integer=True)
+    op = _extractable_op("buf1", ["buf0"])
+    op.get_size = lambda: [1_048_576]
+    rw = op.get_read_writes()
+    rw.writes.append(SimpleNamespace(index=c0))
+    op.get_read_writes = lambda: rw
+    monkeypatch.setattr(dcm, "iteration_space_from_op", lambda _: {c0: 1_048_576})
+    monkeypatch.setattr(dcm, "_loop_features", lambda _: (128, False, False))
+    monkeypatch.setattr(dcm, "_hbm_pattern", lambda *_: "restickify")
+    features = dcm.extract_op_features(op)
+    assert features.restickify_outer_split is None
+    assert features.restickify_inner_split is None
+    assert cost_model._restickify_loop_split_ns([features], CostParams()) == 0
+
+    known_unsplit = dcm.extract_op_features(op, {})
+    assert known_unsplit.restickify_outer_split == 1
+    assert known_unsplit.restickify_inner_split == 1
+    assert cost_model._restickify_loop_split_ns(
+        [known_unsplit], CostParams()
+    ) == pytest.approx(58_240_000)
 
 
 def _indirect_store(cores=1, is_lx=False, **kwargs):

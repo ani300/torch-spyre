@@ -46,11 +46,12 @@ Model (per fused bundle / single-op kernel):
   overall (turnaround) vs ~11% for an additive two-rate. Using a single aggregate
   BW_PEAK is the "shared HBM" assumption (rung-5: core-independent for >=2 cores).
 - A RESTICKIFY inside a coarse loop is sensitive to split shape, not just core count.
-  Splitting its outer device dimension eight ways is fast; spending another factor on
-  an inner dimension adds about 65 us per loop iteration, and using fewer than eight
-  outer splits gives up the useful parallelism. This is deliberately restricted to
-  repeated restickifies: standalone transpose measurements remain bandwidth-bound and
-  split-count invariant.
+  At the calibrated 2 MiB fp16 tile, splitting its outer device dimension eight ways is
+  fast; spending another factor on an inner dimension adds about 65 us per iteration,
+  and using fewer than eight outer splits gives up useful parallelism. This fixed
+  increment is added after bandwidth/spill adjustments and compute overlap. It is
+  restricted to repeated restickifies at the measured tile size: standalone transpose
+  measurements remain bandwidth-bound and split-count invariant.
 - memory traffic counts each tensor-arg's bytes once, attributed to HBM or LX by
   its allocation. LX-placed tensors don't touch HBM, and their LX traffic is treated
   as ~free (the measured per-pass LX cost is below run-to-run noise). The exception is
@@ -371,9 +372,10 @@ class OpFeatures:
     # iteration variable with the largest flattened write-index coefficient;
     # ``inner`` is the product of the other output-variable splits. The distinction
     # matters even at equal core count: the long-context SDPA clone is fast at 8x1
-    # and slow at 8x2 (or 4x2). Other access patterns leave both at 1.
-    restickify_outer_split: int = 1
-    restickify_inner_split: int = 1
+    # and slow at 8x2 (or 4x2). ``None`` means extraction failed or the feature came
+    # from an older serialized record; it must not be treated as a measured 1x1 split.
+    restickify_outer_split: int | None = None
+    restickify_inner_split: int | None = None
     # LX RELAYOUT (PR #3439): an identity copy the scratchpad planner inserts when a
     # producer and its consumers own an LX buffer under different per-core divisions.
     # Its traffic is entirely LX, which this model charges at zero -- calibrated for
@@ -808,14 +810,16 @@ class CostParams:
     bw_restickify_gbps: float = (
         116.0  # transpose: stick swapped, LESS turnaround (faster)
     )
-    # Measured on the nested SDPA key transport: 8x1 outer/inner splitting is fast,
-    # while 8x2 adds ~8.3 ms over 128 iterations. A 4x2 plan is slow too, showing
-    # that total cores are not the governing quantity. Charge one measured increment
-    # per missing factor of outer parallelism or extra factor of inner splitting.
-    # Standalone transpose controls stay flat from 2 through 32 cores, so this applies
-    # only when ``loop_trip > 1``.
+    # Measured on the nested SDPA key transport with a 2 MiB fp16 output tile: 8x1
+    # outer/inner splitting is fast, while 8x2 adds ~8.3 ms over 128 iterations. A 4x2
+    # plan is slow too, showing that total cores are not the governing quantity. Charge
+    # one measured increment per missing factor of outer parallelism or extra factor of
+    # inner splitting. The tile-size gate keeps this one-point calibration from being
+    # extrapolated to other geometries. Standalone transpose controls stay flat from 2
+    # through 32 cores, so this also applies only when ``loop_trip > 1``.
     restickify_loop_split_penalty_ns: float = 65_000.0
     restickify_loop_target_outer_split: int = 8
+    restickify_loop_calibrated_tile_bytes: int = 2 * 1024 * 1024
     # Stick-plane transports (cat0, transpose_outer, cat1): a `clone` that reorganizes
     # the stick layout. The 32 cores split the stick-plane dim (sp = C/64); each core
     # does the per-row stick work. Effective BW falls with the per-row strided stick
@@ -1857,7 +1861,10 @@ def _restickify_loop_split_ns(ops: list, p: "CostParams"):
     inner splitting. ``Max`` and the reciprocal of a split symbol are both forms the
     CP-SAT printer lowers exactly over a division's finite candidate table.
 
-    Standalone restickifies are intentionally excluded: a 32 MiB transpose measured
+    This initial calibration is deliberately narrow: the measured output tile is 2 MiB
+    fp16; that case also had both operands in HBM. The tile size is enforced here.
+    Other tile sizes and any operation whose split shape is unknown receive no
+    adjustment. Standalone restickifies are also excluded: a 32 MiB transpose measured
     the same ~112 GB/s on 2, 4, 8, 16, and 32 cores.
     """
     per_iteration = p.restickify_loop_split_penalty_ns
@@ -1866,10 +1873,18 @@ def _restickify_loop_split_ns(ops: list, p: "CostParams"):
         return 0.0
     total = 0.0
     for op in ops:
-        if getattr(op, "hbm_pattern", "") != "restickify" or op.loop_trip <= 1:
+        if (
+            getattr(op, "hbm_pattern", "") != "restickify"
+            or op.loop_trip <= 1
+            or op.out_elems * op.dtype_bytes != p.restickify_loop_calibrated_tile_bytes
+        ):
             continue
-        outer = max(1, op.restickify_outer_split)
-        inner = max(1, op.restickify_inner_split)
+        outer = op.restickify_outer_split
+        inner = op.restickify_inner_split
+        if outer is None or inner is None:
+            continue
+        outer = max(1, outer)
+        inner = max(1, inner)
         outer_shortfall = max(0.0, target_outer / outer - 1.0)
         inner_excess = max(0.0, inner - 1.0)
         total += per_iteration * op.loop_trip * (outer_shortfall + inner_excess)
@@ -1994,10 +2009,6 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
     # Replace the stores' peak-rate charge with the writing cores' limited rate.
     mem = mem + _store_core_excess_ns(ops, p)
-    # Repeated restickifies are sensitive to which dimensions carry the core splits:
-    # favor useful outer parallelism and charge inner splitting separately from the
-    # traffic already covered by the base memory term.
-    mem = mem + _restickify_loop_split_ns(ops, p)
     # Sharing slows delivery of these same reads; it does not add HBM bytes.
     # Apply the same subsequent bandwidth derates as the base and replica reads.
     # Both matmul models use this input-delivery cost. The bundled model's
@@ -2084,12 +2095,17 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # Measured on x*2 + x*3 (cores=32): with the clone the fused kernel is exactly one
     # read plus one write at 150 GB/s (113 us at x = 8 MiB, 222 us at 16 MiB).
     clone_ns = _clone_in_bytes(ops) / p.bw_peak_gbps
+    # This is a measured latency increment, not another byte-transfer estimate. Keep it
+    # outside bandwidth/spill derates and compute overlap so 65 us per loop iteration
+    # remains 65 us in the final objective.
+    restickify_split_ns = _restickify_loop_split_ns(ops, p)
     t = (
         compute
         + mem_t
         - p.overlap_gamma * _lazy_min(compute, mem_t)
         + rel_ns
         + clone_ns
+        + restickify_split_ns
     )
     # (A genuine-reduction cross-core ring-combine term once lived here; it is provably
     # bounded by ~cores * a tiny per-elem cost <= ~5 ns -- below run-to-run noise --
@@ -2370,7 +2386,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     if restickify_extra:
         lines.append(
             f"     repeated-restickify split shape: +{restickify_extra / 1000:.2f} us "
-            "(before bandwidth adjustments and compute overlap)"
+            "(after bandwidth adjustments and compute overlap)"
         )
     if any(getattr(o, "is_matmul", False) for o in ops) and p.use_bundled_cost_model:
         return _explain_matmul_bundled(lines, ops, p)
@@ -2444,6 +2460,8 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     clone = _clone_in_bytes(ops)
     if not (isinstance(clone, int) and clone == 0):
         parts = f"{parts} + CLONE_IN/BW_PEAK"
+    if restickify_extra:
+        parts = f"{parts} + RESTICKIFY_SPLIT"
     lines.append(f"  -- prediction (turnaround): T = {parts} --")
     lines.append(f"     R={R}B (read)   W={W}B (write)")
     if not (isinstance(clone, int) and clone == 0):

@@ -365,7 +365,7 @@ def _row_split(op, default: int, work_slices=None) -> int:
         return default
 
 
-def _output_split_shape(op, work_slices=None) -> tuple[int, int]:
+def _output_split_shape(op, work_slices=None) -> tuple[int | None, int | None]:
     """Return ``(outer_split, inner_split)`` for an op's output iteration vars.
 
     The outer variable has the largest flattened write-index coefficient.  The
@@ -375,6 +375,15 @@ def _output_split_shape(op, work_slices=None) -> tuple[int, int]:
     candidate; ``math.prod`` deliberately preserves those expressions.
     """
     try:
+        # An empty explicit/committed map is a proven unsplit 1x1 layout. With no
+        # ownership source at all, however, an empty map means the split metadata is
+        # unavailable and must not be turned into a measured-looking 1x1 penalty.
+        if (
+            work_slices is None
+            and getattr(op, "iteration_space_ownership", None) is None
+            and not getattr(op, "op_it_space_splits", None)
+        ):
+            return None, None
         rw = op.get_read_writes()
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
@@ -386,7 +395,7 @@ def _output_split_shape(op, work_slices=None) -> tuple[int, int]:
             if write_index.coeff(symbol) != 0
         ]
         if not output_vars:
-            return 1, 1
+            return None, None
         _, outer = max(output_vars, key=lambda item: item[0])
         outer_split = readable.get(outer, 1)
         inner_split = math.prod(
@@ -394,7 +403,7 @@ def _output_split_shape(op, work_slices=None) -> tuple[int, int]:
         )
         return outer_split, inner_split
     except Exception:  # noqa: BLE001 - best-effort feature extraction
-        return 1, 1
+        return None, None
 
 
 def _matmul_features(
@@ -1035,7 +1044,7 @@ def extract_op_features(
     restickify_outer_split, restickify_inner_split = (
         _output_split_shape(op, work_slices)
         if hbm_pattern == "restickify" and loop_trip > 1
-        else (1, 1)
+        else (None, None)
     )
 
     features = OpFeatures(
