@@ -633,9 +633,9 @@ class CostParams:
     # over-charged rather than the overlap under-modelled.
     loop_reread_scale: float = 0.85
     overlap_gamma: float = 1.0  # compute/HBM overlap: min(compute,HBM) partly hidden
-    # A fused row-reduction pipeline is bounded by the number of logical input
+    # A fused row-reduction pipeline is bounded by the number of device-layout input
     # elements each active core processes even when all intermediates stay in LX.
-    # The low-core softmax ladder (1--8 cores) sustains about 1.5 logical input
+    # The low-core softmax ladder (1--8 cores) sustains about 1.5 device-layout input
     # elements/ns/core; at 16/32 cores the HBM side of the roofline takes over. This
     # is a floor on the final memory time, not another byte stream: applying the LX
     # spill/underfill derates to it would count the same bottleneck twice.
@@ -1670,7 +1670,8 @@ def _fused_reduction_floor_ns(ops: list, p: CostParams) -> object:
     """Per-core element-throughput floor for a fused non-matmul reduction.
 
     A softmax-like bundle may keep every score-sized intermediate in LX, but its
-    reduction pipeline still processes the full logical input on each owning core.
+    reduction pipeline still processes the full padded device-layout input on each
+    owning core.
     The largest such reduction governs the fused pipeline. ``cores`` may be the
     product of symbolic work-division factors; the solver lowers their reciprocal
     directly, keeping this hardware model independent of candidate enumeration.
@@ -1966,7 +1967,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         # worst category (median -82 % at cores<32; `softmax_unrolled` runs at cores=1
         # BY DESIGN, so every one of its points sat near -92 %). The binding constraint
         # there is PER-CORE ELEMENT THROUGHPUT: the 1--8 core ladder sustains about
-        # 1.5 logical elements/ns/core. Charged as a floor, it only ever raises a
+        # 1.5 device-layout elements/ns/core. Charged as a floor, it only ever raises a
         # prediction and never binds at cores=32 (0/89 records) ->
         # the cores=32 path is byte-identical. FLAGGED, deliberately NOT modelled: the
         # floor alone leaves a systematic residual at cores=8/16 (median -17 % / -41 %),
