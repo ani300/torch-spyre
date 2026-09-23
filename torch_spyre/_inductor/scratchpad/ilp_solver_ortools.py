@@ -1407,10 +1407,18 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 free_copies,
                 max_copies,
             )
+        # CP-SAT's portfolio expands as workers are added. On large hosts, asking
+        # for every physical core can race many extra subsolvers and return materially
+        # different cost optima across identical compiles. Eight retains the useful
+        # parallel portfolio without that plan-quality variance; deterministic mode
+        # remains single-worker so exact ties are reproducible too.
         solver.parameters.num_search_workers = (
-            1 if torch.are_deterministic_algorithms_enabled() else get_cpu_count()
+            1
+            if torch.are_deterministic_algorithms_enabled()
+            else min(8, get_cpu_count())
         )
-        # Fixed seed so a given worker configuration is reproducible run-to-run.
+        # Stabilize randomized strategies. Parallel scheduling may still select a
+        # different representative of an exact objective tie.
         solver.parameters.random_seed = 0
 
         status = None
