@@ -1691,7 +1691,7 @@ def _fused_reduction_compute_ns(ops: list, p: CostParams) -> float | sympy.Expr:
         if not internal_inputs:
             continue
         input_elems = max(
-            (arg.elems * arg.loop_factor for arg in internal_inputs),
+            [arg.elems * arg.loop_factor for arg in internal_inputs],
             default=op.out_elems,
         )
         costs.append(input_elems / op.cores / p.fused_reduction_elems_per_core_ns)
