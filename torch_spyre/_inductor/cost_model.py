@@ -45,6 +45,12 @@ Model (per fused bundle / single-op kernel):
   Verified on the B-F profiler sweep: ~2% error on core pointwise + reductions, ~7%
   overall (turnaround) vs ~11% for an additive two-rate. Using a single aggregate
   BW_PEAK is the "shared HBM" assumption (rung-5: core-independent for >=2 cores).
+- A RESTICKIFY inside a coarse loop is sensitive to split shape, not just core count.
+  Splitting its outer device dimension eight ways is fast; spending another factor on
+  an inner dimension adds about 65 us per loop iteration, and using fewer than eight
+  outer splits gives up the useful parallelism. This is deliberately restricted to
+  repeated restickifies: standalone transpose measurements remain bandwidth-bound and
+  split-count invariant.
 - memory traffic counts each tensor-arg's bytes once, attributed to HBM or LX by
   its allocation. LX-placed tensors don't touch HBM, and their LX traffic is treated
   as ~free (the measured per-pass LX cost is below run-to-run noise). The exception is
@@ -361,6 +367,13 @@ class OpFeatures:
     # (cross-row reduction: reduced var read with coeff!=1). "" -> default
     # 150+turnaround.
     hbm_pattern: str = ""
+    # Split shape for a repeated restickify. ``outer`` is the split on the output
+    # iteration variable with the largest flattened write-index coefficient;
+    # ``inner`` is the product of the other output-variable splits. The distinction
+    # matters even at equal core count: the long-context SDPA clone is fast at 8x1
+    # and slow at 8x2 (or 4x2). Other access patterns leave both at 1.
+    restickify_outer_split: int = 1
+    restickify_inner_split: int = 1
     # LX RELAYOUT (PR #3439): an identity copy the scratchpad planner inserts when a
     # producer and its consumers own an LX buffer under different per-core divisions.
     # Its traffic is entirely LX, which this model charges at zero -- calibrated for
@@ -795,6 +808,14 @@ class CostParams:
     bw_restickify_gbps: float = (
         116.0  # transpose: stick swapped, LESS turnaround (faster)
     )
+    # Measured on the nested SDPA key transport: 8x1 outer/inner splitting is fast,
+    # while 8x2 adds ~8.3 ms over 128 iterations. A 4x2 plan is slow too, showing
+    # that total cores are not the governing quantity. Charge one measured increment
+    # per missing factor of outer parallelism or extra factor of inner splitting.
+    # Standalone transpose controls stay flat from 2 through 32 cores, so this applies
+    # only when ``loop_trip > 1``.
+    restickify_loop_split_penalty_ns: float = 65_000.0
+    restickify_loop_target_outer_split: int = 8
     # Stick-plane transports (cat0, transpose_outer, cat1): a `clone` that reorganizes
     # the stick layout. The 32 cores split the stick-plane dim (sp = C/64); each core
     # does the per-row stick work. Effective BW falls with the per-row strided stick
@@ -1825,6 +1846,36 @@ def _store_core_excess_ns(ops: list, p: "CostParams"):
     return total
 
 
+def _restickify_loop_split_ns(ops: list, p: "CostParams"):
+    """Extra time for an inefficient repeated-restickify split shape.
+
+    The long-context SDPA transport exposes why total cores are insufficient: 8x1 is
+    fast, 8x2 is about 8.3 ms slower, and forcing the total back to eight as 4x2 stays
+    slow. The useful parallelism is the outer split; an inner split adds strided work
+    without increasing the effective transfer rate. Price one measured per-iteration
+    increment for every missing factor of outer parallelism and every extra factor of
+    inner splitting. ``Max`` and the reciprocal of a split symbol are both forms the
+    CP-SAT printer lowers exactly over a division's finite candidate table.
+
+    Standalone restickifies are intentionally excluded: a 32 MiB transpose measured
+    the same ~112 GB/s on 2, 4, 8, 16, and 32 cores.
+    """
+    per_iteration = p.restickify_loop_split_penalty_ns
+    target_outer = p.restickify_loop_target_outer_split
+    if per_iteration <= 0 or target_outer <= 0:
+        return 0.0
+    total = 0.0
+    for op in ops:
+        if getattr(op, "hbm_pattern", "") != "restickify" or op.loop_trip <= 1:
+            continue
+        outer = max(1, op.restickify_outer_split)
+        inner = max(1, op.restickify_inner_split)
+        outer_shortfall = max(0.0, target_outer / outer - 1.0)
+        inner_excess = max(0.0, inner - 1.0)
+        total += per_iteration * op.loop_trip * (outer_shortfall + inner_excess)
+    return total
+
+
 def predict_ops(ops: list, params: CostParams | None = None) -> float:
     """Predicted device latency (ns) for a bundle of ops (one fused kernel).
 
@@ -1943,6 +1994,10 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
     # Replace the stores' peak-rate charge with the writing cores' limited rate.
     mem = mem + _store_core_excess_ns(ops, p)
+    # Repeated restickifies are sensitive to which dimensions carry the core splits:
+    # favor useful outer parallelism and charge inner splitting separately from the
+    # traffic already covered by the base memory term.
+    mem = mem + _restickify_loop_split_ns(ops, p)
     # Sharing slows delivery of these same reads; it does not add HBM bytes.
     # Apply the same subsequent bandwidth derates as the base and replica reads.
     # Both matmul models use this input-delivery cost. The bundled model's
@@ -2309,6 +2364,12 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     if store_extra:
         lines.append(
             f"     indirect-store core limit: +{store_extra / 1000:.2f} us "
+            "(before bandwidth adjustments and compute overlap)"
+        )
+    restickify_extra = _restickify_loop_split_ns(ops, p)
+    if restickify_extra:
+        lines.append(
+            f"     repeated-restickify split shape: +{restickify_extra / 1000:.2f} us "
             "(before bandwidth adjustments and compute overlap)"
         )
     if any(getattr(o, "is_matmul", False) for o in ops) and p.use_bundled_cost_model:

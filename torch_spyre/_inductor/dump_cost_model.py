@@ -365,6 +365,38 @@ def _row_split(op, default: int, work_slices=None) -> int:
         return default
 
 
+def _output_split_shape(op, work_slices=None) -> tuple[int, int]:
+    """Return ``(outer_split, inner_split)`` for an op's output iteration vars.
+
+    The outer variable has the largest flattened write-index coefficient.  The
+    remaining output-variable splits are multiplied into ``inner_split``.  Reduction
+    variables (zero write coefficient) do not describe the output layout and are
+    excluded.  Values may be solver symbols while the co-optimizer is pricing a
+    candidate; ``math.prod`` deliberately preserves those expressions.
+    """
+    try:
+        rw = op.get_read_writes()
+        write_index = next(iter(rw.writes)).index
+        read_index = next((d.index for d in rw.reads), write_index)
+        it_space = iteration_space_from_op(op)
+        readable = _work_slices(op, write_index, read_index, it_space, work_slices)
+        output_vars = [
+            (abs(int(write_index.coeff(symbol))), symbol)
+            for symbol in it_space
+            if write_index.coeff(symbol) != 0
+        ]
+        if not output_vars:
+            return 1, 1
+        _, outer = max(output_vars, key=lambda item: item[0])
+        outer_split = readable.get(outer, 1)
+        inner_split = math.prod(
+            readable.get(symbol, 1) for _, symbol in output_vars if symbol != outer
+        )
+        return outer_split, inner_split
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        return 1, 1
+
+
 def _matmul_features(
     op,
     out_elems: int,
@@ -999,6 +1031,13 @@ def extract_op_features(
 
     _rl = _relayout_features(op, out_dims)
 
+    hbm_pattern = "" if is_matmul else _hbm_pattern(op, is_reduction, out_dims)
+    restickify_outer_split, restickify_inner_split = (
+        _output_split_shape(op, work_slices)
+        if hbm_pattern == "restickify" and loop_trip > 1
+        else (1, 1)
+    )
+
     features = OpFeatures(
         name=_op_name(op),
         is_reduction=is_reduction,
@@ -1019,7 +1058,9 @@ def extract_op_features(
         matmul_b_bytes=matmul_b_bytes,
         matmul_m_split=matmul_m_split,
         matmul_n_split=matmul_n_split,
-        hbm_pattern="" if is_matmul else _hbm_pattern(op, is_reduction, out_dims),
+        hbm_pattern=hbm_pattern,
+        restickify_outer_split=restickify_outer_split,
+        restickify_inner_split=restickify_inner_split,
         is_lx_relayout=_rl[0],
         relayout_run_elems=_rl[1],
         relayout_split=_rl[2],

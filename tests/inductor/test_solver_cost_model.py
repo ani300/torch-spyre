@@ -625,6 +625,115 @@ def test_the_per_arg_io_breakdown_sums_to_its_own_total():
     assert counted == dcm.LAST_IO["hbm_bytes"] == 2 * BYTES
 
 
+def _looped_restickify(
+    outer_split=8, inner_split=1, *, pattern="restickify", loop_trip=128
+):
+    """The repeated K-layout transport from the long-context SDPA regression."""
+    return OpFeatures(
+        name="Pointwise",
+        is_reduction=False,
+        out_elems=1_048_576,
+        cores=outer_split * inner_split,
+        dtype_bytes=2,
+        loop_trip=loop_trip,
+        hbm_pattern=pattern,
+        restickify_outer_split=outer_split,
+        restickify_inner_split=inner_split,
+        args=[
+            # Four outer-loop passes over the 32,768-token input and the output tile.
+            ArgTraffic("arg1", "input", False, 34_078_720, loop_factor=4),
+            ArgTraffic("buf10", "output", False, 1_048_576, loop_factor=4),
+        ],
+    )
+
+
+def test_repeated_restickify_penalizes_the_slow_split_shape():
+    params = CostParams()
+    fast = _looped_restickify(8)
+    slow = _looped_restickify(8, 2)
+    equally_wide_but_slow = _looped_restickify(4, 2)
+    assert cost_model._restickify_loop_split_ns([fast], params) == 0
+    assert cost_model._restickify_loop_split_ns([slow], params) == pytest.approx(
+        8_320_000
+    )
+    assert cost_model._restickify_loop_split_ns(
+        [equally_wide_but_slow], params
+    ) == pytest.approx(16_640_000)
+    assert cost_model.predict_ops([fast], params) < cost_model.predict_ops(
+        [slow], params
+    )
+
+
+def test_restickify_division_survives_in_the_symbolic_cost():
+    outer, inner = sympy.symbols(
+        "split_buf10_d0 split_buf10_d1", integer=True, positive=True
+    )
+    expr = sympy.sympify(cost_model.predict_ops([_looped_restickify(outer, inner)]))
+    assert {outer, inner} <= expr.free_symbols
+    assert float(expr.subs({outer: 8, inner: 1})) < float(
+        expr.subs({outer: 8, inner: 2})
+    )
+    assert float(expr.subs({outer: 8, inner: 1})) < float(
+        expr.subs({outer: 4, inner: 2})
+    )
+
+
+def test_cpsat_picks_the_faster_restickify_division():
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        _SympyExprToCpSat,
+    )
+
+    outer, inner = sympy.symbols(
+        "split_buf10_d0 split_buf10_d1", integer=True, positive=True
+    )
+    expr = sympy.sympify(cost_model.predict_ops([_looped_restickify(outer, inner)]))
+    model = cp_model.CpModel()
+    division = model.new_int_var(0, 2, "division_buf10")
+    outer_var = model.new_int_var_from_domain(
+        cp_model.Domain.FromValues([4, 8]), outer.name
+    )
+    inner_var = model.new_int_var_from_domain(
+        cp_model.Domain.FromValues([1, 2]), inner.name
+    )
+    model.add_element(division, [8, 8, 4], outer_var)
+    model.add_element(division, [1, 2, 2], inner_var)
+    model.minimize(
+        _SympyExprToCpSat(
+            model,
+            {outer.name: outer_var, inner.name: inner_var},
+            {outer.name: (None, [8, 8, 4]), inner.name: (None, [1, 2, 2])},
+        ).convert(expr)
+    )
+    solver = cp_model.CpSolver()
+    assert solver.solve(model) == cp_model.OPTIMAL
+    assert solver.value(division) == 0
+
+
+def test_restickify_split_cost_does_not_change_other_pointwise_costs():
+    params = CostParams()
+    plain = _looped_restickify(8, 2, pattern="")
+    standalone = _looped_restickify(8, 2, loop_trip=1)
+    assert cost_model._restickify_loop_split_ns([plain], params) == 0
+    assert cost_model._restickify_loop_split_ns([standalone], params) == 0
+
+
+def test_extractor_records_restickify_outer_and_inner_splits(monkeypatch):
+    c0, c1, c2 = sympy.symbols("c0 c1 c2", integer=True)
+    op = _extractable_op("buf1", ["buf0"])
+    rw = op.get_read_writes()
+    rw.writes.append(SimpleNamespace(index=131_072 * c0 + 1024 * c1 + c2))
+    op.get_read_writes = lambda: rw
+    monkeypatch.setattr(
+        dcm, "iteration_space_from_op", lambda _: {c0: 8, c1: 128, c2: 1024}
+    )
+    monkeypatch.setattr(dcm, "_loop_features", lambda _: (128, False, False))
+    monkeypatch.setattr(dcm, "_hbm_pattern", lambda *_: "restickify")
+    features = dcm.extract_op_features(op, {c0: 8, c1: 2, c2: 1})
+    assert features.restickify_outer_split == 8
+    assert features.restickify_inner_split == 2
+
+
 def _indirect_store(cores=1, is_lx=False, **kwargs):
     return OpFeatures(
         name="store",
