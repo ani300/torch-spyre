@@ -64,6 +64,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
+    DivisionCost,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
     SolveError,
@@ -132,13 +133,15 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     solver_relayout_pair_cost,
     work_division_from_view,
 )
-from torch_spyre._inductor.cost_model import CostParams
+from torch_spyre._inductor.cost_model import (
+    CostParams,
+    _fused_reduction_floor_ns,
+)
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 
 _COST_PARAMS = CostParams(
-    # we need a expression of both compute, mem_t
-    # whereas the default gives max(compute, mem_t)
-    # which optimizes compute only when there's a matmul
+    # Joint optimization needs the additive compute and memory expression; the
+    # default bundled model returns their roofline maximum.
     overlap_gamma=0.46,
     use_bundled_cost_model=False,
 )
@@ -2378,7 +2381,23 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         buffer = buffers[output_name]
         division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        return extract_op_features(op, ws, is_lx=is_lx)
+        feature = extract_op_features(op, ws, is_lx=is_lx)
+        if feature.is_reduction and not feature.is_matmul:
+            prices = []
+            for candidate in buffer.core_divisions:
+                concrete = extract_op_features(
+                    op, _work_slices(op, candidate), is_lx=is_lx
+                )
+                prices.append(
+                    sympy.Integer(
+                        round(_fused_reduction_floor_ns([concrete], _COST_PARAMS))
+                    )
+                )
+            feature = replace(
+                feature,
+                reduction_floor_ns=DivisionCost(buffer.sym_division, *prices),
+            )
+        return feature
 
     def _finalize_lx_relayout_allocation(
         self,

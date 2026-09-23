@@ -420,6 +420,33 @@ class RelayoutCharge(sympy.Function):
         return is_lx * (prices[i] if 0 <= i < len(prices) else 0)
 
 
+class DivisionCost(sympy.Function):
+    """``DivisionCost(division, price_0, ..., price_n)`` selects a cost-model
+    estimate by work-division candidate identity.
+
+    Candidate divisions are a finite menu.  Evaluating the calibrated hardware
+    model once for each concrete candidate preserves its nonlinear shape terms
+    exactly, while this opaque node lets each solver lower the resulting table
+    without approximating those terms.  The prices are estimates produced by the
+    cost model, not hand-authored preferences or measured shape tables.
+    """
+
+    is_real = True
+    is_nonnegative = True
+
+    @classmethod
+    def eval(cls, division, *prices):
+        if division.is_Integer:
+            i = int(division)
+            return prices[i] if 0 <= i < len(prices) else sympy.S.Zero
+        return None
+
+    @staticmethod
+    def _imp_(division, *prices):
+        i = int(round(division))
+        return prices[i] if 0 <= i < len(prices) else 0
+
+
 def solved_bindings(buffers: Sequence["LifetimeBoundBuffer"]) -> dict:
     """The objective's symbols as the solved plan fixes them: ``is_lx`` is 1
     for a placed buffer and 0 for a spilled one; a core-division buffer with a

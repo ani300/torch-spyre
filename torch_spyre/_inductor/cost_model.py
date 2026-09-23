@@ -19,7 +19,8 @@ LoopLevel IR to guide higher-level optimization. Deliberately NOT a simulator.
 
 Model (per fused bundle / single-op kernel):
 
-    T   = max(compute, mem) + split                        mem = HBM / (eff * s_lx)
+    T   = max(compute, mem) + split
+    mem = max(HBM / (eff * s_lx), reduction_elems / (cores * reduction_rate))
 
     HBM = [ (R+W)/BW + alpha*min(R,W) ] + spill + write_extra
     s_lx = min(1, (512KB/ws)**0.15)   for a coarse-tiled kernel with ws > 512KB   (else 1)
@@ -355,6 +356,11 @@ class OpFeatures:
     # unsplit.
     matmul_m_split: int = 1
     matmul_n_split: int = 1
+    # Optional exact per-core element-throughput floor for an already-enumerated
+    # reduction work-division candidate. The joint solver fills it with a
+    # candidate-table lookup, while ordinary concrete feature extraction derives
+    # it from ``cores`` below.
+    reduction_floor_ns: object | None = None
     # Access-pattern HBM effective-BW override (from the LoopLevel IR index/layout):
     # "restickify" (transpose: write-stick var read with coeff!=1), "stick_scatter"
     # (cat on a partition dim -> a device dim <64 just inside the stick), "reduce_outer"
@@ -632,6 +638,13 @@ class CostParams:
     # over-charged rather than the overlap under-modelled.
     loop_reread_scale: float = 0.85
     overlap_gamma: float = 1.0  # compute/HBM overlap: min(compute,HBM) partly hidden
+    # A fused row-reduction pipeline is bounded by the number of logical input
+    # elements each active core processes even when all intermediates stay in LX.
+    # The low-core softmax ladder (1--8 cores) sustains about 1.5 logical input
+    # elements/ns/core; at 16/32 cores the HBM side of the roofline takes over. This
+    # is a floor on the final memory time, not another byte stream: applying the LX
+    # spill/underfill derates to it would count the same bottleneck twice.
+    fused_reduction_elems_per_core_ns: float = 1.5
     # LX RELAYOUT (shuffle) term: per-core serial descriptor cost plus a stride-limited
     # walk. Fitted 2026-08-17 on 21 direct per-kernel rows (main @ 65508a02, fp16,
     # BUNDLE_SYMBOLIC_ARGS=0 -- a method #3741 has since removed; re-measuring needs
@@ -1658,6 +1671,36 @@ def _reduction_bw_cores_factor(cores, p):
     return 1.0
 
 
+def _fused_reduction_floor_ns(ops: list, p: CostParams) -> object:
+    """Per-core element-throughput floor for a fused non-matmul reduction.
+
+    A softmax-like bundle may keep every score-sized intermediate in LX, but its
+    reduction pipeline still processes the full logical input on each owning core.
+    The largest such reduction governs the fused pipeline. Candidate-table prices
+    make this exact for CP-SAT's finite work-division menu; ordinary concrete
+    features use the same calibrated expression directly.
+    """
+    floors = []
+    for op in ops:
+        if not op.is_reduction or op.is_matmul:
+            continue
+        if op.reduction_floor_ns is not None:
+            floors.append(op.reduction_floor_ns)
+            continue
+        if isinstance(op.cores, sympy.Basic) or op.cores <= 0:
+            continue
+        input_elems = max(
+            (arg.elems * arg.loop_factor for arg in op.args if arg.role == "input"),
+            default=op.out_elems,
+        )
+        floors.append(input_elems / op.cores / p.fused_reduction_elems_per_core_ns)
+    if not floors:
+        return 0.0
+    if any(isinstance(floor, sympy.Basic) for floor in floors):
+        return sympy.Max(*floors, evaluate=False)
+    return max(floors)
+
+
 def _matmul_axes_for_split_cost(o) -> tuple | None:
     """Recover the ``(B,b),(M,m),(N,n),(K,k)`` axis pairs, the ``shared_weight`` flag,
     and the cores actually used -- everything ``work_division._matmul_execution_cost``
@@ -1804,6 +1847,15 @@ def _lazy_min(r, w):
     return min(r, w)
 
 
+def _lazy_max(r, w):
+    """``max`` counterpart of :func:`_lazy_min` for symbolic roofline terms."""
+    if isinstance(r, sympy.Basic) or isinstance(w, sympy.Basic):
+        if getattr(r, "free_symbols", None) or getattr(w, "free_symbols", None):
+            return sympy.Max(r, w, evaluate=False)
+        return sympy.Max(r, w)
+    return max(r, w)
+
+
 def _store_core_excess_ns(ops: list, p: "CostParams"):
     """Extra write time when the writing cores cannot saturate the shared bus.
 
@@ -1924,8 +1976,9 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         # path had no core-count term at all, which made low-core softmax the model's
         # worst category (median -82 % at cores<32; `softmax_unrolled` runs at cores=1
         # BY DESIGN, so every one of its points sat near -92 %). The binding constraint
-        # there is PER-CORE ELEMENT that separate the two. Charged as a floor, so it
-        # only ever raises a prediction and never binds at cores=32 (0/89 records) ->
+        # there is PER-CORE ELEMENT THROUGHPUT: the 1--8 core ladder sustains about
+        # 1.5 logical elements/ns/core. Charged as a floor, it only ever raises a
+        # prediction and never binds at cores=32 (0/89 records) ->
         # the cores=32 path is byte-identical. FLAGGED, deliberately NOT modelled: the
         # floor alone leaves a systematic residual at cores=8/16 (median -17 % / -41 %),
         # where the throughput bound hands back to the memory term and that term is
@@ -1980,8 +2033,12 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # slower than the modeled rate. Bytes are already counted as HBM; here we derate the
     # BW.
     spill_derate = _lx_spill_bw_derate(ops, p)
-    # A fused reduction bundle is floored by per-core element throughput (see
     mem_t = p.fill_ns + mem / eff / spill_derate
+    # A fused reduction bundle is floored by per-core element throughput. Keep
+    # this outside the bandwidth derates: it describes LX-resident execution, not
+    # another HBM stream.
+    if len(ops) > 1:
+        mem_t = _lazy_max(mem_t, _fused_reduction_floor_ns(ops, p))
     # LOOP-INVARIANT OPERAND RE-READ, charged AFTER the derates and at the plain peak
     # rate. Placement is the mechanism, not a convenience: `eff` models a SHORT PER-TILE
     # stream underfilling the pipeline, but a re-read of a loop-invariant operand is one

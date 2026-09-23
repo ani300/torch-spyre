@@ -70,7 +70,7 @@ _SDPA_MHA_QUERY_ONLY_MIN_KV_BLOCKS = 8
 # These constants do not represent a legacy non-HOP SDPA implementation.
 _SDPA_NARROW_LIVE_SCORE_BUFFER_ALLOWANCE = 2
 _SDPA_NARROW_LIVE_QUERY_BUFFER_ALLOWANCE = 2
-# When every selected MHA tile count is one, ``map_tiles`` and the K/V scan
+# When every selected tile count is one, ``map_tiles`` and the K/V scan
 # invoke their bodies directly. There is no HOP staging or carry handoff in
 # that graph: the score allocation can be reused after its reduction and only
 # the scaled query, weighted result, and normalized output overlap at peak.
@@ -424,7 +424,7 @@ def _sdpa_estimated_live_bytes_per_core(
         batch_size * heads_per_core * query_rows_per_core * head_dim * element_size
     )
     accumulator_bytes = batch_size * heads_per_core * query_rows_per_core * element_size
-    if full_sdpa_prefill and not has_loop_boundary:
+    if not has_loop_boundary:
         score_allowance = _SDPA_DIRECT_LIVE_SCORE_BUFFER_ALLOWANCE
         query_allowance = _SDPA_DIRECT_LIVE_QUERY_BUFFER_ALLOWANCE
     elif full_sdpa_prefill:
@@ -623,9 +623,7 @@ def _sdpa_kv_candidates(
             element_size=element_size,
             restick_bytes_per_core=(restick_bytes_per_core if full_sdpa_prefill else 0),
             full_sdpa_prefill=full_sdpa_prefill,
-            has_loop_boundary=(
-                num_heads != num_kvheads or num_outer_tiles > 1 or num_blocks > 1
-            ),
+            has_loop_boundary=num_outer_tiles > 1 or num_blocks > 1,
         )
         blocks_per_group = _kv_blocks_per_loop_group(1, num_blocks)
         num_loop_groups = (num_blocks + blocks_per_group - 1) // blocks_per_group
@@ -1869,10 +1867,8 @@ def spyre__sdpa_overrideable(
         mask_shapes=tuple(tuple(mask.shape) for mask in masks),
         head_tile_staging_bytes=head_tile_staging_bytes,
     )
-    direct_prefill_plan = (
-        max_seqlen_q > 1
-        and num_heads == num_kvheads
-        and tiling.num_batch_tiles == 1
+    direct_plan = (
+        tiling.num_batch_tiles == 1
         and tiling.num_head_tiles == 1
         and tiling.num_group_tiles == 1
         and tiling.num_q_tiles == 1
@@ -1952,11 +1948,11 @@ def spyre__sdpa_overrideable(
         # Q is invariant across the counted Lk loop.
         q_scaled = q_tile * query_scale
 
-        # A fully direct prefill plan has no online-softmax state to carry. Keep
+        # A loop-free plan has no online-softmax state to carry. Keep
         # its graph as the stable-softmax formula so the compiler sees the same
-        # short live ranges that the cost model charges above. Decode and
-        # outer-tiled plans retain the common carry path below.
-        if direct_prefill_plan:
+        # short live ranges that the cost model charges above. Tiled plans retain
+        # the common carry path below.
+        if direct_plan:
             if use_gqa:
                 k_tile = k_tile.unsqueeze(2)
                 v_tile = v_tile.unsqueeze(2)

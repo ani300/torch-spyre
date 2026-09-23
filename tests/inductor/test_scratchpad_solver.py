@@ -34,6 +34,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     CoreDivision,
     CoreDivisionBuffer,
+    DivisionCost,
     LifetimeBoundBuffer,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
@@ -1192,6 +1193,25 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
     single-use (zero-width) parent."""
 
     solver_class = CpSatLayoutSolver
+
+    def test_division_cost_selects_the_calibrated_candidate_price(self):
+        buf = CoreDivisionBuffer(
+            "reduction_out",
+            128,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(splits={"m": 4, "n": 8}),
+                CoreDivision(splits={"m": 8, "n": 4}),
+            ],
+            residency_reason="no consumer reads it from LX",
+        )
+        cost = DivisionCost(buf.sym_division, 9000, 1000)
+        (result,) = self.solver_class(
+            [buf], size=1 << 20, alignment=1
+        ).plan_layout_and_core_divisions(cost)
+
+        self.assertEqual(result.chosen_division, 1)
+        self.assertEqual(float(cost.subs(buf.sym_division, 1)), 1000.0)
 
     def test_inplace_chain_shares_single_slot(self):
         # A 3-level in-place chain gp -> p -> c (each parent.end_time ==

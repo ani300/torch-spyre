@@ -28,6 +28,9 @@ _select_sdpa_tiling = _decompositions._select_sdpa_tiling
 _axis_slice_is_dense = _decompositions._axis_slice_is_dense
 _sdpa_kv_candidates = _decompositions._sdpa_kv_candidates
 _sdpa_mask_hbm_bytes = _decompositions._sdpa_mask_hbm_bytes
+_sdpa_estimated_live_bytes_per_core = (
+    _decompositions._sdpa_estimated_live_bytes_per_core
+)
 _num_tiles_for_max_extent = _decompositions._num_tiles_for_max_extent
 _sdpa_num_batch_tiles = _decompositions._sdpa_num_batch_tiles
 
@@ -179,6 +182,33 @@ class TestSDPATiling(unittest.TestCase):
         self.assertEqual(config.score_bytes_per_core, 768 * 1024)
         self.assertEqual(config.estimated_live_bytes_per_core, 1182720)
         self.assertEqual(config.estimated_spill_buffers, 0)
+
+    def test_loop_free_live_set_is_independent_of_attention_geometry(self):
+        kwargs = dict(
+            batch_size=1,
+            heads_per_core=2,
+            query_rows_per_core=1,
+            kv_block_size=512,
+            head_dim=256,
+            element_size=2,
+            has_loop_boundary=False,
+        )
+        score_bytes, direct_live_bytes = _sdpa_estimated_live_bytes_per_core(
+            **kwargs,
+            full_sdpa_prefill=False,
+        )
+        _, prefill_live_bytes = _sdpa_estimated_live_bytes_per_core(
+            **kwargs,
+            full_sdpa_prefill=True,
+        )
+        query_bytes = 2 * 1 * 256 * 2
+        accumulator_bytes = 2 * 1 * 2
+
+        self.assertEqual(
+            direct_live_bytes,
+            score_bytes + 3 * query_bytes + 2 * accumulator_bytes,
+        )
+        self.assertEqual(direct_live_bytes, prefill_live_bytes)
 
     def test_batch_tiles_are_exact_for_odd_extents(self):
         for batch_size, expected_tiles in ((1, 1), (2, 1), (3, 3), (4, 2), (7, 7)):

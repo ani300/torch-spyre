@@ -979,6 +979,27 @@ class _SympyExprToCpSat(Printer):
         self._model.add(charge == 0).only_enforce_if(lit.Not())
         return charge
 
+    def _print_DivisionCost(self, expr):
+        """A calibrated cost evaluated over a buffer's finite division menu."""
+        division, *prices = expr.args
+        table = [int(p) for p in prices]
+        if division.is_Integer:
+            i = int(division)
+            return table[i] if 0 <= i < len(table) else 0
+        wrapper = self._sym_map.get(f"_division_of_{division.name}")
+        if wrapper is None or not isinstance(wrapper, _CoreDivisionBufferWithCpVars):
+            raise NotImplementedError(f"no division variable for {division}")
+        if len(table) != len(wrapper.buffer.core_divisions):
+            raise ValueError(
+                f"cost table for {division} has {len(table)} rows, expected "
+                f"{len(wrapper.buffer.core_divisions)}"
+            )
+        lo, hi = min(table), max(table)
+        price = self._model.new_int_var(lo, hi, f"division_cost_{self._count}")
+        self._count += 1
+        self._model.add_element(wrapper.division, table, price)
+        return price
+
     def _print_Pow(self, expr):
         if expr.exp == 2:
             base = self._print(expr.base)
