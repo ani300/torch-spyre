@@ -185,6 +185,7 @@ from .work_division import (
     min,
     max,
     log2,
+    isinf,
 )
 from . import config
 
@@ -1768,7 +1769,7 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
             shared_weight=shared_weight,
             include_hbm=False,
         )
-        if us == float("inf"):
+        if isinf(us):
             cores_used = b_axis[1] * m_axis[1] * n_axis[1] * k_axis[1]
             raise RuntimeError(
                 f"matmul op {o.name!r} has an infeasible core split "
@@ -2391,7 +2392,7 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                 include_hbm=False,
             )
             cores_used = b * m * n * k
-            if us == float("inf"):
+            if isinf(us):
                 raise RuntimeError(
                     f"matmul op {o.name!r} has an infeasible core split "
                     f"(B={B}/{b}, M={M}/{m}, N={N}/{n}, K={K}/{k}, "
