@@ -190,11 +190,11 @@ def test_relayout_solve_presolves_by_default(monkeypatch, priced):
     assert (_copy(result).address is not None) == priced
 
 
-@pytest.mark.parametrize("deterministic,expected_workers", [(False, 8), (True, 1)])
-def test_relayout_solve_caps_parallel_search_workers(
+@pytest.mark.parametrize("deterministic,expected_workers", [(False, 96), (True, 1)])
+def test_relayout_solve_uses_available_parallel_search_workers(
     monkeypatch, deterministic, expected_workers
 ):
-    """Large hosts must not expand CP-SAT's nondeterministic solver portfolio."""
+    """Only deterministic mode restricts CP-SAT's parallel search portfolio."""
     from ortools.sat.python import cp_model
 
     p = _producer([0, 1])
@@ -212,6 +212,7 @@ def test_relayout_solve_caps_parallel_search_workers(
 
     def solve(solver, model, *args, **kwargs):
         workers.append(solver.parameters.num_search_workers)
+        assert not solver.parameters.share_level_zero_bounds
         return original(solver, model, *args, **kwargs)
 
     monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
