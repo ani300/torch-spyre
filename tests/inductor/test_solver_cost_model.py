@@ -125,22 +125,6 @@ def test_joint_matmul_price_is_independent_of_standalone_preferences(monkeypatch
     assert wd._matmul_split_cost(*axes, 32) > standalone
 
 
-def test_fused_reduction_accepts_an_exact_candidate_throughput_floor():
-    op = OpFeatures(
-        name="amax",
-        is_reduction=True,
-        dtype_bytes=2,
-        args=[],
-        out_elems=512,
-        cores=8,
-        reduction_floor_ns=123_456,
-    )
-
-    assert cost_model._fused_reduction_floor_ns([op], CostParams()) == pytest.approx(
-        123_456
-    )
-
-
 def test_fused_reduction_floor_uses_work_per_active_core():
     small = ArgTraffic("small", "input", True, 1024)
     large = ArgTraffic("large", "input", True, 6144, loop_factor=2)
@@ -156,6 +140,23 @@ def test_fused_reduction_floor_uses_work_per_active_core():
     assert cost_model._fused_reduction_floor_ns(
         reductions, CostParams()
     ) == pytest.approx(expected)
+
+
+def test_fused_reduction_floor_keeps_core_count_symbolic():
+    heads, rows = sympy.symbols("split_heads split_rows", integer=True, positive=True)
+    op = OpFeatures(
+        "sum",
+        True,
+        64,
+        heads * rows,
+        2,
+        [ArgTraffic("input", "input", True, 12_288)],
+    )
+
+    floor = cost_model._fused_reduction_floor_ns([op], CostParams())
+
+    assert floor.free_symbols == {heads, rows}
+    assert float(floor.subs({heads: 4, rows: 8})) == pytest.approx(256)
 
 
 def test_standalone_reduction_keeps_its_calibrated_bandwidth_model():

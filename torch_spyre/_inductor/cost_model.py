@@ -356,11 +356,6 @@ class OpFeatures:
     # unsplit.
     matmul_m_split: int = 1
     matmul_n_split: int = 1
-    # Optional exact per-core element-throughput floor for an already-enumerated
-    # reduction work-division candidate. The joint solver fills it with a
-    # candidate-table lookup, while ordinary concrete feature extraction derives
-    # it from ``cores`` below.
-    reduction_floor_ns: object | None = None
     # Access-pattern HBM effective-BW override (from the LoopLevel IR index/layout):
     # "restickify" (transpose: write-stick var read with coeff!=1), "stick_scatter"
     # (cat on a partition dim -> a device dim <64 just inside the stick), "reduce_outer"
@@ -1676,18 +1671,13 @@ def _fused_reduction_floor_ns(ops: list, p: CostParams) -> object:
 
     A softmax-like bundle may keep every score-sized intermediate in LX, but its
     reduction pipeline still processes the full logical input on each owning core.
-    The largest such reduction governs the fused pipeline. Candidate-table prices
-    make this exact for CP-SAT's finite work-division menu; ordinary concrete
-    features use the same calibrated expression directly.
+    The largest such reduction governs the fused pipeline. ``cores`` may be the
+    product of symbolic work-division factors; the solver lowers their reciprocal
+    directly, keeping this hardware model independent of candidate enumeration.
     """
     floors = []
     for op in ops:
         if not op.is_reduction or op.is_matmul:
-            continue
-        if op.reduction_floor_ns is not None:
-            floors.append(op.reduction_floor_ns)
-            continue
-        if isinstance(op.cores, sympy.Basic) or op.cores <= 0:
             continue
         input_elems = max(
             (arg.elems * arg.loop_factor for arg in op.args if arg.role == "input"),
@@ -1696,9 +1686,8 @@ def _fused_reduction_floor_ns(ops: list, p: CostParams) -> object:
         floors.append(input_elems / op.cores / p.fused_reduction_elems_per_core_ns)
     if not floors:
         return 0.0
-    if any(isinstance(floor, sympy.Basic) for floor in floors):
-        return sympy.Max(*floors, evaluate=False)
-    return max(floors)
+    # work_division.max does not yet accept a single numeric scalar.
+    return floors[0] if len(floors) == 1 else max(*floors)
 
 
 def _matmul_axes_for_split_cost(o) -> tuple | None:
