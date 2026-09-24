@@ -1,9 +1,9 @@
 # Restickify: DMA requests and transpose throughput
 
 The [cost model](cost_model.md) prices proven DL16 transports using their physical
-source access, including stick-axis swaps and staging copies. A core split can make each input burst shorter
-without reducing total payload, so total cores and aggregate bytes alone cannot
-rank these plans.
+source access, including stick-axis swaps and staging copies. A core split can
+make each input burst shorter without reducing total payload, so total cores and
+aggregate bytes alone cannot rank these plans.
 
 ## Geometry and hardware limits
 
@@ -27,7 +27,8 @@ extra = max(0, max(transfer_time, transpose_time) - 2 * byte_time)
 
 The existing model already charges balanced-copy bandwidth. Add only `extra`,
 multiplied by the operation's loop trip count. Add it outside bundle compute
-overlap: the swap uses the on-chip transpose pipeline and precedes its dependent consumer.
+overlap: the swap uses the on-chip transpose pipeline and precedes its dependent
+consumer.
 This formula describes an HBM-to-HBM stick-axis swap. A plain copy or an HBM-to-LX
 staging copy receives only the read-request excess over its existing byte charge,
 without the transpose ceiling. An LX-resident input receives no off-chip request
@@ -42,104 +43,84 @@ valid for **every candidate division**. It then prices the consumer's source
 geometry and omits the removed copy. A failed proof or shared copy preserves the
 original cost view. Sources eligible for input cloning and copies eligible for
 an additional scratchpad shuffle also retain the original view, since these
-later allocation choices can redirect the read. Allocation still plans the original buffers; the late pass
-remains responsible for validating and performing the actual rewrite.
+later allocation choices can redirect the read. Allocation still plans the
+original buffers; the late pass remains responsible for validating and performing
+the actual rewrite.
 
 The implementation folds payload into the request-count expression **before**
 CP-SAT integerization. Keeping requests/byte as an intermediate can silently round
 the entire request term to zero. Solver tests check actual choices and objective
 values, not just the presence of split symbols.
 
-## Calibration, September 24, 2026
+## Calibration methodology
 
-Controlled operation replay on Spyre 1.0, DL16. No planner
-choices are involved. Input device order `[N,B,X/64,64]`, output
-`[B,N/64,X,64]`; the same access as Granite's repeated key restickify. Every
-configuration is checked bit-exactly against CPU. Device durations are medians of
-three profiler kernel events, separately from 11 synchronized host timings.
+Calibrate the aggregate request interval as a function of active core count and
+the per-core transpose throughput independently. These are empirical parameters,
+not hardware transfer limits or preferred work divisions. A measured request-rate
+plateau does not by itself establish a microarchitectural explanation.
 
-At `B=8, X=128, N=1024` (2 MiB payload):
+Use controlled transport operations with explicit layouts and divisions, so the
+planner does not choose the configurations used to calibrate its own model.
+Check every configuration against a CPU reference and inspect the generated
+transfers to verify that their burst lengths agree with the extracted source
+runs. Keep device-event durations separate from synchronized host timings, and
+report repeated measurements and their spread.
 
-| Split B×X | Input run | Lowered input burst | Single invocation | 128 repetitions, per invocation |
-|---|---:|---:|---:|---:|
-| 4×1 | 512 B | 4 words | 51.06 us | 50.45 us |
-| 8×1 | 256 B | 2 words | 82.72 us | 81.21 us |
-| 4×2 | 128 B | 1 word | 143.76 us | 142.56 us |
-| 8×2 | 128 B | 1 word | 144.61 us | 142.03 us |
+Vary the factors that distinguish the model's terms:
 
-Inspection of the generated programs confirms these burst lengths. This is a request-rate
-effect already present **outside** loops. `4×1` is faster than `8×1`, not slower.
+- Hold payload constant while changing source geometry and core division to
+  isolate contiguous-run length from aggregate bytes.
+- Vary payload independently to test scaling, including shapes outside the
+  calibration set.
+- Sweep low core counts and long input runs to expose the transpose throughput
+  ceiling. Do not infer a request rate from a measurement dominated by that
+  ceiling.
+- Compare a single invocation with repeated invocations, and compare reuse of
+  one input tile with advancing through a larger backing allocation. This
+  distinguishes per-invocation costs from loop and reuse effects.
+- Include a copy-only control with the same source access to separate input
+  request costs from transpose costs.
+- Validate source and destination residency cases independently. A coefficient
+  fitted to an off-chip-to-off-chip transport does not establish the absolute
+  latency of an off-chip-to-scratchpad transport.
 
-Varying `N` independently, with 32 advancing input tiles repeated four times:
+Fit request-related increments without counting the existing byte-bandwidth
+charge twice. Preserve conservative fallbacks where the measurements cannot
+identify a parameter, and validate predicted rankings on held-out geometries
+instead of introducing exact-size or preferred-split gates.
 
-| N | 4×1 | 8×1 | 4×2 | 8×2 |
-|---:|---:|---:|---:|---:|
-| 512 | 25.22 us | 40.70 us | 70.92 us | 72.61 us |
-| 1024 | 50.63 us | 78.62 us | 142.84 us | 142.77 us |
-| 2048 | 101.93 us | 163.57 us | 286.48 us | 286.63 us |
+## Validation methodology
 
-Reusing one input tile versus advancing through the KV backing does not materially
-change these rates. The extra time scales with payload, not an exact-size gate.
+Deterministic tests should check geometry extraction, residency handling,
+copy-removal proof failures, and the solver's selected divisions and objective
+values. Hardware timing does not belong in deterministic unit-test assertions.
 
-An independent low-core sweep at `N=1024`, 32 repetitions, measured per invocation:
-`1×1`: 54.03 us, `2×1`: 39.14 us, `4×1`: 51.03 us, `2×2`: 142.94 us.
-The single-core result constrains the transpose pipeline ceiling (40 GB/s payload).
+For end-to-end validation, compare full-model runs on the same hardware and
+runtime environment. Hold model weights, dtype, batch size, prompt contents,
+chunk size, generation settings, and host-thread settings constant. Include both
+short and long sequences rather than extrapolating from one attention shape.
 
-The sustained aggregate request intervals are **empirical hardware calibration**:
-8.75 ns at two cores, 7.5 ns at 4/8/16 cores, 3.75 ns at 32 cores. One core uses
-the two-core interval as a conservative fallback; its measurement is dominated
-by the separately modelled transpose ceiling and cannot identify a request rate.
-The 4–16 plateau and 32-core improvement are measured, but their microarchitectural
-cause is not established. Do not interpret the table as a topology specification.
+Use isolated compiler caches and record solver status and selected divisions.
+Measure compilation separately from warm execution: complete warmup before
+collecting repeated generation latencies, exclude loading and tokenization, and
+collect profiles separately from unprofiled timing runs. Report the median and
+spread, and check output consistency within and across variants. Repeated warm
+runs measure runtime variation; independent compilations are needed to assess
+plan stability.
 
-Cross-geometry check: at `B=8,X=256,N=512` (still 2 MiB), `8×1` measures 50.82 us,
-`8×2` 81.67 us, `8×4` 76.81 us. This changes both run length and request parallelism;
-it cannot be represented by an outer/inner split penalty independent of geometry.
-
-A copy-only control preserves the stick axis and uses the same source access.
-At `B=8,X=128,N=1024`, 32 repetitions, per invocation: `2×1` takes 34.30 us,
-`4×1` 49.11 us, `8×1` 82.32 us, `4×2` 153.81 us and `8×2` 155.28 us.
-The request-related slowdown is therefore not unique to the transpose pipeline.
-The model captures these split-dependent increments within 15%; it does not
-recalibrate the existing plain-copy bandwidth and read/write turnaround estimate.
-
-## Full-model validation
-
-Granite 3.3 8B Instruct, all 40 layers, DL16, batch one, 32768 prompt tokens,
-512-token prefill chunks, and one generated token. Both variants used the same
-hardware and runtime environment (`OMP_NUM_THREADS=1`), a fresh compiler cache,
-one warmup, and three timed generations. Times below are wall-clock generation
-latencies **after compilation**, without profiling; they exclude model loading
-and tokenization.
-
-| Variant | Critical split | Run 1 | Run 2 | Run 3 | Median |
-|---|---|---:|---:|---:|---:|
-| Main including #4812 | 8×2 | 100.388 s | 100.494 s | 100.317 s | 100.388 s |
-| This PR | 2×1 | 65.996 s | 65.426 s | 65.387 s | 65.426 s |
-
-Median latency is **34.8% lower** (1.53× speedup). Every measured generation
-produced the same token, `France`. Each variant compiled two attention graphs
-from the fresh cache: both baseline solves selected 8×2 and both PR solves
-selected 2×1, with an optimal solver result. A separate one-block PR run selected
-2×1 and measured a 2.341 s median over five warm generations.
-
-These results establish the gain for this workload, not a general model-accuracy
-or throughput guarantee. Bit-exact CPU comparisons in the controlled transport
-replay separately check the copy and stick-swap operations.
+Transport-level reference checks and matching generated outputs serve different
+purposes. A matching generated token is a useful smoke check, not a general
+model-accuracy guarantee; numerical validation should cover the affected
+operations and representative model workloads.
 
 ## Scope and limitations
 
 - No exact-size, repetition or preferred-split gate. Payload is the work visited
   per invocation, not the size of the KV backing allocation.
 - DL16 source DMA calibration. Fully local transports and other device formats
-  remain unchanged. HBM-to-LX uses the same source-request estimate; that staging
-  case is not independently calibrated for absolute latency.
+  remain unchanged. HBM-to-LX uses the same source-request estimate, not a
+  separate absolute-latency model.
 - Non-affine/sub-stick accesses are not calibrated. Unsupported core counts are
   neutral rather than assigned an invented measured rate.
 - Output burst fragmentation and interactions between independent operations in
   a fused bundle are not separately modelled by this term.
-
-Use `examples/bench_restickify_dma.py` for controlled measurements. Hardware timing belongs in the
-calibration report, not in deterministic unit-test timing assertions.
-With `--profile`, the replay reports device and synchronized-host microseconds
-per iteration separately; `--copy-only` selects the control without a stick swap.
