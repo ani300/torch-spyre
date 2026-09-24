@@ -401,7 +401,15 @@ def test_proven_direct_read_is_priced_with_consumer_splits(staged_transport_grap
 
 
 @pytest.mark.parametrize(
-    "failure", ["one_candidate", "validation", "disabled", "shared"]
+    "failure",
+    [
+        "one_candidate",
+        "validation",
+        "disabled",
+        "shared",
+        "source_placement",
+        "relayout",
+    ],
 )
 def test_projection_declines_without_a_universal_proof(
     staged_transport_graph, monkeypatch, failure
@@ -412,6 +420,8 @@ def test_projection_declines_without_a_universal_proof(
     graph, stage, consumer = staged_transport_graph
     b, x, n = iteration_space_from_op(consumer)
     splits = [{b: 2, x: 1, n: 1}, {b: 8, x: 2, n: 1}]
+    divisions = {"consumer": splits}
+    relayout_sources = ()
     proof = rce._prove_matmul_direct_read
     if failure == "one_candidate":
 
@@ -425,9 +435,15 @@ def test_projection_declines_without_a_universal_proof(
         monkeypatch.setattr(rce, "_validate_proposal", lambda *args: "invalid loop")
     elif failure == "disabled":
         monkeypatch.setattr(config, "read_copy_elision", False)
+    elif failure == "source_placement":
+        divisions["input"] = [{}]
+    elif failure == "relayout":
+        relayout_sources = ("stage",)
     else:
         monkeypatch.setattr(rce, "_copy_readers", lambda *args: [consumer, consumer])
-    assert rce.project_transport_read_copies(graph, {"consumer": splits}) == [
+    assert rce.project_transport_read_copies(
+        graph, divisions, relayout_sources=relayout_sources
+    ) == [
         stage,
         consumer,
     ]

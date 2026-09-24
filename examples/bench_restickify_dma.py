@@ -185,6 +185,7 @@ def main():
             compile_s=compile_s,
             us=samples,
             median_us=statistics.median(samples),
+            host_us_per_iteration=statistics.median(samples) / trips,
             correct=True,
             copy_only=args.copy_only,
         )
@@ -198,7 +199,12 @@ def main():
                 for _ in range(3):
                     runner.run(in_dev, out_dev)
                 torch.spyre.synchronize()
-            prof.export_chrome_trace(str(outdir / "trace.json"))
+            trace_path = outdir / "trace.json"
+            prof.export_chrome_trace(str(trace_path))
+            events = json.loads(trace_path.read_text())["traceEvents"]
+            device_us = [e["dur"] for e in events if e.get("cat") == "kernel"]
+            if device_us:
+                record["device_us_per_iteration"] = statistics.median(device_us) / trips
         print(json.dumps(record), flush=True)
         with (root / "results.jsonl").open("a") as f:
             f.write(json.dumps(record) + "\n")

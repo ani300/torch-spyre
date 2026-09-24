@@ -2233,6 +2233,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 name: [cd.splits for cd in buf.core_divisions]
                 for name, buf in bufmap.items()
             },
+            relayout_sources={
+                buf.relayout_parent
+                for buf in solver.buffers
+                if isinstance(buf, RelayoutCopyBuffer)
+            },
         )
         pricing_by_name = {op.get_name(): op for op in pricing_ops}
 

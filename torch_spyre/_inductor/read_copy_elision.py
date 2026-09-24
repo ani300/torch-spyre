@@ -520,7 +520,7 @@ def _validate_proposal(
     return None
 
 
-def project_transport_read_copies(graph, division_splits):
+def project_transport_read_copies(graph, division_splits, *, relayout_sources=()):
     """Non-mutating cost view of transport copies removable for every candidate.
 
     The allocator still plans the original buffers, and the normal late pass
@@ -543,7 +543,13 @@ def project_transport_read_copies(graph, division_splits):
         ):
             continue
         candidates = division_splits.get(consumer.get_name(), ())
-        if not candidates:
+        # A later input clone or LX relayout can redirect this read and invalidate
+        # its saved record. Keep those allocation-dependent cases authoritative.
+        if (
+            not candidates
+            or record.source_name in division_splits
+            or record.copy_name in relayout_sources
+        ):
             continue
         copy_op = next(
             (op for op in operations if op.get_name() == record.copy_name), None

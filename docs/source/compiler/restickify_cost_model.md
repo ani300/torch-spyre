@@ -40,7 +40,9 @@ the executed read. The objective uses a non-mutating view of the direct read
 only when the existing address, ownership and loop checks prove copy removal
 valid for **every candidate division**. It then prices the consumer's source
 geometry and omits the removed copy. A failed proof or shared copy preserves the
-original cost view. Allocation still plans the original buffers; the late pass
+original cost view. Sources eligible for input cloning and copies eligible for
+an additional scratchpad shuffle also retain the original view, since these
+later allocation choices can redirect the read. Allocation still plans the original buffers; the late pass
 remains responsible for validating and performing the actual rewrite.
 
 The implementation folds payload into the request-count expression **before**
@@ -101,7 +103,31 @@ The request-related slowdown is therefore not unique to the transpose pipeline.
 The model captures these split-dependent increments within 15%; it does not
 recalibrate the existing plain-copy bandwidth and read/write turnaround estimate.
 
-## Scope and remaining validation
+## Full-model validation
+
+Granite 3.3 8B Instruct, all 40 layers, DL16, batch one, 32768 prompt tokens,
+512-token prefill chunks, and one generated token. Both variants used the same
+hardware and runtime environment (`OMP_NUM_THREADS=1`), a fresh compiler cache,
+one warmup, and three timed generations. Times below are wall-clock generation
+latencies **after compilation**, without profiling; they exclude model loading
+and tokenization.
+
+| Variant | Critical split | Run 1 | Run 2 | Run 3 | Median |
+|---|---|---:|---:|---:|---:|
+| Main including #4812 | 8×2 | 100.388 s | 100.494 s | 100.317 s | 100.388 s |
+| This PR | 2×1 | 65.996 s | 65.426 s | 65.387 s | 65.426 s |
+
+Median latency is **34.8% lower** (1.53× speedup). Every measured generation
+produced the same token, `France`. Each variant compiled two attention graphs
+from the fresh cache: both baseline solves selected 8×2 and both PR solves
+selected 2×1, with an optimal solver result. A separate one-block PR run selected
+2×1 and measured a 2.341 s median over five warm generations.
+
+These results establish the gain for this workload, not a general model-accuracy
+or throughput guarantee. Bit-exact CPU comparisons in the controlled transport
+replay separately check the copy and stick-swap operations.
+
+## Scope and limitations
 
 - No exact-size, repetition or preferred-split gate. Payload is the work visited
   per invocation, not the size of the KV backing allocation.
@@ -112,9 +138,8 @@ recalibrate the existing plain-copy bandwidth and read/write turnaround estimate
   neutral rather than assigned an invented measured rate.
 - Output burst fragmentation and interactions between independent operations in
   a fused bundle are not separately modelled by this term.
-- A frozen-plan one-block Granite 32k experiment confirms the direction of the
-  split effects, but later samples developed runtime noise and a memory-mapping diagnostic.
-  It is not evidence for a new stable end-to-end speedup; clean validation is required.
 
 Use `examples/bench_restickify_dma.py` for controlled measurements. Hardware timing belongs in the
 calibration report, not in deterministic unit-test timing assertions.
+With `--profile`, the replay reports device and synchronized-host microseconds
+per iteration separately; `--copy-only` selects the control without a stick swap.
