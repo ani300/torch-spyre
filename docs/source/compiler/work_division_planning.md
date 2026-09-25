@@ -566,6 +566,13 @@ proof for pointwise and matmul consumers. Existing core-domain, capacity,
 lifetime and whole-source fallback restrictions still apply; this does
 not change the work chooser's policy.
 
+For ordinary producer partitions, each destination may gather at most eight
+fragments. This conservative limit avoids overflowing the shuffle lowering's
+eight L3LU bound registers when its global address maps cannot be commoned
+per core. Both solver candidate pricing and committed planning enforce it,
+allowing another partition or HBM placement to be selected before codegen.
+The limit applies to incoming fragments, not the number of broadcast recipients.
+
 #### Split-K results in LX
 
 For `A[128,256] @ B[256,128]`, let eight producer cores use
