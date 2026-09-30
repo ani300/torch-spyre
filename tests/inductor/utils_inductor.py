@@ -442,6 +442,13 @@ def make_param_dict(cases, rand_type="randn"):
     }
 
 
+def _safe_test_name(name: str) -> str:
+    # PyTorch >= 2.14 rejects generated test names containing "." (pytorch#192648),
+    # since unittest.TestLoader.loadTestsFromName splits on it. Param keys built
+    # from floats (e.g. "alpha_0.5") are spelled with "p" instead ("alpha_0p5").
+    return name.replace(".", "p")
+
+
 # ParameterizedTestMeta injects parameterized test methods
 # based on PARAMS of the subclass.
 # The metaclass looks through the keys in the PARAMS dict,
@@ -490,13 +497,8 @@ def make_param_dict(cases, rand_type="randn"):
 # - If parameterization is not needed for a concrete test case,
 #   simply implement it in TestOps without adding an item
 #   to PARAMS. It will be executed by unittests.
-def _safe_test_name(name: str) -> str:
-    # PyTorch >= 2.14 rejects generated test names containing "." (pytorch#192648),
-    # since unittest.TestLoader.loadTestsFromName splits on it. Param keys built
-    # from floats (e.g. "alpha_0.5") are spelled with "p" instead ("alpha_0p5").
-    return name.replace(".", "p")
-
-
+# - Any "." in a materialized name is replaced with "p"
+#   (e.g. "alpha_0.5" -> "alpha_0p5"); see _safe_test_name.
 class ParameterizedTestMeta(type):
     def __new__(mcs, name, bases, namespace):
         param_map = namespace.get("PARAMS", {})

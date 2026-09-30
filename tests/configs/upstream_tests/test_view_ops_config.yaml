@@ -72,7 +72,7 @@ test_suite_config:
             - TestOldViewOps::test_narrow_tensor
             # aten::_validate_compressed_sparse_indices is not implemented
             - TestOldViewOps::test_crow_col_indices
-            # empty(2, 3).t() on device: values differ from the CPU reference
+            # resize_as_ on a transposed device tensor does not keep its strides
             - TestOldViewOps::test_resize_as_preserves_strides
           mode: xfail
         #######################################################################
