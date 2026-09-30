@@ -5,9 +5,7 @@ test_suite_config:
       unlisted_test_mode: mandatory_success
       tests:
         - names: # Tests that pass with no special config needed
-            - TestViewOps::test_as_strided_gradients
             - TestViewOps::test_contiguous_self
-            - TestViewOps::test_unbind
             - TestOldViewOps::test_atleast_gradient
             - TestOldViewOps::test_contiguous
             - TestOldViewOps::test_resize_as_preserves_strides
@@ -53,6 +51,14 @@ test_suite_config:
         #######################################################################
         - names:
             - TestViewOps::test_maybe_view_chunk_cat
+          mode: xfail
+        #######################################################################
+        #### Tests device-parametrized in pytorch 2.14 (were CPU-only) ####
+        #######################################################################
+        - names:
+            # unbind backward copies a slice at storage_offset 100, not a multiple
+            # of the fp32 stick (32 elems): spyre::copy_from_d2d rejects it
+            - TestViewOps::test_unbind
           mode: xfail
         #######################################################################
         - names: # Tests that pass with extra dtypes allowed
@@ -169,6 +175,7 @@ test_suite_config:
             - TestOldViewOps::test_transpose_vs_numpy   # Signal Received: 11 (Segmentation fault) https://github.com/torch-spyre/torch-spyre/issues/727
             - TestOldViewOps::test_view_empty   # Segmentation fault https://github.com/torch-spyre/torch-spyre/issues/1229
             - TestOldViewOps::test_view    # Segmentation fault https://github.com/torch-spyre/torch-spyre/issues/1231
+            - TestViewOps::test_as_strided_gradients   # SIGFPE: device-parametrized since PyTorch 2.14; .to(torch.double) on spyre divides by zero in senlib via SpyreTensorLayout::init
           mode: skip
 
   global:
