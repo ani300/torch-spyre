@@ -118,6 +118,14 @@ each step's output tile back into the correct slice of a full-size result.
 Either can be `None` independently — a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
 
+For compiled SDPA, maps over batch, head, group, or query positions use this
+carry-free form when K/V fits in one block: each map body computes stable
+softmax over its complete K/V range. Only a scan over multiple K/V blocks
+needs online-softmax running maximum, denominator, and output carries.
+The SDPA tile selector accounts for the shorter single-block body and the
+input/output tiles staged by an enclosing map separately; this does not
+change its LX spill-admission policy or calibrate placement costs.
+
 ## Example: tiling `y = a + b; z = y * c`
 
 The example below tiles the same computation used throughout this document's

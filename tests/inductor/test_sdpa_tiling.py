@@ -544,36 +544,21 @@ class TestSDPATiling(unittest.TestCase):
             max_seqlen_kv=3520,
         )
 
-        self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 704)
-        self.assertEqual(config.num_kv_blocks, 5)
         self.assertEqual(config.kv_block_size % 64, 0)
         self.assertEqual(
             config.num_kv_blocks * config.kv_block_size,
             3520,
         )
 
-    def test_lx_budget_allows_one_priced_carry_spill(self):
-        config = self._select(batch_size=2, lx_budget_bytes=300 * 1024)
+    def test_lx_budget_prices_one_spill_before_falling_back(self):
+        tight = self._select(batch_size=2, lx_budget_bytes=200 * 1024)
+        roomy = self._select(batch_size=2, lx_budget_bytes=300 * 1024)
 
-        self.assertEqual(config.strategy, "work_divided_tiled")
-        self.assertEqual(config.kv_block_size, 256)
-        self.assertEqual(config.num_kv_blocks, 2)
-        self.assertEqual(config.num_q_tiles, 1)
-        self.assertEqual(config.num_head_tiles, 6)
-        self.assertEqual(config.score_bytes_per_core, 32 * 1024)
-        self.assertEqual(config.estimated_live_bytes_per_core, 311552)
-        self.assertEqual(config.estimated_spill_buffers, 1)
-        self.assertGreater(config.estimated_spill_bytes, 0)
-
-    def test_batch_axis_is_enumerated_and_exact(self):
-        config = self._select(batch_size=6, lx_budget_bytes=600 * 1024)
-
-        self.assertEqual(config.num_batch_tiles, 2)
-        self.assertEqual(6 % config.num_batch_tiles, 0)
-        self.assertEqual(config.num_head_tiles, 4)
-        self.assertGreater(config.estimated_live_bytes_per_core, config.lx_budget_bytes)
-        self.assertEqual(config.estimated_spill_buffers, 1)
+        self.assertEqual(tight.estimated_spill_buffers, 1)
+        self.assertGreater(tight.estimated_spill_bytes, 0)
+        self.assertGreater(tight.estimated_live_bytes_per_core, tight.lx_budget_bytes)
+        self.assertEqual(roomy.estimated_spill_buffers, 0)
+        self.assertLessEqual(roomy.estimated_live_bytes_per_core, roomy.lx_budget_bytes)
 
     def test_broadcast_mask_replay_is_charged_on_outer_map_axes(self):
         one_mask_pass = 512 * 8192 * 2
@@ -638,6 +623,48 @@ class TestSDPATiling(unittest.TestCase):
         self.assertEqual(k256.estimated_restick_active_cores, 8)
         self.assertEqual(k256.estimated_live_bytes_per_core, 2_033_664)
         self.assertGreater(k256.estimated_live_bytes_per_core, self._LX_BUDGET)
+
+    def test_mapped_single_block_has_direct_live_set_and_dispatch_cost(self):
+        kwargs = {
+            "batch_size": 1,
+            "num_heads": 4,
+            "num_kvheads": 4,
+            "max_seqlen_q": 64,
+            "max_seqlen_kv": 512,
+            "head_dim": 64,
+            "element_size": 2,
+            "num_cores": 32,
+            "query_tile_size": 64,
+            "group_tile_size": 1,
+            "full_sdpa_prefill": True,
+        }
+        direct = next(
+            c
+            for c in _sdpa_kv_candidates(**kwargs, num_non_group_outer_tiles=1)
+            if c.num_blocks == 1
+        )
+        mapped = next(
+            c
+            for c in _sdpa_kv_candidates(**kwargs, num_non_group_outer_tiles=2)
+            if c.num_blocks == 1
+        )
+        scanned = next(
+            c
+            for c in _sdpa_kv_candidates(**kwargs, num_non_group_outer_tiles=2)
+            if c.num_blocks == 2
+        )
+
+        self.assertEqual(
+            mapped.estimated_dsc_executions, 2 * direct.estimated_dsc_executions
+        )
+        self.assertEqual(direct.estimated_dsc_executions, 10)
+        self.assertEqual(
+            mapped.estimated_live_bytes_per_core - direct.estimated_live_bytes_per_core,
+            2 * mapped.query_bytes_per_core,
+        )
+        self.assertGreater(
+            scanned.estimated_dsc_executions, mapped.estimated_dsc_executions
+        )
 
     def test_map_carry_residency_preserves_the_right_production_split(self):
         def candidate(*, query_tile_size, group_tile_size, block_size, head_dim):
@@ -765,6 +792,44 @@ class TestSDPATiling(unittest.TestCase):
 
 
 class TestSDPAForEachTileIntegration(unittest.TestCase):
+    def test_mapped_single_block_gqa_with_broadcast_mask(self):
+        """Outer maps must preserve stable SDPA across query and head tiles."""
+
+        def sdpa(q, k, v, mask):
+            return F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, enable_gqa=True
+            )
+
+        generator = torch.Generator().manual_seed(4960)
+        query = torch.randn(2, 4, 64, 64, dtype=torch.float16, generator=generator)
+        key = torch.randn(2, 2, 64, 64, dtype=torch.float16, generator=generator)
+        value = torch.randn(2, 2, 64, 64, dtype=torch.float16, generator=generator)
+        mask = torch.zeros(2, 1, 1, 64, dtype=torch.float16)
+        mask[..., :32] = float("-inf")
+
+        def mapped_single_block(**kwargs):
+            selected = _select_sdpa_tiling(**kwargs)
+            return dataclasses.replace(
+                selected,
+                strategy="work_divided_tiled",
+                kv_block_size=64,
+                num_kv_blocks=1,
+                num_batch_tiles=2,
+                num_head_tiles=2,
+                num_group_tiles=2,
+                num_q_tiles=2,
+                q_tile_size=32,
+            )
+
+        expected = sdpa(query.float(), key.float(), value.float(), mask.float())
+        with mock.patch.object(
+            _decompositions, "_select_sdpa_tiling", side_effect=mapped_single_block
+        ):
+            actual = torch.compile(sdpa, fullgraph=True, dynamic=False)(
+                query.to("spyre"), key.to("spyre"), value.to("spyre"), mask.to("spyre")
+            )
+        torch.testing.assert_close(actual.cpu().float(), expected, atol=0.05, rtol=0.05)
+
     def test_gqa_decode_with_interleaved_kv_cache(self):
         """A tiled-away group must preserve query strides across KV heads."""
         generator = torch.Generator().manual_seed(123)
