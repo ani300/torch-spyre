@@ -122,9 +122,21 @@ For compiled SDPA, maps over batch, head, group, or query positions use this
 carry-free form when K/V fits in one block: each map body computes stable
 softmax over its complete K/V range. Only a scan over multiple K/V blocks
 needs online-softmax running maximum, denominator, and output carries.
-The SDPA tile selector accounts for the shorter single-block body and the
-input/output tiles staged by an enclosing map separately; this does not
-change its LX spill-admission policy or calibrate placement costs.
+
+The SDPA tile selector (`_select_sdpa_tiling` in `decompositions.py`) admits
+a plan only if its resident floor fits in LX: the two co-live score tiles
+(the QK^T output and its exponentials), plus the scaled query, output carry,
+and per-block P@V for a multi-block scan. A spilled score costs far more than
+its HBM bytes, so such plans are rejected rather than priced. It also rejects
+plans the compiler cannot build: more than two nested maps, or more than 1024
+unrolled tile iterations (the backend unrolls every loop). The admitted plans
+are ranked by predicted device time from four measured terms: a fixed cost per
+outer map tile, a cost per K/V scan block, HBM traffic that depends on the
+plan (K/V replay, broadcast-mask replay, head-tile staging), and iterations
+whose QK^T working set overflows LX. The coefficients come from forced-plan
+timings over full and chunked prefill. The selector chooses tiles before
+scratchpad planning, so it can only estimate the allocator's placement; a
+placement-aware selector would remove that gap.
 
 ## Example: tiling `y = a + b; z = y * c`
 
