@@ -19,7 +19,6 @@ import sys
 import unittest
 from unittest import mock
 
-import regex as re
 import torch
 import torch.nn.functional as F
 from torch._inductor.utils import run_and_get_code
@@ -333,7 +332,15 @@ class TestSDPATiling(unittest.TestCase):
             with self.subTest(
                 num_heads=num_heads, num_kvheads=num_kvheads, head_dim=head_dim
             ):
-                with self.assertLogs(_decompositions.logger, level="DEBUG") as logs:
+                calls = []
+
+                def record(**kwargs):
+                    calls.append(kwargs)
+                    return _sdpa_kv_candidates(**kwargs)
+
+                with mock.patch.object(
+                    _decompositions, "_sdpa_kv_candidates", side_effect=record
+                ):
                     config = self._select(
                         batch_size=2,
                         num_heads=num_heads,
@@ -341,18 +348,15 @@ class TestSDPATiling(unittest.TestCase):
                         head_dim=head_dim,
                         max_seqlen_kv=8192,
                     )
-                candidates = [
-                    tuple(int(x) for x in m.groups())
-                    for m in (
-                        re.search(r"tile candidate: B=(\d+) H=(\d+) G=(\d+)", line)
-                        for line in logs.output
-                    )
-                    if m
-                ]
-                self.assertTrue(any(b > 1 for b, _, _ in candidates))
-                # GQA tiles the Hkv axis as heads; a single KV head has no H split.
-                self.assertEqual(any(h > 1 for _, h, _ in candidates), num_kvheads > 1)
-                self.assertTrue(any(g > 1 for _, _, g in candidates))
+                group = num_heads // num_kvheads
+                self.assertTrue(any(c["batch_size"] < 2 for c in calls))
+                # GQA tiles the Hkv axis as heads; one KV head has no H split.
+                self.assertEqual(
+                    any(c["num_kvheads"] < num_kvheads for c in calls),
+                    num_kvheads > 1,
+                )
+                self.assertTrue(any(c["group_tile_size"] < group for c in calls))
+                self.assertTrue(any(c["num_q_tiles"] > 1 for c in calls))
                 self.assertEqual(config.strategy, "work_divided_tiled")
                 self.assertEqual(config.estimated_active_cores, 32)
 
@@ -605,9 +609,32 @@ class TestSDPATiling(unittest.TestCase):
             head_tile_staging_bytes=2 * 3 * 32 * 2048 * 128 * 2,
         )
 
-        self.assertGreater(without_staging.num_head_tiles, 1)
+        self.assertEqual(without_staging.num_head_tiles, 2)
+        self.assertEqual(without_staging.num_q_tiles, 1)
         self.assertEqual(with_staging.num_head_tiles, 1)
-        self.assertGreater(with_staging.num_q_tiles, 1)
+        self.assertEqual(with_staging.num_q_tiles, 2)
+
+    def test_interleaved_gqa_chunk_does_not_head_tile(self):
+        # The adapter's GQA chunk: a broadcast mask and interleaved B/S/H/D
+        # inputs. The untiled-Q K512 scan measured 3.20 ms vs 4.99 ms for the
+        # former Q2 plan; head-tile staging must not change it.
+        kwargs = dict(
+            num_heads=32,
+            num_kvheads=8,
+            max_seqlen_q=512,
+            max_seqlen_kv=8192,
+            head_dim=128,
+            mask_shapes=((1, 1, 1, 512, 8192),),
+        )
+        for staging in (0, 75_497_472):
+            with self.subTest(head_tile_staging_bytes=staging):
+                config = self._select(**kwargs, head_tile_staging_bytes=staging)
+
+                self.assertEqual(config.num_head_tiles, 1)
+                self.assertEqual(config.num_group_tiles, 1)
+                self.assertEqual(config.num_q_tiles, 1)
+                self.assertEqual(config.kv_block_size, 512)
+                self.assertEqual(config.num_kv_blocks, 16)
 
     def test_interleaved_head_axis_is_not_dense(self):
         shape = (1, 8, 8192, 128)
@@ -733,15 +760,97 @@ class TestSDPATiling(unittest.TestCase):
             self._LX_BUDGET,
         )
 
-    def test_live_footprint_over_budget_keeps_coarse_tiling(self):
-        # Every plan's two co-live scores exceed a 1 KiB budget.
-        config = self._select(batch_size=2, lx_budget_bytes=1024)
+    def test_direct_body_needs_both_score_tiles_in_lx(self):
+        # Issue #4912: at B4/S512/D64 the direct body's two co-live scores fit
+        # LX at H12 (2 x 786,432 B) but not at H13 or H14, which scan K/V.
+        for num_heads, strategy, num_kv_blocks in (
+            (12, "work_divided", 1),
+            (13, "work_divided_tiled", 2),
+            (14, "work_divided_tiled", 2),
+        ):
+            with self.subTest(num_heads=num_heads):
+                config = self._select(
+                    batch_size=4,
+                    num_heads=num_heads,
+                    num_kvheads=num_heads,
+                    head_dim=64,
+                )
+
+                self.assertEqual(config.strategy, strategy)
+                self.assertEqual(config.num_kv_blocks, num_kv_blocks)
+                self.assertEqual(config.num_head_tiles, 1)
+                self.assertEqual(config.num_q_tiles, 1)
+                self.assertEqual(config.estimated_spill_buffers, 0)
+                self.assertLessEqual(
+                    2 * config.score_bytes_per_core, config.lx_budget_bytes
+                )
+
+    def test_compile_caps_decide_between_buildable_and_resident_plans(self):
+        kwargs = dict(
+            num_heads=64,
+            num_kvheads=8,
+            max_seqlen_q=8192,
+            max_seqlen_kv=32768,
+            head_dim=64,
+        )
+
+        def iterations_and_maps(config):
+            group = _decompositions._sdpa_effective_group_tiles(
+                config.num_group_tiles, config.num_q_tiles, config.num_kv_blocks
+            )
+            maps = (config.num_batch_tiles, config.num_head_tiles, group)
+            maps += (config.num_q_tiles,)
+            iterations = config.num_kv_blocks
+            for count in maps:
+                iterations *= count
+            return iterations, sum(count > 1 for count in maps)
+
+        capped = self._select(**kwargs)
+        with (
+            mock.patch.object(
+                _decompositions, "_SDPA_MAX_UNROLLED_TILE_ITERATIONS", 1 << 30
+            ),
+            mock.patch.object(_decompositions, "_SDPA_MAX_NESTED_MAP_LEVELS", 8),
+        ):
+            uncapped = self._select(**kwargs)
+
+        # Every plan that keeps both scores resident needs more than 1024
+        # unrolled iterations, so the caps select the buildable plan that
+        # spills the fewest scores instead.
+        iterations, maps = iterations_and_maps(capped)
+        self.assertLessEqual(iterations, 1024)
+        self.assertLessEqual(maps, 2)
+        self.assertEqual(capped.estimated_spill_buffers, 1)
+        self.assertEqual(
+            capped.reason,
+            "no buildable plan keeps both score tiles in LX; fewest spilled "
+            "scores within the compile limits",
+        )
+        self.assertEqual(uncapped.estimated_spill_buffers, 0)
+        self.assertGreater(iterations_and_maps(uncapped)[0], 1024)
+
+    def test_no_buildable_plan_falls_back_to_coarse_tiling(self):
+        with mock.patch.object(
+            _decompositions, "_SDPA_MAX_UNROLLED_TILE_ITERATIONS", 0
+        ):
+            config = self._select()
 
         self.assertEqual(config.strategy, "coarse_tiled")
+        self.assertEqual(config.reason, "no enumerated plan fits the compile limits")
+
+    def test_live_footprint_over_budget_spills_fewest_scores(self):
+        # No plan keeps two score tiles in a 1 KiB budget. A buildable plan that
+        # spills the fewest scores is preferred over the coarse fallback, which
+        # is reserved for shapes where nothing fits the compile limits.
+        config = self._select(batch_size=2, lx_budget_bytes=1024)
+
+        self.assertEqual(config.strategy, "work_divided_tiled")
+        self.assertGreater(config.estimated_spill_buffers, 0)
         self.assertGreater(config.estimated_live_bytes_per_core, 1024)
         self.assertEqual(
             config.reason,
-            "estimated per-core live footprint exceeds the LX budget",
+            "no buildable plan keeps both score tiles in LX; fewest spilled "
+            "scores within the compile limits",
         )
 
     def test_estimated_active_cores_scales_with_available_cores(self):

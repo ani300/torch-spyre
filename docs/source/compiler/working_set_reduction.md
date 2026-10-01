@@ -129,7 +129,11 @@ a plan only if its resident floor fits in LX: the two co-live score tiles
 and per-block P@V for a multi-block scan. A spilled score costs far more than
 its HBM bytes, so such plans are rejected rather than priced. It also rejects
 plans the compiler cannot build: more than two nested maps, or more than 1024
-unrolled tile iterations (the backend unrolls every loop). The admitted plans
+unrolled tile iterations (the backend unrolls every loop). If those limits
+leave no plan whose floor fits, it takes the buildable plan that spills the
+fewest score tiles; coarse tiling remains only for shapes with no buildable
+plan. Overflow above the floor is not charged: across the measured plans it
+had no measurable cost. The admitted plans
 are ranked by predicted device time from four measured terms: a fixed cost per
 outer map tile, a cost per K/V scan block, HBM traffic that depends on the
 plan (K/V replay, broadcast-mask replay, head-tile staging), and iterations
