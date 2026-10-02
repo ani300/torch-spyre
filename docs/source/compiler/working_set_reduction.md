@@ -133,14 +133,21 @@ unrolled tile iterations (the backend unrolls every loop). If those limits
 leave no plan whose floor fits, it takes the buildable plan that spills the
 fewest score tiles; coarse tiling remains only for shapes with no buildable
 plan. Overflow above the floor is not charged: across the measured plans it
-had no measurable cost. The admitted plans
-are ranked by predicted device time from four measured terms: a fixed cost per
-outer map tile, a cost per K/V scan block, HBM traffic that depends on the
-plan (K/V replay, broadcast-mask replay, head-tile staging), and iterations
-whose QK^T working set overflows LX. The coefficients come from forced-plan
-timings over full and chunked prefill. The selector chooses tiles before
-scratchpad planning, so it can only estimate the allocator's placement; a
-placement-aware selector would remove that gap.
+had no measurable cost. The admitted plans are ranked by predicted device time
+from four measured terms: a fixed cost per outer map tile, an extra cost per
+tile when the plan splits query rows, the query-shaped carry each K/V scan
+step reads and writes, and HBM traffic that depends on the plan (K/V replay
+and head-tile staging). The coefficients come from forced-plan timings over
+full and chunked prefill, including Gemma 4 global and sliding layers. The
+selector chooses tiles before scratchpad planning, so it can only estimate the
+allocator's placement; a placement-aware selector would remove that gap.
+
+Sliding-window attention (`_select_swa_tiling`) applies the same resident
+floor to its per-query-block K/V window and takes the fewest blocks whose
+floor fits: each extra block adds a scan step that rescales the output carry.
+A tiling that covers the window exactly with an odd number of blocks is
+skipped, because the K/V loop then slices the cache view directly and its
+strides are not divisible by the tile count.
 
 ## Example: tiling `y = a + b; z = y * c`
 
