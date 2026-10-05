@@ -34,6 +34,7 @@ import torch
 from sympy import Symbol
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.ir import InputBuffer, MutationLayoutSHOULDREMOVE, Scatter
+from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
@@ -186,9 +187,20 @@ def _cache_store_op(dep, slot_index=None):
     """A stand-in mutation op around real objects: real InputBuffer target, real
     mutation layout, real read/writes; only the op wrapper is hand-built."""
     op = mock.Mock()
-    indices = [SimpleNamespace(name="slots")]
+    slot_expr = _isym("d0") if slot_index is None else slot_index
+
+    def output_indexer(index):
+        load_index = slot_expr.xreplace(dict(zip(dep.var_names, index)))
+        return [
+            V.ops.indirect_indexing(
+                V.ops.load("slots", load_index), CACHE_ROWS, check=False
+            ),
+            index[1],
+        ]
+
     op.data = mock.Mock(spec=Scatter)
-    op.data.output_indexer = lambda _: indices
+    op.data.ranges = list(dep.size)
+    op.data.output_indexer = output_indexer
     op.dim_hints = []
     with V.set_graph_handler(mock.Mock()):
         op.get_layout.return_value = MutationLayoutSHOULDREMOVE(
@@ -253,6 +265,12 @@ class StoredElemsTest(unittest.TestCase):
 
 class IndirectWriteElemsTest(unittest.TestCase):
     """The store's own geometry, through the real layout helpers."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator()))
+        )
 
     def test_row_loop_through_an_indirect_slot_is_counted(self):
         dep = _cache_store_dep()
