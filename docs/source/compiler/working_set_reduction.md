@@ -118,6 +118,9 @@ each step's output tile back into the correct slice of a full-size result.
 Either can be `None` independently — a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
 
+Set `DXP_LOOP_UNROLL=0` to keep counted loops in the backend compiler. The setting
+is part of the kernel cache key, so changing it cannot reuse an unrolled artifact.
+
 For compiled SDPA, maps over batch, head, group, or query positions use this
 carry-free form when K/V fits in one block: each map body computes stable
 softmax over its complete K/V range. Only a scan over multiple K/V blocks
@@ -127,12 +130,12 @@ The SDPA tile selector (`_select_sdpa_tiling` in `decompositions.py`) admits
 a plan only if its resident floor fits in LX: the two co-live score tiles
 (the QK^T output and its exponentials), plus the scaled query, output carry,
 and per-block P@V for a multi-block scan. A spilled score costs far more than
-its HBM bytes, so such plans are rejected rather than priced. It also rejects
-plans the compiler cannot build: more than two nested maps, or more than 1024
-unrolled tile iterations (the backend unrolls every loop). If those limits
-leave no plan whose floor fits, it takes the buildable plan that spills the
-fewest score tiles; coarse tiling remains only for shapes with no buildable
-plan. Overflow above the floor is not charged: across the measured plans it
+its HBM bytes, so such plans are rejected rather than priced. The selector also
+limits compilation to two nested maps and 1024 tile iterations, guarding against
+excessive default loop unrolling. If those limits leave no plan whose floor fits,
+it takes the buildable plan that spills the fewest score tiles; coarse tiling
+remains only for shapes with no buildable plan. Overflow above the floor is not
+charged: across the measured plans it
 had no measurable cost. The admitted plans are ranked by predicted device time
 from four measured terms: a fixed cost per outer map tile, an extra cost per
 tile when the plan splits query rows, the query-shaped carry each K/V scan
