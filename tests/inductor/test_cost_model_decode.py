@@ -190,13 +190,14 @@ def _cache_store_op(dep, slot_index=None):
     slot_expr = _isym("d0") if slot_index is None else slot_index
 
     def output_indexer(index):
-        load_index = slot_expr.xreplace(dict(zip(dep.var_names, index)))
-        return [
-            V.ops.indirect_indexing(
-                V.ops.load("slots", load_index), CACHE_ROWS, check=False
-            ),
-            index[1],
-        ]
+        with V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator())):
+            load_index = slot_expr.xreplace(dict(zip(dep.var_names, index)))
+            return [
+                V.ops.indirect_indexing(
+                    V.ops.load("slots", load_index), CACHE_ROWS, check=False
+                ),
+                index[1],
+            ]
 
     op.data = mock.Mock(spec=Scatter)
     op.data.ranges = list(dep.size)
@@ -265,12 +266,6 @@ class StoredElemsTest(unittest.TestCase):
 
 class IndirectWriteElemsTest(unittest.TestCase):
     """The store's own geometry, through the real layout helpers."""
-
-    def setUp(self):
-        super().setUp()
-        self.enterContext(
-            V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator()))
-        )
 
     def test_row_loop_through_an_indirect_slot_is_counted(self):
         dep = _cache_store_dep()
