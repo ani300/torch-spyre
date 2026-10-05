@@ -118,6 +118,10 @@ each step's output tile back into the correct slice of a full-size result.
 Either can be `None` independently — a pure reduction has no `out_dim`; a
 pure per-tile map has no `init`.
 
+A functional `index_copy` into a carried output preserves its caller's initializer.
+The compiler removes a full carry clone only when its addresses, shape, strides
+and offset are unchanged.
+
 Set `DXP_LOOP_UNROLL=0` to keep counted loops in the backend compiler. The setting
 is part of the kernel cache key, so changing it cannot reuse an unrolled artifact.
 
