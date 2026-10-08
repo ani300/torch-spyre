@@ -998,6 +998,12 @@ class CostParams:
     # cost and measured 0.36-0.45 ms slower on 1 core; this rate charges its
     # 12 MiB of traffic 0.34 ms. Same rate as store_gbps_per_core; 0 disables.
     pointwise_gbps_per_core: float = 30.0
+    # Smallest arg, in bytes, the low-core pointwise rate applies to. Measured
+    # on that 12 MiB pass only; smaller args keep a division-invariant price.
+    # Charging every size let the ns-scale excess of a few-stick tensor decide
+    # its division: (68,) and (196,) dtype round trips then took a multi-core
+    # split of a partial stick and returned wrong values.
+    pointwise_core_min_bytes: int = 1 << 20
     # Rate of each REPEATED pass a loop makes over a fixed-address, non-resident
     # input of a non-matmul op (``loop_factor > 1``): an online-softmax scan's
     # output, max and sum carries when they are not LX-resident. Forced SDPA
@@ -2257,9 +2263,10 @@ def _pointwise_core_excess_ns(ops: list, p: "CostParams"):
     the op's division. A pointwise op on ``cores`` cores moves its own reads and
     writes at most at ``cores * pointwise_gbps_per_core``; only the excess over
     the peak charge is added, after compute overlap, so divisions with enough
-    cores (5 or more at the defaults) are unaffected. Matmuls, reductions,
-    indirect stores and plain copies keep their own core-count terms; a
-    one-input arithmetic op pays this as well as its request-law read. With
+    cores (5 or more at the defaults) are unaffected, and so are args smaller
+    than ``pointwise_core_min_bytes``. Matmuls, reductions, indirect stores
+    and plain copies keep their own core-count terms; a one-input arithmetic
+    op pays this as well as its request-law read. With
     symbolic cores each arg is one :class:`ResidencyGatedPrice` over the op's
     splits.
     """
@@ -2287,6 +2294,8 @@ def _pointwise_core_excess_ns(ops: list, p: "CostParams"):
             if arg.role == "input" and arg.broadcast:
                 continue
             nbytes = arg.elems * (arg.loop_factor or 1) * op.dtype_bytes
+            if _is_sym(nbytes) or nbytes < p.pointwise_core_min_bytes:
+                continue
             is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
             if arg.role == "output" and arg.is_graph_boundary:
                 is_lx = 0  # the clone-out still writes it
