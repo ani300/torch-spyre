@@ -352,13 +352,13 @@ def test_cpsat_tabulates_a_gated_burst_price_over_the_op_divisions():
     assert float(expr.xreplace({split[d0]: 32, split[d1]: 1, resident: 0})) > 0
 
 
-def _pointwise(cores, *, resident=False, out_resident=False):
-    arg = ArgTraffic(name="buf0", role="input", is_lx=resident, elems=ELEMS * 64)
-    out = ArgTraffic(name="buf1", role="output", is_lx=out_resident, elems=ELEMS * 64)
+def _pointwise(cores, *, resident=False, out_resident=False, elems=ELEMS * 256):
+    arg = ArgTraffic(name="buf0", role="input", is_lx=resident, elems=elems)
+    out = ArgTraffic(name="buf1", role="output", is_lx=out_resident, elems=elems)
     return OpFeatures(
         name="mul",
         is_reduction=False,
-        out_elems=ELEMS * 64,
+        out_elems=elems,
         cores=cores,
         dtype_bytes=2,
         args=[out, arg],
@@ -369,7 +369,7 @@ def test_a_pointwise_op_on_few_cores_pays_its_per_core_rate():
     from torch_spyre._inductor.cost_model import _pointwise_core_excess_ns
 
     p = CostParams()
-    nbytes = ELEMS * 64 * 2
+    nbytes = ELEMS * 256 * 2
     one = _pointwise_core_excess_ns([_pointwise(1)], p)
     expected = 2 * nbytes * (1 / p.pointwise_gbps_per_core - 1 / p.bw_peak_gbps)
     assert one == pytest.approx(expected)
@@ -409,6 +409,22 @@ def test_a_one_input_arithmetic_op_keeps_the_low_core_price():
     assert plain > 0
     assert _pointwise_core_excess_ns([unary(True)], p) == pytest.approx(plain)
     assert _pointwise_core_excess_ns([unary(False)], p) == 0
+
+
+def test_small_pointwise_args_keep_a_division_invariant_price():
+    """Below pointwise_core_min_bytes nothing depends on the core count: a
+    few-stick tensor's ns-scale excess must not decide its division (a (68,)
+    round trip split across cores returned wrong values)."""
+    from torch_spyre._inductor.cost_model import _pointwise_core_excess_ns
+
+    p = CostParams()
+    small = p.pointwise_core_min_bytes // 2 // 2 - 1
+    assert {
+        _pointwise_core_excess_ns([_pointwise(c, elems=small)], p) for c in (1, 2, 32)
+    } == {0}
+    assert {predict_ops([_pointwise(c, elems=68)], p) for c in (1, 2, 4, 32)} == {
+        predict_ops([_pointwise(1, elems=68)], p)
+    }
 
 
 def test_low_core_pointwise_price_is_symbolic_in_the_split():
