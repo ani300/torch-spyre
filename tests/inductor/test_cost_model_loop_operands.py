@@ -286,6 +286,153 @@ def test_cpsat_keeps_the_burst_price_when_replication_resolves_to_one():
         assert solver.objective_value == pytest.approx(expected, abs=1)
 
 
+def test_cpsat_tabulates_a_gated_burst_price_over_the_op_divisions():
+    """A symbolic burst price is one ResidencyGatedPrice node, which CP-SAT
+    lowers to a table over the op's candidate divisions: no branch literals,
+    and the objective equals the concrete price for every division and
+    residency."""
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.cost_model import ResidencyGatedPrice
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        _CoreDivisionBufferWithCpVars,
+        _SympyExprToCpSat,
+    )
+    from torch_spyre._inductor.scratchpad.plan_solver import (
+        CoreDivision,
+        CoreDivisionBuffer,
+    )
+
+    d0, d1 = sympy.symbols("d0 d1")
+    shapes = ((1, 1), (2, 1), (8, 1), (1, 8), (8, 4), (32, 1))
+    buffer = CoreDivisionBuffer(
+        "buf1",
+        ELEMS,
+        [0, 1],
+        core_divisions=[CoreDivision(splits={d0: a, d1: b}) for a, b in shapes],
+    )
+    model = cp_model.CpModel()
+    wrapper = _CoreDivisionBufferWithCpVars(
+        buffer=buffer, model=model, capacity_units=ELEMS
+    )
+    split = buffer.sym_core_divs
+    resident = sympy.Symbol("is_lx_buf0", integer=True, nonnegative=True)
+    p = CostParams()
+    op = dataclasses.replace(
+        _streamed(64 * p.transport_dma_word_bytes / split[d0], resident=resident),
+        cores=split[d0] * split[d1],
+    )
+    expr = sympy.sympify(TRIPS * _read_burst_excess_ns([op], p))
+    assert expr.atoms(ResidencyGatedPrice)
+
+    is_lx = model.new_bool_var(resident.name)
+    sym_map = {resident.name: is_lx}
+    buffer_map = {}
+    for key, symbol in split.items():
+        sym_map[symbol.name] = wrapper.cp_core_divs[key]
+        buffer_map[symbol.name] = (wrapper, wrapper.cp_core_divs_raw[key])
+    before = len(model.proto.variables)
+    model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
+    added = [v.name for v in model.proto.variables][before:]
+    assert not [n for n in added if n.startswith(("cond_", "piecewise_", "_product"))]
+
+    solver = cp_model.CpSolver()
+    for index, (a, b) in enumerate(shapes):
+        for lx in (0, 1):
+            fixed = model.clone()
+            fixed.add(wrapper.division == index)
+            fixed.add(is_lx == lx)
+            expected = float(
+                expr.xreplace({split[d0]: a, split[d1]: b, resident: sympy.Integer(lx)})
+            )
+            assert solver.solve(fixed) == cp_model.OPTIMAL
+            assert solver.objective_value == pytest.approx(expected, abs=1e-6)
+            if lx:
+                assert expected == 0
+    # The table is not flat: the 32-way split's one-stick run pays requests.
+    assert float(expr.xreplace({split[d0]: 32, split[d1]: 1, resident: 0})) > 0
+
+
+def _pointwise(cores, *, resident=False, out_resident=False):
+    arg = ArgTraffic(name="buf0", role="input", is_lx=resident, elems=ELEMS * 64)
+    out = ArgTraffic(name="buf1", role="output", is_lx=out_resident, elems=ELEMS * 64)
+    return OpFeatures(
+        name="mul",
+        is_reduction=False,
+        out_elems=ELEMS * 64,
+        cores=cores,
+        dtype_bytes=2,
+        args=[out, arg],
+    )
+
+
+def test_a_pointwise_op_on_few_cores_pays_its_per_core_rate():
+    from torch_spyre._inductor.cost_model import _pointwise_core_excess_ns
+
+    p = CostParams()
+    nbytes = ELEMS * 64 * 2
+    one = _pointwise_core_excess_ns([_pointwise(1)], p)
+    expected = 2 * nbytes * (1 / p.pointwise_gbps_per_core - 1 / p.bw_peak_gbps)
+    assert one == pytest.approx(expected)
+    # Enough cores to reach the bus peak, or LX-resident traffic, pay nothing.
+    assert _pointwise_core_excess_ns([_pointwise(8)], p) == 0
+    assert (
+        _pointwise_core_excess_ns([_pointwise(1, resident=True, out_resident=True)], p)
+        == 0
+    )
+    costs = [_pointwise_core_excess_ns([_pointwise(c)], p) for c in (1, 2, 4, 8, 32)]
+    assert costs == sorted(costs, reverse=True)
+    assert "low-core pointwise traffic" in explain([_pointwise(1)], p)
+    off = dataclasses.replace(p, pointwise_gbps_per_core=0.0)
+    assert _pointwise_core_excess_ns([_pointwise(1)], off) == 0
+
+
+def test_a_one_input_arithmetic_op_keeps_the_low_core_price():
+    """A unary arithmetic op with proven read geometry is priced by the
+    transport request law (transport_compute_read), which charges short runs
+    only; it still pays the per-core byte rate. A plain copy does not."""
+    from torch_spyre._inductor.cost_model import (
+        _pointwise_core_excess_ns,
+        transport_dma_cost_available,
+    )
+
+    p = CostParams()
+
+    def unary(compute_read):
+        op = _pointwise(1)
+        op.transport_read_run_bytes = 1 << 16
+        op.transport_tile_elems = ELEMS * 64
+        op.transport_compute_read = compute_read
+        assert transport_dma_cost_available(op, p)
+        return op
+
+    plain = _pointwise_core_excess_ns([_pointwise(1)], p)
+    assert plain > 0
+    assert _pointwise_core_excess_ns([unary(True)], p) == pytest.approx(plain)
+    assert _pointwise_core_excess_ns([unary(False)], p) == 0
+
+
+def test_low_core_pointwise_price_is_symbolic_in_the_split():
+    from torch_spyre._inductor.cost_model import (
+        ResidencyGatedPrice,
+        _pointwise_core_excess_ns,
+    )
+
+    split = sympy.Symbol("split_buf1_d0", integer=True, positive=True)
+    resident = sympy.Symbol("is_lx_buf0", integer=True, nonnegative=True)
+    p = CostParams()
+    expr = sympy.sympify(
+        _pointwise_core_excess_ns([_pointwise(split, resident=resident)], p)
+    )
+    assert expr.atoms(ResidencyGatedPrice)
+    for cores in (1, 2, 4, 32):
+        for lx in (0, 1):
+            concrete = _pointwise_core_excess_ns(
+                [_pointwise(cores, resident=bool(lx))], p
+            )
+            actual = float(expr.xreplace({split: cores, resident: sympy.Integer(lx)}))
+            assert actual == pytest.approx(float(concrete))
+
+
 # ------------------------------------------------- stick-plane run geometry
 
 

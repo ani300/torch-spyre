@@ -202,6 +202,42 @@ from .work_division import (
 from . import config
 
 
+class ResidencyGatedPrice(sympy.Function):
+    """``ResidencyGatedPrice(is_lx, price)``: ``(1 - is_lx) * price``, a
+    charge paid only while an arg stays in HBM, whose ``price`` is a function of
+    one op's core-division split symbols alone.
+
+    Written out as algebra, that product of a residency literal and a nested
+    Piecewise over the op's splits and core count (``_read_burst_excess_ns``)
+    lowered to a literal per branch condition plus a product variable per
+    branch: on a GPT-2 prefill graph about 10k of the solver's 19k variables,
+    with an LP relaxation weak enough that CP-SAT stopped FEASIBLE at its 30 s
+    limit where it had proven OPTIMAL in about 10 s without the term. As one
+    function node the term is opaque to the rewrite passes, and the CP-SAT
+    printer tabulates ``price`` over the op's candidate divisions and charges
+    each priced level through a single literal, exactly
+    ``division in level and not is_lx``
+    (``_SympyExprToCpSat._lower_gated_prices``): the same objective with a
+    tight relaxation. ``lambdify`` evaluates the node through :meth:`_imp_`, and
+    ``eval`` folds it once ``is_lx`` is 1 or both arguments are numeric.
+    """
+
+    is_real = True
+
+    @classmethod
+    def eval(cls, is_lx, price):
+        if is_lx.is_Number:
+            if is_lx == 1:
+                return sympy.S.Zero
+            if price.is_Number:
+                return (1 - is_lx) * price
+        return None
+
+    @staticmethod
+    def _imp_(is_lx, price):
+        return (1 - is_lx) * price
+
+
 @dataclasses.dataclass
 class ArgTraffic:
     """Traffic for one tensor argument of an op."""
@@ -954,6 +990,14 @@ class CostParams:
     # the large 1-to-many-core gain, not the smaller measured 4-vs-16 ranking.
     # The shared bus remains capped at bw_peak_gbps; 0 disables this correction.
     store_gbps_per_core: float = 30.0
+    # Rate, in GB/s per core, at which a pointwise op's own HBM reads and writes
+    # run when its division leaves it on too few cores to reach bw_peak_gbps.
+    # Under co-optimization the per-core-count reduction factor (red_bw_cores_g)
+    # is not symbolic, so nothing else prices a pointwise op's core count: in a
+    # Granite GQA Lq 1024 scan an 8 MiB output pass picked 1 core or 32 at equal
+    # cost and measured 0.36-0.45 ms slower on 1 core; this rate charges its
+    # 12 MiB of traffic 0.34 ms. Same rate as store_gbps_per_core; 0 disables.
+    pointwise_gbps_per_core: float = 30.0
     # Rate of each REPEATED pass a loop makes over a fixed-address, non-resident
     # input of a non-matmul op (``loop_factor > 1``): an online-softmax scan's
     # output, max and sum carries when they are not LX-resident. Forced SDPA
@@ -2206,6 +2250,53 @@ def _dma_request_law_available(
     return True
 
 
+def _pointwise_core_excess_ns(ops: list, p: "CostParams"):
+    """Extra HBM time of a pointwise op whose cores cannot saturate the bus.
+
+    The base model charges every non-resident byte at the shared peak whatever
+    the op's division. A pointwise op on ``cores`` cores moves its own reads and
+    writes at most at ``cores * pointwise_gbps_per_core``; only the excess over
+    the peak charge is added, after compute overlap, so divisions with enough
+    cores (5 or more at the defaults) are unaffected. Matmuls, reductions,
+    indirect stores and plain copies keep their own core-count terms; a
+    one-input arithmetic op pays this as well as its request-law read. With
+    symbolic cores each arg is one :class:`ResidencyGatedPrice` over the op's
+    splits.
+    """
+    rate, peak = p.pointwise_gbps_per_core, p.bw_peak_gbps
+    if rate <= 0 or rate >= peak:
+        return 0.0
+    total = 0.0
+    for op in ops:
+        if op.is_matmul or op.is_reduction or op.is_indirect_store:
+            continue
+        # A copy keeps the transport term. A one-input arithmetic op is priced
+        # by the same request law (transport_compute_read), which charges short
+        # runs only, not the per-core byte rate this term adds.
+        if transport_dma_cost_available(op, p) and not op.transport_compute_read:
+            continue
+        cores = op.cores
+        symbolic = isinstance(cores, sympy.Basic) and bool(cores.free_symbols)
+        if symbolic:
+            per_byte = sympy.Max(0, 1 / (cores * rate) - sympy.Float(1 / peak))
+        else:
+            per_byte = max(0.0, 1.0 / (max(1, int(cores)) * rate) - 1.0 / peak)
+            if per_byte == 0:
+                continue
+        for arg in op.args:
+            if arg.role == "input" and arg.broadcast:
+                continue
+            nbytes = arg.elems * (arg.loop_factor or 1) * op.dtype_bytes
+            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
+            if arg.role == "output" and arg.is_graph_boundary:
+                is_lx = 0  # the clone-out still writes it
+            if symbolic:
+                total += ResidencyGatedPrice(is_lx, nbytes * per_byte)
+            else:
+                total += (1 - is_lx) * nbytes * per_byte
+    return total
+
+
 def transport_dma_cost_available(op: OpFeatures, p: "CostParams") -> bool:
     """Whether transport geometry and calibration support this cost term.
 
@@ -2538,7 +2629,12 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
                 excess = sympy.Piecewise((excess, sympy.Eq(replication, 1)), (0, True))
             is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
             lf = getattr(arg, "loop_factor", 1) or 1
-            total += (1 - is_lx) * lf * excess
+            if isinstance(excess, sympy.Basic) and excess.free_symbols:
+                # One node per read, not the algebraic product: see
+                # ResidencyGatedPrice for what the expanded form cost CP-SAT.
+                total += lf * ResidencyGatedPrice(is_lx, excess)
+            else:
+                total += (1 - is_lx) * lf * excess
     return total
 
 
@@ -2770,6 +2866,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         + transport_dma_ns
         + _loop_repeated_read_excess_ns(ops, p)
         + _read_burst_excess_ns(ops, p)
+        + _pointwise_core_excess_ns(ops, p)
     )
     # Looped matmul operand reads: the request law's part beyond the loop-delivery
     # estimate, serialized like the transport term above (the same law).
@@ -3077,6 +3174,12 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         lines.append(
             f"     loop-repeated reads: +{reread_extra / 1000:.2f} us "
             f"({p.loop_reread_gbps:g} GB/s per repeated pass; after compute overlap)"
+        )
+    low_core_extra = _pointwise_core_excess_ns(ops, p)
+    if low_core_extra:
+        lines.append(
+            f"     low-core pointwise traffic: +{float(low_core_extra) / 1000:.2f} us "
+            f"({p.pointwise_gbps_per_core:g} GB/s per core; after compute overlap)"
         )
     restickify_extra = _transport_dma_excess_ns(ops, p)
     if restickify_extra:
