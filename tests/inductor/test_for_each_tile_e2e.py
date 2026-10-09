@@ -59,6 +59,7 @@ import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
@@ -219,7 +220,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
             )
             with (
                 self.subTest(rows=rows, inner=inner, transpose_source=transpose_source),
-                patch.dict("os.environ", {"DXP_LOOP_UNROLL": "0"}),
+                spyre_config.patch(backend_loop_unroll=False),
                 warnings.catch_warnings(),
                 torch.inference_mode(),
             ):
