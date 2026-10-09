@@ -23,6 +23,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
+#include <flex/telemetry/trace_context.hpp>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -39,35 +40,16 @@ AiuptiActivityApi& AiuptiActivityApi::singleton() {
   return instance;
 }
 
-void AiuptiActivityApi::pushCorrelationID(int id, CorrelationFlowType type) {
+void AiuptiActivityApi::pushCorrelationID(uint64_t id,
+                                          CorrelationFlowType type) {
 #ifdef HAS_AIUPTI
-  if (!singleton().externalCorrelationEnabled_) {
-    return;
-  }
-  switch (type) {
-    case Default:
-      // TODO(kavya): implement AIUPTI PushExternalCorrelationId
-      break;
-    case User:
-      // TODO(kavya): implement AIUPTI PushExternalCorrelationId
-      break;
-  }
+  flex::telemetry::PushExternalCorrelationId(id, type == User);
 #endif
 }
 
 void AiuptiActivityApi::popCorrelationID(CorrelationFlowType type) {
 #ifdef HAS_AIUPTI
-  if (!singleton().externalCorrelationEnabled_) {
-    return;
-  }
-  switch (type) {
-    case Default:
-      // TODO(kavya): implement AIUPTI PopExternalCorrelationId
-      break;
-    case User:
-      // TODO(kavya): implement AIUPTI PopExternalCorrelationId
-      break;
-  }
+  flex::telemetry::PopExternalCorrelationId(type == User);
 #endif
 }
 
@@ -227,7 +209,6 @@ void AiuptiActivityApi::enableAiuptiActivities(
   AIUPTI_CALL(aiuptiActivityRegisterCallbacks(bufferRequestedTrampoline,
                                               bufferCompletedTrampoline));
   bool activityEnabled = false;
-  externalCorrelationEnabled_ = false;
   for (const auto& activity : selected_activities) {
     if (activity == libkineto::ActivityType::GPU_MEMCPY) {
       AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY));
@@ -321,7 +302,6 @@ void AiuptiActivityApi::disablePtiActivities(
       AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_DRIVER));
     }
   }
-  externalCorrelationEnabled_ = false;
 #endif
 }
 

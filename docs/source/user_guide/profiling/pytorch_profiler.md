@@ -79,8 +79,34 @@ for compute-heavy matmul layers.
 ### Export a trace for viewers
 
 ```python
-prof.export_chrome_trace("spyre_trace.json")
+from torch_spyre.profiler import export_chrome_trace
+
+export_chrome_trace(prof, "spyre_trace.json")
 ```
+
+The Spyre exporter adds explicit CPU-launch-to-`aiuSubmitToHardware` flow
+arrows using the external correlation IDs carried through the runtime queue.
+Each submission gets its own edge, including when one CPU operation launches
+multiple batches. Native flows connect the nested `aiuLaunchControlBlocks` (or DMI/DMO launch)
+to the device activity. The exporter
+preserves all activity times and supports `.json.gz` as well as `.json`.
+It reports unmatched submissions in the top-level `spyre_submission_links`
+metadata instead of guessing their CPU origin from timestamps.
+
+`prof.export_chrome_trace(...)` remains available for a native Kineto export;
+it includes correlation metadata and hardware-launch-to-device flows, but does not add
+the extra CPU-to-submit arrows. To export scheduled captures with these arrows,
+use a callback such as
+`on_trace_ready=lambda p: export_chrome_trace(p, f"trace-{p.step_num}.json")`.
+
+Runtime activities use OS thread IDs, matching PyTorch's CPU lanes. Calibration
+activities share a logical `Spyre calibration (device N)` lane; their
+`host_thread` metadata preserves the actual emitting thread. Its DMA activity
+is calibration traffic, not model input transfer. Queue waits, manager setup,
+HDMA resets, and socket barriers have separate `aiuComms*` spans.
+
+These runtime records require matching Flex, libaiupti, and torch-spyre builds.
+Rebuild all three together after changing the activity record layout.
 
 See [Trace analysis](trace_analysis.md) for viewing.
 
@@ -202,3 +228,11 @@ them, are recorded alongside compute kernels on multi-AIU runs.
   alongside `torch.profiler`
 
 [torch-profiler-docs]: https://pytorch.org/docs/stable/profiler.html
+
+Device events include `timestamp_source`. Before device clock calibration is
+ready, the decoder estimates placement by anchoring elapsed device ticks
+(assuming 1 ns per tick) at host completion. These events are explicitly marked
+`estimated (host completion, 1 ns/tick)`; their absolute placement is approximate.
+Use `FLEX_TIMESTAMP_CALIBRATION=always` before initializing the device to start
+calibration during model loading/warmup when calibrated timings are needed from
+the beginning of the capture. The default starts calibration on a profiling session.
