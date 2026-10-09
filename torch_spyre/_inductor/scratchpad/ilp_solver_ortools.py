@@ -1535,11 +1535,33 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             buffer_map[symbol.name] = (t, t.cores_used)
 
         try:
+            first_cost_variable = len(model.proto.variables)
+            first_cost_constraint = len(model.proto.constraints)
             cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
                 model.minimize(cp_cost)
+                if config.cpsat_local_cost_tables:
+                    from .cost_tables import add_cost_tables
+
+                    tables = add_cost_tables(
+                        model,
+                        divisions=[
+                            t.division
+                            for t in tensors.values()
+                            if isinstance(t, _CoreDivisionBufferWithCpVars)
+                            and isinstance(t.division, cp_model.IntVar)
+                        ],
+                        residency=[
+                            t.in_buffer
+                            for t in tensors.values()
+                            if not isinstance(t.buffer, RelayoutCopyBuffer)
+                        ],
+                        first_variable=first_cost_variable,
+                        first_constraint=first_cost_constraint,
+                    )
+                    logger.debug("[CP-SAT layout solver] local cost tables: %s", tables)
             status = self._solve_and_record(solver, model, objective=True)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(

@@ -314,6 +314,12 @@ cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")
 )
 
+# Strengthen joint division/residency cost bounds with redundant local tables.
+# This can shorten long optimality proofs, but adds model-construction work and
+# variables. Opt in while collecting workload coverage; the solve budget and
+# cost objective are unchanged.
+cpsat_local_cost_tables: bool = os.environ.get("CPSAT_LOCAL_COST_TABLES", "0") == "1"
+
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
