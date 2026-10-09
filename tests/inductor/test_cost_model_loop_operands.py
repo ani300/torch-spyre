@@ -449,6 +449,87 @@ def test_low_core_pointwise_price_is_symbolic_in_the_split():
             assert actual == pytest.approx(float(concrete))
 
 
+def test_uncalibrated_core_counts_take_the_next_lower_burst_rate():
+    """A 12- or 24-core division is priced like 8 or 16 cores, not for free."""
+    p = CostParams()
+    stick = p.transport_dma_word_bytes
+
+    def at(cores):
+        return _read_burst_excess_ns(
+            [dataclasses.replace(_streamed(stick), cores=cores)], p
+        )
+
+    assert at(12) == at(8) > 0
+    assert at(24) == at(16) > 0
+    assert at(3) == at(2) > 0
+    split = sympy.Symbol("split_buf1_d0", integer=True, positive=True)
+    expr = sympy.sympify(
+        _read_burst_excess_ns([dataclasses.replace(_streamed(stick), cores=split)], p)
+    )
+    for cores in (3, 6, 12, 24, 32):
+        assert float(expr.xreplace({split: cores})) == pytest.approx(float(at(cores)))
+
+
+def _decode_pv(cores, replication, *, reuse=2, loop_factor=1):
+    """A decode GQA P@V: the value cache, reused by ``reuse`` query rows."""
+    v = ArgTraffic(
+        name="arg10_1",
+        role="input",
+        is_lx=False,
+        elems=ELEMS * 128,
+        broadcast=True,
+        replication=replication,
+        loop_factor=loop_factor,
+    )
+    out = ArgTraffic(name="buf42", role="output", is_lx=True, elems=ELEMS)
+    return OpFeatures(
+        name="bmm",
+        is_reduction=False,
+        out_elems=ELEMS,
+        cores=cores,
+        dtype_bytes=2,
+        args=[out, v],
+        is_matmul=True,
+        matmul_macs=reuse * ELEMS * 128,
+    )
+
+
+def test_few_cores_stream_a_reused_matmul_operand_at_their_own_rate():
+    from torch_spyre._inductor.cost_model import _reused_operand_stream_excess_ns
+
+    p = CostParams()
+    nbytes = ELEMS * 128 * 2
+    peak = nbytes / p.bw_peak_gbps
+    one = _reused_operand_stream_excess_ns([_decode_pv(1, 1)], p)
+    assert one == pytest.approx(nbytes / p.mm_reused_read_gbps_per_core - peak)
+    # A split of the query rows multicasts each core's slice: slower per core.
+    shared = _reused_operand_stream_excess_ns([_decode_pv(2, 2)], p)
+    assert shared == pytest.approx(nbytes / p.mm_multicast_read_gbps_per_core - peak)
+    # Enough cores, prefill-sized reuse, or a looped read cost nothing extra.
+    assert _reused_operand_stream_excess_ns([_decode_pv(32, 1)], p) == 0
+    assert _reused_operand_stream_excess_ns([_decode_pv(1, 1, reuse=64)], p) == 0
+    assert _reused_operand_stream_excess_ns([_decode_pv(1, 1, loop_factor=4)], p) == 0
+    assert "reused matmul operand streaming" in explain([_decode_pv(2, 2)], p)
+
+
+def test_reused_operand_stream_price_is_symbolic_in_the_split():
+    from torch_spyre._inductor.cost_model import (
+        ResidencyGatedPrice,
+        _reused_operand_stream_excess_ns,
+    )
+
+    heads, rows = sympy.symbols("split_buf42_d0 split_buf42_d1", integer=True)
+    p = CostParams()
+    expr = sympy.sympify(
+        _reused_operand_stream_excess_ns([_decode_pv(heads * rows, rows)], p)
+    )
+    assert expr.atoms(ResidencyGatedPrice)
+    for h, r in ((1, 1), (1, 2), (4, 1), (4, 2), (8, 2)):
+        concrete = _reused_operand_stream_excess_ns([_decode_pv(h * r, r)], p)
+        actual = float(expr.xreplace({heads: h, rows: r}))
+        assert actual == pytest.approx(float(concrete))
+
+
 # ------------------------------------------------- stick-plane run geometry
 
 

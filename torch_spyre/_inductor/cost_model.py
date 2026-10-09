@@ -823,6 +823,26 @@ class CostParams:
     # 16-core projection on an older SDK ran about 15% faster than it predicts;
     # below 16 cores it is unmeasured. See ``_partitioned_operand_read_excess``.
     mm_partitioned_read_gbps_per_core: float = 150.0 / 32
+    # REUSED matmul operands (every element feeds several multiply-accumulates,
+    # e.g. a decode GQA P@V's value cache, reused by the group's query rows),
+    # which _partitioned_operand_read_excess leaves at the shared peak. Each core
+    # still streams its own slice of the operand, bytes * replication / cores,
+    # and at few cores that slice, not the bus, bounds the read. Fitted to the
+    # profiler kernel time of the Qwen3-0.6B decode P@V bmm (8 KV heads x 2
+    # queries, S 512, 1 MiB value cache) pinned to 15 divisions, 2 runs each:
+    # a core streams its slice at about 25 GB/s alone (1 core 42.8 us, 2 cores
+    # 22.5 us) and at about 10 GB/s when the slice is multicast to cores that
+    # share it (a split of the query rows only: 2 cores 103.8 us, 4 cores
+    # 52.9 us, 8 cores 26.9 us). Charged in single-pass bundles only, where it
+    # was measured; looped attention keeps its own read pricing. 0 disables.
+    mm_reused_read_gbps_per_core: float = 25.0
+    mm_multicast_read_gbps_per_core: float = 10.0
+    # Most multiply-accumulates per operand element for which the stream bound
+    # applies: the measured P@V reuses its value cache 2x (one GQA group). A
+    # prefill or encoder GEMM reuses its weight across 64+ rows and hides the
+    # read behind compute; charging it the stream bound made gpt2 prefill and
+    # granite-embedding-125m 45-68% slower on device.
+    mm_reused_read_max_reuse: int = 8
     # DEFAULT-LAYOUT BMM slow compute rate (cat 4). A batched matmul whose BOTH rank-3
     # operands carry the COMPILER-DEFAULT [0,1,2] device tile order -- the batch dim B
     # sits just inside the stick (device pos -2) -- runs the systolic array at a much
@@ -1616,6 +1636,64 @@ def _owned_total(charges) -> float:
         else:
             total += value
     return total + sum(external.values())
+
+
+def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
+    """Extra time when too few cores stream a reused matmul operand.
+
+    The complement of ``_partitioned_operand_read_excess`` (``matmul_macs >
+    elems``): each core reads ``bytes * replication / cores`` of the operand, at
+    ``mm_reused_read_gbps_per_core``, or ``mm_multicast_read_gbps_per_core``
+    when a split that the operand does not index (``replication > 1``) shares
+    the slice among cores through one broadcast load. Only the excess over the
+    operand's shared-peak charge is added, after compute overlap, so divisions
+    whose slices are small cost nothing extra. Only operands reused by at most
+    ``mm_reused_read_max_reuse`` multiply-accumulates per element (decode-sized
+    row counts), whose reads cannot hide behind compute. A replicated operand that is not
+    a shared load keeps ``_replicated_operand_reads``. Single-pass bundles only
+    (``_is_single_pass``). With symbolic splits each read is one
+    :class:`ResidencyGatedPrice` over the op's splits.
+    """
+    unicast, multicast = (
+        p.mm_reused_read_gbps_per_core,
+        p.mm_multicast_read_gbps_per_core,
+    )
+    if unicast <= 0 or multicast <= 0 or not all(_is_single_pass(op) for op in ops):
+        return 0.0
+    total = 0.0
+    for op in ops:
+        if not op.is_matmul:
+            continue
+        for arg in op.args:
+            if (
+                arg.role != "input"
+                or _is_sym(op.matmul_macs, arg.elems)
+                or not op.matmul_macs > arg.elems > 0
+                or op.matmul_macs > p.mm_reused_read_max_reuse * arg.elems
+            ):
+                continue
+            nbytes = arg.elems * op.dtype_bytes
+            replication = sympy.sympify(arg.replication)
+            if replication.is_number and replication != 1 and not arg.broadcast:
+                continue
+            per_core = nbytes * replication / op.cores
+            if replication.is_number:
+                rate = multicast if replication > 1 else unicast
+                price = per_core / rate - nbytes / p.bw_peak_gbps
+            else:
+                shared = per_core / multicast if arg.broadcast else 0
+                price = (
+                    sympy.Piecewise(
+                        (per_core / unicast, sympy.Eq(replication, 1)), (shared, True)
+                    )
+                    - nbytes / p.bw_peak_gbps
+                )
+            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
+            if isinstance(price, sympy.Basic) and price.free_symbols:
+                total += ResidencyGatedPrice(is_lx, sympy.Max(0, price))
+            else:
+                total += (1 - is_lx) * max(0.0, float(price))
+    return total
 
 
 def _loop_reread_bytes(ops: list) -> float:
@@ -2557,10 +2635,15 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
     An HBM->LX read is issued in bursts of up to ``transport_dma_max_burst_words``
     sticks, each ending at the core's contiguous run (``read_run_bytes``): a
     split on an inner axis or a stride gap shortens it. Burst 32 reaches the
-    shared byte rate; burst 1 issues one request per stick. Uses the transport
-    term's calibrated aggregate ``transport_dma_ns_per_request``, and charges
-    only the time by which requests exceed the byte charge. Transport ops keep
-    ``_transport_dma_excess_ns``; replicated per-core loads keep
+    shared byte rate; burst 1 issues one request per stick. Priced by the
+    transport request law (``_dma_request_excess_ns``) as a compute read, which
+    charges only the time by which requests exceed the byte charge. A core
+    count the table was not calibrated at (3, 6, 12, 24 cores of a 12-head
+    split) takes the rate of the largest calibrated count below it
+    (``_transport_rate_cores``): pricing those counts at zero made them the
+    cheapest short-burst reads, and gpt2's decode P@V took a 12-way head split
+    (one stick per run) that runs 40 us against 14 us on device. Transport ops
+    keep ``_transport_dma_excess_ns``; replicated per-core loads keep
     ``_replicated_operand_reads``. Proven looped-matmul geometry uses
     ``_loop_operand_request_excess`` instead, which composes requests with
     delivery and counts shared inputs once. An unproven run adds nothing.
@@ -2590,47 +2673,9 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
             payload = arg.elems * op.dtype_bytes
             if payload <= 0:
                 continue
-            requests = sympy.piecewise_fold(payload / sympy.sympify(run))
-            min_requests = math.ceil(
-                payload / (p.transport_dma_word_bytes * p.transport_dma_max_burst_words)
+            excess = _dma_request_excess_ns(
+                payload, run, op.cores, True, p, byte_time=payload / p.bw_peak_gbps
             )
-            max_requests = math.ceil(payload / p.transport_dma_word_bytes)
-            byte_time = payload / p.bw_peak_gbps
-
-            def at_most(value, limit):
-                coefficient, split = value.as_coeff_Mul()
-                if split.is_Symbol and coefficient > 0:
-                    return sympy.Le(split, sympy.floor(limit / coefficient))
-                return sympy.Le(value, limit)
-
-            def for_run(value):
-                branches = []
-                for cores, ns in rates.items():
-                    if ns <= 0:
-                        continue
-                    floor = max(0, min_requests * ns - byte_time)
-                    cap = max(floor, max_requests * ns - byte_time)
-                    if not isinstance(value, sympy.Basic) or not value.free_symbols:
-                        v = min(max(float(value), min_requests), max_requests)
-                        priced = max(floor, v * ns - byte_time)
-                    elif floor == cap:
-                        priced = floor
-                    else:
-                        threshold = math.floor((floor + byte_time) / ns)
-                        priced = sympy.Piecewise(
-                            (floor, at_most(value, threshold)),
-                            (value * ns - byte_time, at_most(value, max_requests)),
-                            (cap, True),
-                        )
-                    branches.append((priced, sympy.Eq(op.cores, cores)))
-                return sympy.Piecewise(*branches, (0, True))
-
-            if isinstance(requests, sympy.Piecewise):
-                excess = sympy.Piecewise(
-                    *((for_run(value), condition) for value, condition in requests.args)
-                )
-            else:
-                excess = for_run(requests)
             if not arg.broadcast and replication != 1:
                 # The solver can choose an unreplicated read. Charge its bursts
                 # just as the concrete model does; only replicated per-core
@@ -2876,6 +2921,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         + _loop_repeated_read_excess_ns(ops, p)
         + _read_burst_excess_ns(ops, p)
         + _pointwise_core_excess_ns(ops, p)
+        + _reused_operand_stream_excess_ns(ops, p)
     )
     # Looped matmul operand reads: the request law's part beyond the loop-delivery
     # estimate, serialized like the transport term above (the same law).
@@ -3183,6 +3229,13 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         lines.append(
             f"     loop-repeated reads: +{reread_extra / 1000:.2f} us "
             f"({p.loop_reread_gbps:g} GB/s per repeated pass; after compute overlap)"
+        )
+    reused_extra = _reused_operand_stream_excess_ns(ops, p)
+    if reused_extra:
+        lines.append(
+            f"     reused matmul operand streaming: +{float(reused_extra) / 1000:.2f} us "
+            f"({p.mm_reused_read_gbps_per_core:g} / {p.mm_multicast_read_gbps_per_core:g}"
+            " GB/s per core unicast / multicast; after compute overlap)"
         )
     low_core_extra = _pointwise_core_excess_ns(ops, p)
     if low_core_extra:
