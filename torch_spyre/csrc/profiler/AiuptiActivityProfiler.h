@@ -23,6 +23,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "AiuptiProfilerMacros.h"
@@ -94,6 +95,7 @@ class AiuptiActivityProfilerSession
   int64_t profilerStartTs_{0};
   int64_t profilerEndTs_{0};
   std::unordered_map<int64_t, int64_t> cpuCorrelationMap_;
+  std::unordered_set<uint32_t> deviceActivityIds_;
   std::unordered_map<int64_t, int64_t> userCorrelationMap_;
   std::unordered_map<int64_t, const libkineto::ITraceActivity*>
       correlatedPtiActivities_;
@@ -115,7 +117,8 @@ class AiuptiActivityProfilerSession
   bool hasDeviceResource(uint32_t device, uint32_t id);
   void recordStream(uint32_t device, uint32_t id);
   void recordMemoryStream(uint32_t device, uint32_t id, std::string kind);
-  void recordThreadStream(uint32_t device, uint32_t id);
+  void recordThreadStream(uint32_t device, uint32_t id,
+                          const std::string& name);
 
   int64_t totalAllocatedBytes_{0};
 };

@@ -15,12 +15,13 @@
 """
 Spyre profiling package.
 
-FFDC retrieval is the public API on this package
-(``get_diagnostic_report``, also bound as ``torch.spyre.get_diagnostic_report``).
-Device-side timing uses upstream ``torch.profiler``. Device presence is
+Public APIs include FFDC retrieval (``get_diagnostic_report``, also bound as
+``torch.spyre.get_diagnostic_report``) and ``export_chrome_trace``, which adds
+CPU-to-submission flows to an upstream ``torch.profiler`` capture. Device presence is
 ``torch.spyre.is_available()``, not a flag on this package.
 """
 
 from torch_spyre.profiler._ffdc import get_diagnostic_report
+from torch_spyre.profiler._trace import export_chrome_trace
 
-__all__ = ["get_diagnostic_report"]
+__all__ = ["export_chrome_trace", "get_diagnostic_report"]
