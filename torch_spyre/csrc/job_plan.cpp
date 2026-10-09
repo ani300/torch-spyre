@@ -115,6 +115,7 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
   }
   auto* params = flex::createComputeParams(
       &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
+  params->program_corrections = std::move(ctx.program_corrections);
   params->pipeline_barrier = pipeline_barrier_;
   stream.launchCompute(params);
   flex::destroyComputeParams(params);
@@ -192,6 +193,13 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // Enforce that the host buffer correction size matches the expected device
   // allocation size.
   TORCH_DCHECK_EQ(host_buffer->size(), device_address_.total_size());
+
+  if (ctx.batch_program_corrections) {
+    ctx.program_corrections.push_back(
+        {std::move(host_buffer), std::make_shared<flex::CompositeAddress>(
+                                     device_address_.clone_non_owning())});
+    return;
+  }
 
   // Create DmaParams to transfer the host buffer.
   auto* dma_params =

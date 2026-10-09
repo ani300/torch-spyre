@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 The Torch-Spyre Authors.
+ * Copyright 2026 The Torch-Spyre Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,9 +22,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -313,6 +315,15 @@ void SpyreStream::launch(const JobPlan& plan,
   // JobPlanStepHostCompute::construct can capture it by value without an extra
   // copy.
   LaunchContext ctx{args, std::move(symbolic_args)};
+  const char* batch_corrections =
+      std::getenv("TORCH_SPYRE_VF_BATCH_CORRECTIONS");
+  ctx.batch_program_corrections = batch_corrections != nullptr &&
+                                  std::string_view(batch_corrections) == "1";
+  if (ctx.batch_program_corrections) {
+    TORCH_CHECK(GlobalRuntime::get()->getDeviceHandle()->GetType() ==
+                    flex::DeviceTypes::VF,
+                "TORCH_SPYRE_VF_BATCH_CORRECTIONS requires VF");
+  }
 
   // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
   // then inserts the cross-stream edges. Off = every step on S_dev (the
@@ -323,6 +334,8 @@ void SpyreStream::launch(const JobPlan& plan,
         (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
     step->construct(ctx, target);
   }
+  TORCH_CHECK(ctx.program_corrections.empty(),
+              "Program correction has no consuming compute step");
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
