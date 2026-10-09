@@ -330,13 +330,12 @@ allow_exhaustive_search: bool = os.environ.get("ALLOW_EXHAUSTIVE_SEARCH", "0") =
 
 # Wall-clock budget for one CP-SAT solve, in seconds. This applies to the cost
 # objective or to each phase of the fallback lexicographic objective, not the
-# whole compilation. Large-model cost objectives can need tens of minutes to
-# prove optimality even after finding their final incumbent much earlier.
-# A timeout can return a merely feasible plan; without an incumbent it raises
-# SolveError and scratchpad_planning falls back to greedy placement. A finite
-# limit does not guarantee optimality for every graph; 0 disables the limit.
+# whole compilation. A timeout can return a feasible plan without proving
+# optimality; without an incumbent it raises SolveError and scratchpad_planning
+# falls back to greedy placement. Override for difficult graphs; 0 disables
+# the limit.
 cpsat_time_limit_seconds: float = float(
-    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "3600")
+    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")
 )
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
