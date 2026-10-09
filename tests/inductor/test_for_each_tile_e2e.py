@@ -59,6 +59,7 @@ import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
@@ -199,35 +200,6 @@ class TestForEachTileE2E(_DynamoResetTestCase):
     ATOL = 1e-2
     RTOL = 1e-2
 
-    def test_computed_where_condition_in_broadcast_tile(self):
-        from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
-        from torch_spyre.ops.fallbacks import FallbackWarning
-
-        def tiled_where(x):
-            def body(accum, tiles):
-                (tile,) = tiles
-                selected = (tile > 0) & (tile < 3)
-                values = tile[None, None]
-                return accum + torch.where(selected, values, -values), None
-
-            result, _ = for_each_tile(
-                body,
-                (x,),
-                dims=(0,),
-                tile_size=64,
-                init=x.new_zeros((1, 1, 64, 128)),
-            )
-            return result
-
-        x = (torch.arange(192 * 128) % 7 - 3).half().reshape(192, 128)
-        expected = torch.where((x > 0) & (x < 3), x, -x)
-        expected = expected.reshape(3, 1, 1, 64, 128).sum(0)
-        with torch.inference_mode(), warnings.catch_warnings():
-            warnings.simplefilter("error", FallbackWarning)
-            compiled = torch.compile(tiled_where, fullgraph=True, dynamic=False)
-            actual = compiled(x.to(DEVICE_NAME)).cpu()
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
     def test_scatter_carry_runtime_indices_and_preserved_initializer(self):
         from torch._dynamo.utils import counters
 
@@ -248,6 +220,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
             )
             with (
                 self.subTest(rows=rows, inner=inner, transpose_source=transpose_source),
+                spyre_config.patch(backend_loop_unroll=False),
                 warnings.catch_warnings(),
                 torch.inference_mode(),
             ):
@@ -294,6 +267,35 @@ class TestForEachTileE2E(_DynamoResetTestCase):
                         self.assertEqual(counters["stats"]["unique_graphs"], before)
                     torch.testing.assert_close(actual, expected, atol=0.005, rtol=0.02)
                     torch.testing.assert_close(inputs[2].cpu(), initial, atol=0, rtol=0)
+
+    def test_computed_where_condition_in_broadcast_tile(self):
+        from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        def tiled_where(x):
+            def body(accum, tiles):
+                (tile,) = tiles
+                selected = (tile > 0) & (tile < 3)
+                values = tile[None, None]
+                return accum + torch.where(selected, values, -values), None
+
+            result, _ = for_each_tile(
+                body,
+                (x,),
+                dims=(0,),
+                tile_size=64,
+                init=x.new_zeros((1, 1, 64, 128)),
+            )
+            return result
+
+        x = (torch.arange(192 * 128) % 7 - 3).half().reshape(192, 128)
+        expected = torch.where((x > 0) & (x < 3), x, -x)
+        expected = expected.reshape(3, 1, 1, 64, 128).sum(0)
+        with torch.inference_mode(), warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            compiled = torch.compile(tiled_where, fullgraph=True, dynamic=False)
+            actual = compiled(x.to(DEVICE_NAME)).cpu()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     @staticmethod
     def _operands():
