@@ -17,12 +17,14 @@ import math
 import os
 import platform
 import sys
+import warnings
 import pytest
 import unittest
 import torch
 import torch.nn.functional as F
 
 
+from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
     ParameterizedTestMeta,
     _compile_and_run,
@@ -7621,18 +7623,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, dst, src, run_eager=False)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_cpu(self, x):
+        """
+        Verify that cumsum executes via the CPU fallback path and emits
+        FallbackWarning. Also verifies numerical correctness via compare_with_cpu.
+        """
+
         def fn(t):
-            t = torch.exp(t)  # compiled op
+            t = torch.exp(t)
             t = torch.cumsum(t.clamp(-1, 1), dim=-1)  # fallback op (aten.cumsum)
-            t = torch.exp(t.clamp(-1, 1))  # compiled op (clamp keeps exp safe)
+            t = torch.exp(t.clamp(-1, 1))
             return t
 
-        with pytest.warns(UserWarning) as record:
-            self.compare_with_cpu(fn, x, cpu_compile=True)
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            self.compare_with_cpu(fn, x, cpu_compile=True, run_eager=False)
 
-        print(f"Warn {len(record)}")
+        fallback_warnings = [
+            w
+            for w in captured
+            if issubclass(w.category, FallbackWarning)
+            and "aten.cumsum" in str(w.message)
+        ]
+        assert len(fallback_warnings) > 0, (
+            f"Expected FallbackWarning for cumsum (CPU fallback path). "
+            f"All captured: {[str(w.message) for w in captured]}"
+        )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_arange_cpu(self, *args):
