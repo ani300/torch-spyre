@@ -32,8 +32,9 @@ if TYPE_CHECKING:
 import torch
 import torch._prims_common as utils
 from torch._higher_order_ops.scan import scan, scan_op
+from torch._higher_order_ops.utils import check_input_alias_and_mutation_return_outputs
 from torch._subclasses.fake_tensor import FakeTensor
-from torch.fx.experimental import proxy_tensor
+from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch.utils._pytree import tree_flatten, tree_leaves, tree_unflatten
 
 __all__ = ["Gather", "for_each_tile"]
@@ -93,6 +94,38 @@ class TileSpec:
 DimSpec = Union[int, None, Gather]  # noqa: UP007  # `int | None | Gather` needs Gather at runtime
 
 
+def _check_combine_graph(gm: torch.fx.GraphModule, name: str) -> None:
+    """Reject a traced ``for_each_tile`` body that ``scan`` cannot run as-is.
+
+    Dynamo checks a ``scan`` body when it traces the call, and functionalization
+    when it dispatches the HOP. A decomposition reaches neither, so
+    ``_scan_in_make_fx`` checks the graph ``scan_op`` has just registered instead,
+    without tracing the body again.
+
+    Inputs may share a storage, such as K and V split from one QKV projection.
+    ``trace_scan`` traces on clones, so the graph shows no input-input aliasing,
+    and since no input may be written, a shared storage is only ever read.
+    """
+    for node in gm.graph.find_nodes(op="get_attr"):
+        if isinstance(getattr(gm, node.target, None), FakeTensor):
+            raise RuntimeError(
+                "for_each_tile() body closes over a traced tensor, which would "
+                f"be baked into {name} as the constant {node.target}; pass it "
+                "as an operand (dims=None) instead"
+            )
+    _, inp_out, out_out, mutated, _ = check_input_alias_and_mutation_return_outputs(gm)
+    if inp_out or out_out:
+        raise RuntimeError(
+            f"for_each_tile() body in {name} returns an input, a view of one, or the "
+            "same tensor twice, which scan does not support; return a clone instead"
+        )
+    if mutated:
+        raise RuntimeError(
+            f"for_each_tile() body in {name} writes to an input in place, which "
+            "scan does not support; write to a new tensor instead"
+        )
+
+
 def _scan_in_make_fx(step, init, xs, lifted, reverse):
     """Emit the ``scan`` HOP straight into the active make_fx trace.
 
@@ -107,8 +140,8 @@ def _scan_in_make_fx(step, init, xs, lifted, reverse):
     Unlike Dynamo, make_fx does not lift closures: a tensor ``step`` reads from an
     enclosing trace would be baked into the subgraph as a constant. Every operand
     read whole each step is therefore passed in ``lifted`` as an
-    ``additional_input``, and a body that still closes over a traced tensor is
-    rejected below.
+    ``additional_input``, and ``_check_combine_graph`` rejects a body that still
+    closes over a traced tensor.
     """
     leaves_init, spec_init = tree_flatten(init)
     leaves_xs, spec_xs = tree_flatten(xs)
@@ -125,21 +158,12 @@ def _scan_in_make_fx(step, init, xs, lifted, reverse):
         y_spec[:] = [spec]
         return [*tree_leaves(next_carry), *y_leaves]
 
-    root = proxy_tensor._CURRENT_MAKE_FX_TRACER.fx_tracer.root
-    known = {name for name, _ in root.named_children()}
+    tracer = get_proxy_mode().tracer
     flat_out = scan_op(flat_step, leaves_init, leaves_xs, tuple(lifted))
-    for name, gm in root.named_children():
-        if name in known or not isinstance(gm, torch.fx.GraphModule):
-            continue
-        for node in gm.graph.nodes:
-            if node.op == "get_attr" and isinstance(
-                getattr(gm, node.target, None), FakeTensor
-            ):
-                raise RuntimeError(
-                    "for_each_tile() body closes over a traced tensor, which would "
-                    f"be baked into {name} as the constant {node.target}; pass it "
-                    "as an operand (dims=None) instead"
-                )
+    # trace_scan has just appended this node; its first argument is the body graph.
+    scan_node = next(n for n in reversed(tracer.graph.nodes) if n.target is scan_op)
+    name = scan_node.args[0].target
+    _check_combine_graph(getattr(tracer.root, name), name)
 
     final_carry = tree_unflatten(list(flat_out[:num_init]), spec_init)
     ys = list(flat_out[num_init:])
@@ -422,10 +446,7 @@ def for_each_tile(
         return next_carry, (() if out_dim is None else y)
 
     lifted = [operands[i] for i in lifted_idx]
-    if (
-        not torch.compiler.is_dynamo_compiling()
-        and proxy_tensor._CURRENT_MAKE_FX_TRACER is not None
-    ):
+    if not torch.compiler.is_dynamo_compiling() and get_proxy_mode() is not None:
         # Reached from an AOT decomposition: trace the HOP without Dynamo.
         final_carry, ys = _scan_in_make_fx(step_fn, scan_init, xs, lifted, reverse)
     else:
