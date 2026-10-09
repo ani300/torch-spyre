@@ -126,7 +126,7 @@ def _check_combine_graph(gm: torch.fx.GraphModule, name: str) -> None:
         )
 
 
-def _scan_in_make_fx(step, init, xs, lifted, reverse):
+def _scan_in_make_fx(combine_fn, init, xs, lifted, reverse):
     """Emit the ``scan`` HOP straight into the active make_fx trace.
 
     ``scan()`` called outside Dynamo re-enters ``torch.compile``. A
@@ -135,11 +135,11 @@ def _scan_in_make_fx(step, init, xs, lifted, reverse):
     levels each on CPython 3.12), on top of the outer compile's stack. CPython
     caps the C budget at 800 on s390x, so a GQA SDPA nest raises
     ``RecursionError`` there. Under make_fx, ``scan_op``'s proxy-mode rule traces
-    ``step`` itself, at ~16 levels per nest level, so skip Dynamo.
+    ``combine_fn`` itself, at ~16 levels per nest level, so skip Dynamo.
 
-    Unlike Dynamo, make_fx does not lift closures: a tensor ``step`` reads from an
-    enclosing trace would be baked into the subgraph as a constant. Every operand
-    read whole each step is therefore passed in ``lifted`` as an
+    Unlike Dynamo, make_fx does not lift closures: a tensor ``combine_fn`` reads
+    from an enclosing trace would be baked into the subgraph as a constant. Every
+    operand read whole each step is therefore passed in ``lifted`` as an
     ``additional_input``, and ``_check_combine_graph`` rejects a body that still
     closes over a traced tensor.
     """
@@ -150,16 +150,16 @@ def _scan_in_make_fx(step, init, xs, lifted, reverse):
     num_init, num_xs = len(leaves_init), len(leaves_xs)
     y_spec = []
 
-    def flat_step(*args):
+    def flat_combine_fn(*args):
         carry = tree_unflatten(list(args[:num_init]), spec_init)
         sliced = tree_unflatten(list(args[num_init : num_init + num_xs]), spec_xs)
-        next_carry, y = step(carry, sliced, args[num_init + num_xs :])
+        next_carry, y = combine_fn(carry, sliced, args[num_init + num_xs :])
         y_leaves, spec = tree_flatten(y)
         y_spec[:] = [spec]
         return [*tree_leaves(next_carry), *y_leaves]
 
     tracer = get_proxy_mode().tracer
-    flat_out = scan_op(flat_step, leaves_init, leaves_xs, tuple(lifted))
+    flat_out = scan_op(flat_combine_fn, leaves_init, leaves_xs, tuple(lifted))
     # trace_scan has just appended this node; its first argument is the body graph.
     scan_node = next(n for n in reversed(tracer.graph.nodes) if n.target is scan_op)
     name = scan_node.args[0].target
@@ -424,7 +424,7 @@ def for_each_tile(
     # Operands every step reads whole: invariants, and the pools Gather rows index.
     lifted_idx = [i for i, s in enumerate(specs) if s.kind is not Kind.SLICE]
 
-    def step_fn(carry, sliced, lifted):
+    def combine_fn(carry, sliced, lifted):
         # In map mode, the step counter is the whole carry.
         if count_mode:
             step, carry = carry
@@ -448,7 +448,7 @@ def for_each_tile(
     lifted = [operands[i] for i in lifted_idx]
     if not torch.compiler.is_dynamo_compiling() and get_proxy_mode() is not None:
         # Reached from an AOT decomposition: trace the HOP without Dynamo.
-        final_carry, ys = _scan_in_make_fx(step_fn, scan_init, xs, lifted, reverse)
+        final_carry, ys = _scan_in_make_fx(combine_fn, scan_init, xs, lifted, reverse)
     else:
         # specialize_float: a Python float closed over by the body
         # is generalized to a SymFloat and scan_op's validate_subgraph_args_types
@@ -462,7 +462,7 @@ def for_each_tile(
         )
         with ctx:
             final_carry, ys = scan(
-                lambda carry, sliced: step_fn(carry, sliced, lifted),
+                lambda carry, sliced: combine_fn(carry, sliced, lifted),
                 scan_init,
                 xs,
                 dim=0,
