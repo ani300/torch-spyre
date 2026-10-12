@@ -123,6 +123,19 @@ out as a tile scan is left for the upstream default path.
 
 Once stickification has run, every `ComputedBuffer` carries a `FixedTiledLayout`, so the later passes can take device layout into account when making decisions.
 
+Padding-copy masks pin only unaligned stick axes during work division. Other
+axes can still be divided across cores. A large copy with no other splittable
+axis therefore runs on one core, even if only a small tail needs masking.
+This can reduce copy parallelism; lifting the restriction requires support
+for masking across core splits or a padding-aware layout representation.
+
+The mask uses the same DL16 fill value as an ordinary device constant. An
+exact finite fill such as `3.5` is preserved in both FP16 and BF16. On the
+DL16 path, a requested `-inf` fill reads back as `-inf` in FP16 and as the
+finite saturation value `-2**32` in BF16. The latter still underflows to zero
+through softmax's exponential for the tested finite logits; it is not a
+general guarantee that IEEE infinities survive BF16 device round trips.
+
 For deeper treatment of individual passes see [Working Set Reduction](working_set_reduction.md), [Coarse-Tiling Loops](coarse_tiling_loops.md), [Work Division Planning](work_division_planning.md), and [Scratchpad Planning](scratchpad_planning.md).
 
 ### Views and Index Translation

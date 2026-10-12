@@ -3138,13 +3138,6 @@ def lower_pad_sequence(
     # Collect all newly added operations (appended at the end of graph.operations).
     new_ops = graph_lowering.operations[ops_before:]
 
-    # The input copy can round its final stick beyond the logical input and
-    # overwrite the padding filled just before it. Carry the fill value to
-    # codegen so that copy masks its unused input lanes, including when a
-    # preceding restickify populated them from uninitialized scratch storage.
-    if dtype in (torch.float16, torch.bfloat16):
-        setattr(new_ops[-1], "_spyre_pad_copy_value", fill_value)
-
     assert new_ops[0] == padded_buf
 
     # LX planning (scratchpad.py) accesses op.origin_node directly on the
@@ -3167,6 +3160,19 @@ def lower_pad_sequence(
         and isinstance(new_ops[3], ComputedBuffer)
         and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
     )
+
+    # Verify the mutation's role before marking it: the padding fill is also
+    # a ComputedBuffer with a mutation layout, but reads the fill constant.
+    if dtype in (torch.float16, torch.bfloat16):
+        source = arg_buf if arg_buf is not None else graph_lowering.env[arg_fx_node]
+        copy_op = new_ops[3]
+        assert set(copy_op.get_read_names()) == {source.get_name()}, (
+            "lower_pad_sequence: expected the final mutation to copy "
+            f"{source.get_name()!r}, got reads {copy_op.get_read_names()}"
+        )
+        # Rounded copies must preserve the fill in unused lanes, including
+        # when a preceding restickify read uninitialized scratch storage.
+        setattr(copy_op, "_spyre_pad_copy_value", fill_value)
 
     if orig_stl is None:
         # Pre-stickification: leave host FixedLayouts in place for
