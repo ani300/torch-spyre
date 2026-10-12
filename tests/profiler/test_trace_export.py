@@ -12,82 +12,160 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
+"""Exercise ordinary torch.profiler export through the native Spyre session."""
+
 import gzip
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
-from torch_spyre.profiler._trace import _add_submission_flows, export_chrome_trace
 
-
-def _event(name, category, pid, tid, ts, external_id, batch=None):
-    return {
-        "ph": "X",
-        "name": name,
-        "cat": category,
-        "pid": pid,
-        "tid": tid,
-        "ts": ts,
-        "dur": 2,
-        "args": {"External id": external_id, "correlation": batch},
-    }
-
-
-def test_submission_flows_follow_ids_across_threads_and_batches():
-    launch = _event("launch::H2D", "cpu_op", 10, 11, 100, 2**40)
-    unrelated = _event("launch::Compute", "cpu_op", 10, 11, 119, 20)
-    other_rank = _event("launch::H2D", "cpu_op", 20, 21, 90, 2**40)
-    submit1 = _event(
-        "aiuSubmitToHardware", "privateuse1_runtime", 10, 12, 120, 2**40, 1
+@pytest.fixture(scope="module")
+def native_traces(tmp_path_factory):
+    if os.environ.get("USE_SPYRE_PROFILER", "1") == "0":
+        pytest.skip("Spyre profiler support is disabled")
+    if not os.environ.get("RUNTIME_INSTALL_DIR"):
+        pytest.skip("Requires the native build environment (RUNTIME_INSTALL_DIR)")
+    output = tmp_path_factory.mktemp("native_spyre_trace")
+    env = dict(os.environ, TORCH_DEVICE_BACKEND_AUTOLOAD="0", MAX_JOBS="4")
+    # An isolated process avoids backend auto-init and scopes the synthetic
+    # Kineto child profiler to these CPU-only tests.
+    subprocess.run(
+        [sys.executable, __file__, str(output)], env=env, check=True, timeout=300
     )
-    submit2 = _event(
-        "aiuSubmitToHardware", "privateuse1_runtime", 10, 12, 125, 2**40, 2
-    )
-    orphan = _event("aiuSubmitToHardware", "privateuse1_runtime", 10, 12, 130, 777, 3)
-    native_flow = {"ph": "s", "cat": "ac2g", "name": "ac2g", "id": 1}
-    original = [launch, unrelated, other_rank, submit1, submit2, orphan, native_flow]
-    snapshot = copy.deepcopy(original)
-    trace = {"traceEvents": original, "baseTimeNanoseconds": 42}
-    _add_submission_flows(trace)
-    assert trace["traceEvents"][: len(original)] == snapshot
-    flows = trace["traceEvents"][len(original) :]
-    assert [(e["ph"], e["ts"], e["tid"]) for e in flows] == [
-        ("s", 100, 11),
-        ("f", 120, 12),
-        ("s", 100, 11),
-        ("f", 125, 12),
-    ]
-    assert flows[0]["id"] == flows[1]["id"] != flows[2]["id"] == flows[3]["id"]
-    assert trace["spyre_submission_links"]["submissions_without_unique_cpu_source"] == 1
-    once = copy.deepcopy(trace)
-    _add_submission_flows(trace)
-    assert trace == once
+    return output
 
 
-def test_ambiguous_cpu_id_is_not_guessed():
-    event = _event("launch::Compute", "cpu_op", 1, 2, 100, 7)
-    submit = _event("aiuSubmitToHardware", "privateuse1_runtime", 1, 3, 120, 7, 9)
-    trace = {"traceEvents": [event, copy.deepcopy(event), submit]}
-    _add_submission_flows(trace)
-    assert len(trace["traceEvents"]) == 3
-    assert trace["spyre_submission_links"]["linked_submissions"] == 0
-
-
-@pytest.mark.parametrize("suffix", [".json", ".json.gz"])
-def test_export_preserves_metadata_and_supports_compression(tmp_path, suffix):
-    trace = {"traceEvents": [], "baseTimeNanoseconds": 1234, "deviceProperties": []}
-
-    class Profiler:
-        def export_chrome_trace(self, path):
-            opener = gzip.open if path.endswith(".gz") else open
-            with opener(path, "wt") as stream:
-                json.dump(trace, stream)
-
-    path = tmp_path / ("trace" + suffix)
-    export_chrome_trace(Profiler(), path)
-    opener = gzip.open if suffix.endswith(".gz") else open
+def _read(path):
+    opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt") as stream:
-        exported = json.load(stream)
-    assert exported["baseTimeNanoseconds"] == 1234
-    assert exported["deviceProperties"] == []
+        return json.load(stream)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "trace.json",
+        "trace.json.gz",
+        "repeat.json",
+        "scheduled-2.json",
+        "scheduled-4.json",
+    ],
+)
+def test_standard_export_contains_both_flow_stages(native_traces, filename):
+    trace = _read(native_traces / filename)
+    events = trace["traceEvents"]
+    spans = [event for event in events if event.get("ph") == "X"]
+    cpu = next(event for event in spans if event["name"] == "test_cpu_origin")
+    markers = [event for event in spans if event["name"] == "aiuCpuLaunch"]
+    submits = [event for event in spans if event["name"] == "aiuSubmitToHardware"]
+    launches = [event for event in spans if event["name"] == "aiuLaunchControlBlocks"]
+    kernels = [event for event in spans if event["name"] == "synthetic_kernel"]
+    assert len(markers) == len(launches) == len(kernels) == 2
+    assert len(submits) == 6
+    assert all(event["dur"] == 5 for event in submits)
+    assert all(event["dur"] == 2 for event in kernels)
+    assert all(event["dur"] == 0 for event in markers)
+    assert all(
+        (event["pid"], event["tid"], event["ts"]) == (cpu["pid"], cpu["tid"], cpu["ts"])
+        for event in markers
+    )
+    assert {event["args"]["correlation"] for event in markers} == {7, 8}
+    flows = {}
+    for event in events:
+        if event.get("ph") in ("s", "f") and event.get("cat") == "ac2g":
+            flows.setdefault(event["id"], []).append(event)
+    assert len(flows) == 4
+    for flow_id, endpoints in flows.items():
+        assert len(endpoints) == 2
+        start = next(event for event in endpoints if event["ph"] == "s")
+        finish = next(event for event in endpoints if event["ph"] == "f")
+        assert start["ts"] <= finish["ts"]
+        source_spans, target_spans = (
+            (markers, submits) if flow_id > 2**32 else (launches, kernels)
+        )
+        for endpoint, candidates in ((start, source_spans), (finish, target_spans)):
+            assert any(
+                (endpoint["pid"], endpoint["tid"], endpoint["ts"])
+                == (candidate["pid"], candidate["tid"], candidate["ts"])
+                for candidate in candidates
+            )
+    # Wide, missing, cross-process and calibration origins produce no CPU flow.
+    wide = next(event for event in submits if event["args"]["correlation"] == 10)
+    assert wide["args"]["external_correlation"] > 2**40
+    assert "External id" not in wide["args"]
+    assert "spyre_submission_links" not in trace
+
+
+def _capture_native_traces(output):
+    import torch
+    from torch.utils.cpp_extension import load
+
+    root = Path(__file__).resolve().parents[2]
+    csrc = root / "torch_spyre/csrc"
+    runtime = Path(os.environ["RUNTIME_INSTALL_DIR"])
+    aiupti = Path(os.environ.get("LIBAIUPTI_INSTALL_DIR") or runtime)
+    external = Path(os.environ.get("SHARED_DEPS_DIR", csrc / "external"))
+    fixture = load(
+        name="spyre_native_trace_fixture",
+        sources=[
+            str(Path(__file__).with_name("native_trace_fixture.cpp")),
+            *(
+                str(csrc / "profiler" / name)
+                for name in (
+                    "AiuptiActivityApi.cpp",
+                    "AiuptiActivityProfiler.cpp",
+                    "AiuptiActivityHandlers.cpp",
+                )
+            ),
+            str(csrc / "kernel_provenance_registry.cpp"),
+        ],
+        extra_include_paths=[
+            str(csrc),
+            str(csrc / "profiler"),
+            str(runtime / "include"),
+            str(aiupti / "include"),
+            str(external / "nlohmann/include"),
+            str(Path(torch.__file__).parent / "include/kineto"),
+        ],
+        extra_cflags=[
+            "-std=c++20",
+            "-O0",
+            "-DHAS_AIUPTI",
+            "-DUSE_KINETO",
+            "-DFMT_HEADER_ONLY",
+        ],
+        extra_ldflags=[
+            f"-L{runtime / 'lib'}",
+            "-lflex",
+            f"-L{aiupti / 'lib'}",
+            "-laiupti",
+        ],
+    )
+    fixture.register_profiler()
+    for filename in ("trace.json", "trace.json.gz", "repeat.json"):
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        ) as prof:
+            fixture.emit_batches()
+        prof.export_chrome_trace(str(output / filename))
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=2),
+        on_trace_ready=lambda p: p.export_chrome_trace(
+            str(output / f"scheduled-{p.step_num}.json")
+        ),
+    ) as prof:
+        for _ in range(4):
+            if prof.current_action == torch.profiler.ProfilerAction.RECORD_AND_SAVE:
+                fixture.emit_batches()
+            prof.step()
+
+
+if __name__ == "__main__":
+    _capture_native_traces(Path(sys.argv[1]))

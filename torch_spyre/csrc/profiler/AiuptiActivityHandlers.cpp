@@ -18,6 +18,8 @@
 #include <libaiupti/aiupti_runtime_cbid.h>
 
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <unordered_map>
@@ -28,6 +30,30 @@
 #include "kernel_provenance_registry.h"
 
 namespace KINETO_NAMESPACE {
+
+namespace {
+
+// GenericTraceActivity stores a 32-bit flow ID, but ITraceActivity and Kineto's
+// loggers support 64 bits. Give submission flows their own ID range without
+// changing the batch IDs used by hardware-launch-to-device flows.
+class RuntimeTraceActivity : public libkineto::GenericTraceActivity {
+ public:
+  using GenericTraceActivity::GenericTraceActivity;
+
+  int64_t flowId() const override {
+    return submissionFlowId ? submissionFlowId : GenericTraceActivity::flowId();
+  }
+
+  void log(libkineto::ActivityLogger& logger) const override {
+    // handleGenericActivity copies a GenericTraceActivity and would slice away
+    // the 64-bit flow ID. The session transfers ownership in its trace buffer.
+    logger.handleActivity(*this);
+  }
+
+  int64_t submissionFlowId{0};
+};
+
+}  // namespace
 
 // =========== Session Private Methods ============= //
 void AiuptiActivityProfilerSession::removeCorrelatedPtiActivities(
@@ -78,12 +104,25 @@ inline bool AiuptiActivityProfilerSession::outOfRange(
   return out_of_range;
 }
 
+const libkineto::ITraceActivity*
+AiuptiActivityProfilerSession::linkedCpuActivity(uint64_t externalId) {
+  // Kineto's lookup callback currently accepts int32_t. Preserve wider IDs in
+  // metadata, but never truncate one into a different CPU activity's identity.
+  if (!cpuActivity_ || externalId == 0 ||
+      externalId > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+    return nullptr;
+  }
+  const auto* linked = cpuActivity_(static_cast<int32_t>(externalId));
+  return linked && linked->correlationId() == static_cast<int64_t>(externalId)
+             ? linked
+             : nullptr;
+}
+
 const libkineto::ITraceActivity* AiuptiActivityProfilerSession::linkedActivity(
     int32_t correlationId,
     const std::unordered_map<int64_t, int64_t>& correlationMap) {
   const auto& it = correlationMap.find(correlationId);
-  if (it != correlationMap.end() && cpuActivity_)
-    return cpuActivity_(it->second);
+  if (it != correlationMap.end()) return linkedCpuActivity(it->second);
   return nullptr;
 }
 
@@ -300,15 +339,14 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
   const libkineto::ITraceActivity* linked =
-      activity->external_id && cpuActivity_
-          ? cpuActivity_(activity->external_id)
-          : nullptr;
+      linkedCpuActivity(activity->external_id);
   auto cbIDName =
       runtimeCbidName((AIUpti_runtime_api_trace_cbid)activity->cbid);
-  traceBuffer_.emplace_activity(traceBuffer_.span,
-                                libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
-                                cbIDName);
-  auto& runtime_activity = traceBuffer_.activities.back();
+  auto runtime = std::make_unique<RuntimeTraceActivity>(
+      traceBuffer_.span, libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
+      cbIDName);
+  auto* runtime_activity = runtime.get();
+  traceBuffer_.activities.push_back(std::move(runtime));
   runtime_activity->startTime = activity->start;
   runtime_activity->endTime = activity->end;
   runtime_activity->id = activity->correlation_id;
@@ -348,6 +386,34 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
   runtime_activity->flow.start = flowStart;
   runtime_activity->linked = linked;
   runtime_activity->addMetadata("correlation", activity->correlation_id);
+
+  if (activity->cbid == AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE &&
+      !calibration && linked && linked->deviceId() == activity->process_id &&
+      linked->timestamp() <= runtime_activity->startTime) {
+    const auto flowId = ++nextSubmissionFlowId_;
+    runtime_activity->submissionFlowId = flowId;
+
+    // A CPU op can submit several batches, while each Kineto activity carries
+    // only one flow endpoint. Add a zero-duration marker per batch at the CPU
+    // origin instead of copying or mutating the original CPU activity. Keep it
+    // in the trace buffer so deferred exports retain the endpoint's lifetime.
+    auto source = std::make_unique<RuntimeTraceActivity>(
+        traceBuffer_.span, libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
+        "aiuCpuLaunch");
+    source->startTime = source->endTime = linked->timestamp();
+    source->device = linked->deviceId();
+    source->resource = linked->resourceId();
+    source->threadId = linked->getThreadId();
+    source->id = activity->correlation_id;
+    source->linked = linked;
+    source->submissionFlowId = flowId;
+    source->flow.type = libkineto::kLinkAsyncCpuGpu;
+    source->flow.start = true;
+    source->addMetadata("external_correlation", activity->external_id);
+    source->addMetadata("correlation", activity->correlation_id);
+    traceBuffer_.activities.push_back(std::move(source));
+    traceBuffer_.activities.back()->log(*logger);
+  }
 
   switch ((AIUpti_runtime_api_trace_cbid)activity->cbid) {
     case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE:

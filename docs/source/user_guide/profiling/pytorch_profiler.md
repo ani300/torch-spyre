@@ -79,25 +79,24 @@ for compute-heavy matmul layers.
 ### Export a trace for viewers
 
 ```python
-from torch_spyre.profiler import export_chrome_trace
-
-export_chrome_trace(prof, "spyre_trace.json")
+prof.export_chrome_trace("spyre_trace.json")
 ```
 
-The Spyre exporter adds explicit CPU-launch-to-`aiuSubmitToHardware` flow
-arrows using the external correlation IDs carried through the runtime queue.
-Each submission gets its own edge, including when one CPU operation launches
-multiple batches. Native flows connect the nested `aiuLaunchControlBlocks` (or DMI/DMO launch)
-to the device activity. The exporter
-preserves all activity times and supports `.json.gz` as well as `.json`.
-It reports unmatched submissions in the top-level `spyre_submission_links`
-metadata instead of guessing their CPU origin from timestamps.
+The standard Kineto export includes CPU-to-`aiuSubmitToHardware` flow arrows,
+using external correlation IDs carried through the runtime queue. Each
+submission has a zero-duration `aiuCpuLaunch` marker on its originating CPU
+operation's lane and timestamp. These markers allow one CPU operation to link
+to multiple hardware batches without changing the CPU operation or its timing.
+Separate flows connect the nested `aiuLaunchControlBlocks` (or DMI/DMO launch)
+to the device activity.
 
-`prof.export_chrome_trace(...)` remains available for a native Kineto export;
-it includes correlation metadata and hardware-launch-to-device flows, but does not add
-the extra CPU-to-submit arrows. To export scheduled captures with these arrows,
-use a callback such as
-`on_trace_ready=lambda p: export_chrome_trace(p, f"trace-{p.step_num}.json")`.
+Missing CPU origins, calibration traffic, and correlation IDs that Kineto's
+32-bit lookup cannot represent do not receive CPU-to-submit arrows. The full
+external correlation ID remains in the runtime event metadata. No links are
+inferred from timestamp proximity.
+
+JSON, `.json.gz`, and scheduled exports all use the normal PyTorch API, for
+example `on_trace_ready=lambda p: p.export_chrome_trace(f"trace-{p.step_num}.json")`.
 
 Runtime activities use OS thread IDs, matching PyTorch's CPU lanes. Calibration
 activities share a logical `Spyre calibration (device N)` lane; their
