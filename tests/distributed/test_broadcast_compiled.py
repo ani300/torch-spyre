@@ -18,7 +18,18 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
-from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.testing._internal.common_utils import (
+    TestCase,
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
+
+from utils import (
+    _bfloat16_collective_expected,
+    _bfloat16_rank_input,
+    _native_bfloat16_tensor,
+)
 
 import torch_spyre  # noqa: F401
 
@@ -66,6 +77,7 @@ class BroadcastCompiledModule(torch.nn.Module):
         return torch.ops._c10d_functional.wait_tensor(y)
 
 
+@instantiate_parametrized_tests
 class TestBroadcastCompiled(TestCase):
     @classmethod
     def setUpClass(cls):
@@ -193,6 +205,32 @@ class TestBroadcastCompiled(TestCase):
                 f"Rank {self.comm_rank}: iteration {iteration} incorrect. "
                 f"Expected 10.0, got {result[0].to('cpu').item()}",
             )
+
+    @parametrize("shape", [(128,), (4, 96)])
+    def test_broadcast_compiled_bfloat16(self, shape):
+        def fn(x):
+            x = x * 2.0
+            y = torch.ops._c10d_functional.broadcast(x, self.comm_size - 1, _GROUP_NAME)
+            return torch.ops._c10d_functional.wait_tensor(y) * 0.5
+
+        compiled = torch.compile(fn, fullgraph=True)
+        for _ in range(2):
+            x = _bfloat16_rank_input(self.comm_rank, shape).to(DEVICE)
+            result = compiled(x)
+            self.assertEqual(result.dtype, torch.bfloat16)
+            self.assertEqual(
+                result.cpu(),
+                _bfloat16_collective_expected("broadcast", shape, self.comm_size),
+                rtol=0,
+                atol=0,
+            )
+
+    def test_broadcast_compiled_bfloat16_rejects_non_dl16_storage(self):
+        x = _native_bfloat16_tensor(DEVICE)
+        with self.assertRaisesRegex(
+            RuntimeError, "BF16 collectives require DL16 device storage"
+        ):
+            torch.ops.spyre.broadcast_run(x, -1, 0)
 
 
 if __name__ == "__main__":

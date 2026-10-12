@@ -1218,8 +1218,6 @@ jobs:
             config: distributed_tests/test_allgather_compiled.yaml
           - name: Test Multi-Spyre Allreduce Compiled
             config: distributed_tests/test_allreduce_compiled.yaml
-          - name: Test Multi-Spyre BF16 Collectives
-            config: distributed_tests/test_bfloat16_collectives.yaml
 
     steps:
       # See the `test` job above: prebaked path symlinks the baked .github into

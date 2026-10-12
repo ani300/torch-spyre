@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
 
@@ -68,3 +70,32 @@ def _assert_tensor_equal(
             else:
                 error_msg = f"{message_prefix}: tensors not equal"
             pytest.fail(error_msg)
+
+
+def _bfloat16_rank_input(rank, shape):
+    # Signed powers of two are exact in BF16 and DL16; 2**20 also detects an
+    # unintended conversion through IEEE FP16, whose range is smaller.
+    pattern = torch.tensor(
+        [2.0**20, -(2.0**20), 2.0**-20, -(2.0**-20), 0.5, -0.5, 1.5, -1.5],
+        dtype=torch.bfloat16,
+    )
+    return (pattern.repeat(math.prod(shape) // len(pattern)) * (rank + 1)).reshape(
+        shape
+    )
+
+
+def _bfloat16_collective_expected(op, shape, world_size):
+    if op == "broadcast":
+        return _bfloat16_rank_input(world_size - 1, shape)
+    values = [_bfloat16_rank_input(rank, shape) for rank in range(world_size)]
+    if op == "allgather":
+        return torch.cat(values, dim=0)
+    return torch.stack(values).sum(dim=0)
+
+
+def _native_bfloat16_tensor(device):
+    from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
+
+    # Explicit native BF16 storage must not be reinterpreted as DL16.
+    layout = SpyreTensorLayout([2, 64], [64, 1], DataFormats.BFLOAT16, {(0, 1): 128})
+    return spyre_empty_with_layout([128], [1], torch.bfloat16, layout, device=device)

@@ -17,9 +17,19 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
-from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.testing._internal.common_utils import (
+    TestCase,
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
 
-from utils import _assert_tensor_equal
+from utils import (
+    _assert_tensor_equal,
+    _bfloat16_collective_expected,
+    _bfloat16_rank_input,
+    _native_bfloat16_tensor,
+)
 
 # Skip all tests if RANK is not defined, or WORLD_SIZE is not set or less than 2
 if "RANK" not in os.environ:
@@ -51,6 +61,7 @@ DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
 
+@instantiate_parametrized_tests
 class TestAllGather(TestCase):
     @classmethod
     def setUpClass(cls):
@@ -167,6 +178,32 @@ class TestAllGather(TestCase):
     def test_allgather_2d_tensor_float16_async(self):
         """Test allgather with 2D float16 tensors using async_op=True."""
         self._test_allgather_helper(shape=(4, 64), dtype=torch.float16, async_op=True)
+
+    @parametrize("shape", [(128,), (4, 64)])
+    @parametrize("async_op", [False, True])
+    def test_allgather_bfloat16(self, shape, async_op):
+        x = _bfloat16_rank_input(self.comm_rank, shape).to(DEVICE)
+        outputs = [torch.empty_like(x) for _ in range(self.comm_size)]
+        work = dist.all_gather(outputs, x, async_op=async_op)
+        if async_op:
+            self.assertIsNotNone(work)
+            work.wait()
+        else:
+            self.assertIsNone(work)
+        self.assertEqual(
+            torch.cat([part.cpu() for part in outputs]),
+            _bfloat16_collective_expected("allgather", shape, self.comm_size),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_allgather_bfloat16_rejects_non_dl16_storage(self):
+        x = _native_bfloat16_tensor(DEVICE)
+        with self.assertRaisesRegex(
+            RuntimeError, "BF16 collectives require DL16 device storage"
+        ):
+            outputs = [torch.empty_like(x) for _ in range(self.comm_size)]
+            dist.all_gather(outputs, x)
 
 
 if __name__ == "__main__":

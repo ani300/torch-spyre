@@ -18,7 +18,18 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
-from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.testing._internal.common_utils import (
+    TestCase,
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
+
+from utils import (
+    _bfloat16_collective_expected,
+    _bfloat16_rank_input,
+    _native_bfloat16_tensor,
+)
 
 import torch_spyre  # noqa: F401
 
@@ -70,6 +81,7 @@ class AllGatherCompiledModule(torch.nn.Module):
         return torch.ops._c10d_functional.wait_tensor(y)
 
 
+@instantiate_parametrized_tests
 class TestAllGatherCompiled(TestCase):
     @classmethod
     def setUpClass(cls):
@@ -290,6 +302,34 @@ class TestAllGatherCompiled(TestCase):
                     f"all_gather chunk for rank {rank} incorrect. "
                     f"Expected {float(rank)}, got {chunk[0].item()}",
                 )
+
+    @parametrize("shape", [(128,), (4, 96)])
+    def test_allgather_compiled_bfloat16(self, shape):
+        def fn(x):
+            x = x * 2.0
+            y = torch.ops._c10d_functional.all_gather_into_tensor(
+                x, self.comm_size, _GROUP_NAME
+            )
+            return torch.ops._c10d_functional.wait_tensor(y) * 0.5
+
+        compiled = torch.compile(fn, fullgraph=True)
+        for _ in range(2):
+            x = _bfloat16_rank_input(self.comm_rank, shape).to(DEVICE)
+            result = compiled(x)
+            self.assertEqual(result.dtype, torch.bfloat16)
+            self.assertEqual(
+                result.cpu(),
+                _bfloat16_collective_expected("allgather", shape, self.comm_size),
+                rtol=0,
+                atol=0,
+            )
+
+    def test_allgather_compiled_bfloat16_rejects_non_dl16_storage(self):
+        x = _native_bfloat16_tensor(DEVICE)
+        with self.assertRaisesRegex(
+            RuntimeError, "BF16 collectives require DL16 device storage"
+        ):
+            torch.ops.spyre.allgather_run(x, -1, self.comm_size)
 
 
 if __name__ == "__main__":
