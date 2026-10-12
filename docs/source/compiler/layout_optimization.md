@@ -65,6 +65,20 @@ different stick variables.
 **`AnyInNode`** — used for `clone`, no-ops, constants, and similar. Accepts
 any input at zero cost and introduces no optimization constraints.
 
+**Broadcast into a new stick axis.** A packed input such as routing weights
+`[B, K]` with `B` in the stick cannot directly feed `x * weights[..., None]`
+when `x` has shape `[B, K, H]` and `H` in the stick. For standard DL16 layouts
+(logical FP16 or BF16), the compiler can move `B` outside the stick, leaving
+one scalar per stick for the pointwise operation to broadcast across `H`.
+The target retains the logical `B` extent; the padding pass supplies any
+physical rounding required by the transpose. Short packed axes may use their
+logical extent in the inactive outer-chunk stride.
+
+An explicit `weights[..., None].expand(B, K, H).contiguous()` needs the same
+conversion followed by a broadcast. Such a clone uses `AllSameNode` constraints
+with its fixed contiguous output layout, because a transpose alone cannot
+materialize the repeated lanes.
+
 **Mutation ops.** Mutation ops create additional stick constraints: they have
 two output dependencies — their logical output and the target buffer they write
 into — and both must be committed to the same STL. The optimizer enforces this
