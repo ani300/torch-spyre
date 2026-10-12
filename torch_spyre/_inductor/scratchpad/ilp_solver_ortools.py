@@ -857,6 +857,11 @@ class _SympyExprToCpSat(Printer):
                     return None
                 if not math.isfinite(value):
                     return None
+                # Prices equal in exact arithmetic can come out an ulp apart
+                # along different branches; 12 significant digits makes them
+                # one level (one literal) and moves no price by more than 1e-12
+                # of itself.
+                value = float(f"{value:.12g}")
                 memo[point] = value
             values.append(value)
         return wrapper, values

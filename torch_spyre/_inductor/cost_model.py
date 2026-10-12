@@ -853,7 +853,8 @@ class CostParams:
     # 2-way query split: 104.1 us measured, 103.7 us predicted). Charged in
     # single-pass bundles only, after compute overlap, as the excess over what
     # the read already pays (its shared-peak bytes, cohort penalty and
-    # short-burst excess). 0 disables.
+    # short-burst excess). 0 disables. Fit setup, host and SDK, and the known
+    # mispricings left: #5417.
     mm_stream_gbps_per_core: float = 80.0
     mm_stream_unicast_ns_per_request: float = 7.0
     mm_stream_multicast_ns_per_request: float = 22.0
@@ -861,6 +862,10 @@ class CostParams:
     # and larger operands; a decode GEMM's few-row activation (32 KiB at 8 x 2048)
     # otherwise charged its requests (~0.7 us) and decided a near tie between
     # an 8-row GEMM's 2 x 16 and 32 x 1 splits the wrong way (58.4 / 62.1 us).
+    # 256 KiB is deliberately below the fitted range: it keeps that activation
+    # (8x smaller) out while still pricing operands down to a quarter of the
+    # smallest fitted one. pointwise_core_min_bytes, by contrast, is the size of
+    # its single fitted pass.
     mm_stream_min_bytes: int = 1 << 18
     # Most multiply-accumulates per operand element for which a short run is
     # priced as such; a more reused operand is priced as if read in full bursts.
@@ -1044,6 +1049,7 @@ class CostParams:
     # Granite GQA Lq 1024 scan an 8 MiB output pass picked 1 core or 32 at equal
     # cost and measured 0.36-0.45 ms slower on 1 core; this rate charges its
     # 12 MiB of traffic 0.34 ms. Same rate as store_gbps_per_core; 0 disables.
+    # Fit setup: #5417.
     pointwise_gbps_per_core: float = 30.0
     # Smallest arg, in bytes, the low-core pointwise rate applies to. Measured
     # on that 12 MiB pass only; smaller args keep a division-invariant price.

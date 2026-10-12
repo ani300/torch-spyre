@@ -717,6 +717,51 @@ def test_cpsat_tabulates_the_reused_stream_price_over_the_op_divisions():
     assert float(expr.xreplace({split[d0]: 2, split[d1]: 1, resident: 0})) > 0
 
 
+def test_cpsat_merges_gated_price_levels_an_ulp_apart():
+    """Two divisions whose prices are equal but for float rounding share one
+    level, so they share one gated literal instead of adding one each."""
+    cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.cost_model import ResidencyGatedPrice
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        _CoreDivisionBufferWithCpVars,
+        _SympyExprToCpSat,
+    )
+    from torch_spyre._inductor.scratchpad.plan_solver import (
+        CoreDivision,
+        CoreDivisionBuffer,
+    )
+
+    d0 = sympy.Symbol("d0")
+    buffer = CoreDivisionBuffer(
+        "buf7",
+        ELEMS,
+        [0, 1],
+        core_divisions=[CoreDivision(splits={d0: n}) for n in (1, 2, 4)],
+    )
+    model = cp_model.CpModel()
+    wrapper = _CoreDivisionBufferWithCpVars(
+        buffer=buffer, model=model, capacity_units=ELEMS
+    )
+    split = buffer.sym_core_divs[d0]
+    resident = sympy.Symbol("is_lx_arg7", integer=True, nonnegative=True)
+    # 0.3 along both priced branches in exact arithmetic, an ulp apart in
+    # floats; the branches compute it from the split, as a burst price does.
+    assert 0.1 * 2 + 0.1 != 0.075 * 4
+    price = sympy.Piecewise(
+        (0, split <= 1), (0.1 * split + 0.1, split <= 2), (0.075 * split, True)
+    )
+    sym_map = {
+        resident.name: model.new_bool_var(resident.name),
+        split.name: wrapper.cp_core_divs[d0],
+    }
+    buffer_map = {split.name: (wrapper, wrapper.cp_core_divs_raw[d0])}
+    _SympyExprToCpSat(model, sym_map, buffer_map).convert(
+        ResidencyGatedPrice(resident, price)
+    )
+    gated = [v.name for v in model.proto.variables if v.name.startswith("gated_")]
+    assert len(gated) == 1
+
+
 # ------------------------------------------------- stick-plane run geometry
 
 
