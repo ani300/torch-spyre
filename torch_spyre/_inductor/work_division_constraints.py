@@ -376,16 +376,19 @@ def carried_reduction_pinned_row(
 
 
 def coordinate_mask_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Block reduction stick vars that cannot be split across cores.
+    """Keep masked reduction and padding-copy stick vars on one core.
 
     The backend cannot coordinate-mask a dim spread over cores (mirrors
     ``_get_coordinate_mask`` in codegen/superdsc.py). ``ctx.it_space`` must be
     the element-valued iteration space, since padding is defined on element
     counts.
     """
+    masked_vars = set(ctx.reduction_vars)
+    if hasattr(ctx.op, "_spyre_pad_copy_value"):
+        masked_vars.update(ctx.stick_vars)
     blocked = {
         v
-        for v in ctx.reduction_vars
+        for v in masked_vars
         if v in ctx.stick_vars
         and concretize_expr(ctx.it_space[v]) % ctx.stick_vars[v] != 0
     }

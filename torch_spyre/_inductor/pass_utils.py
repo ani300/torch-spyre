@@ -3138,6 +3138,13 @@ def lower_pad_sequence(
     # Collect all newly added operations (appended at the end of graph.operations).
     new_ops = graph_lowering.operations[ops_before:]
 
+    # The input copy can round its final stick beyond the logical input and
+    # overwrite the padding filled just before it. Carry the fill value to
+    # codegen so that copy masks its unused input lanes, including when a
+    # preceding restickify populated them from uninitialized scratch storage.
+    if dtype in (torch.float16, torch.bfloat16):
+        setattr(new_ops[-1], "_spyre_pad_copy_value", fill_value)
+
     assert new_ops[0] == padded_buf
 
     # LX planning (scratchpad.py) accesses op.origin_node directly on the
