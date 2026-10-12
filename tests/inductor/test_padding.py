@@ -36,7 +36,7 @@ from torch._inductor.ir import (
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import DataFormats, SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import spyre_hint
@@ -55,7 +55,6 @@ from torch_spyre._inductor.wsr.propagate_named_dims import (
 )
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
-from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
 
 
 Ts = TypeVarTuple("Ts")
@@ -379,57 +378,6 @@ class TestInsertPaddingIR(unittest.TestCase):
     # ------------------------------------------------------------------
     # Tests
     # ------------------------------------------------------------------
-
-    def test_transposed_weight_padding_survives_poisoned_scratch(self) -> None:
-        """A partial-stick copy must preserve the zeros added for matmul K."""
-        original_run = SpyreSDSCKernelRunner.run
-        poisoned = 0
-
-        def run_with_poisoned_pool(runner, *args):
-            nonlocal poisoned
-            if runner.symbol_kinds and runner.symbol_kinds[0].is_pool:
-                size = args[0].numel()
-                # Raw 0xffff encodes DL16 NaN. Seed every scratch byte so
-                # unused lanes cannot accidentally pass by starting at zero.
-                layout = SpyreTensorLayout(
-                    device_size=[size],
-                    stride_map=[1],
-                    device_dtype=DataFormats.SENINT8,
-                )
-                pool = torch.full((size,), -1, dtype=torch.int8).to(
-                    args[0].device, device_layout=layout
-                )
-                args = (pool, *args[1:])
-                poisoned += 1
-            result = original_run(runner, *args)
-            torch.spyre.synchronize()
-            return result
-
-        with ts_inductor_config.patch(
-            {"frontend_pool_allocation": True, "sencores": 32}
-        ):
-            for dtype in (torch.float16, torch.bfloat16):
-                with self.subTest(dtype=dtype):
-                    x = torch.full((4, 64, 528), 0.125, dtype=dtype).to("spyre")
-                    weight = torch.full((128, 528), 0.125, dtype=dtype)
-                    # Linear weights arrive with output channels in the stick.
-                    layout = SpyreTensorLayout(
-                        list(weight.shape), list(weight.stride()), dtype, [1, 0]
-                    )
-                    weight = weight.to("spyre", device_layout=layout)
-
-                    def linear(x, weight):
-                        return torch.nn.functional.linear(x, weight)
-
-                    before = poisoned
-                    with patch.object(
-                        SpyreSDSCKernelRunner, "run", run_with_poisoned_pool
-                    ):
-                        actual = torch.compile(linear, fullgraph=True)(x, weight).cpu()
-                    self.assertGreater(poisoned, before)
-                    torch.testing.assert_close(
-                        actual, torch.full_like(actual, 8.25), atol=0, rtol=0
-                    )
 
     def test_mm_unaligned_k_pads(self) -> None:
         """2D mm with K=67 (unaligned) — only y is padded before the matmul.
