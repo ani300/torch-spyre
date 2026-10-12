@@ -31,6 +31,7 @@ from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.work_division import OpSplitSpace
+    from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
 
 DEVICE = torch.device("spyre")
 
@@ -46,6 +47,15 @@ def _make_generator(*args) -> torch.Generator:
     gen = torch.Generator()
     gen.manual_seed(seed)
     return gen
+
+
+def strict_xfail(request, raises, reason):
+    """Mark the running test as a strict xfail that must fail with ``raises``.
+
+    Unlike ``pytest.xfail`` this runs the body, so the test XPASSes (and fails,
+    being strict) once the gap is fixed, and any other failure still fails.
+    """
+    request.applymarker(pytest.mark.xfail(raises=raises, strict=True, reason=reason))
 
 
 @functools.lru_cache(maxsize=None)
@@ -513,6 +523,19 @@ def _check_expect_fail_unstable(prefix, cases):
             )
 
 
+def expects_raise(test):
+    """Tag a test that asserts a rejection of the op under test.
+
+    test_inductor_ops_lx_planning.py does not copy a tagged test: the rejection
+    happens in the op under test, before the second op the LX suite appends is
+    built and before any LX planning, so the copy would only repeat the base test.
+    Generated ``expect_raise`` cases are tagged automatically; use this on a
+    hand-written test that wraps its body in ``pytest.raises``.
+    """
+    test._expects_raise = True
+    return test
+
+
 def _expect_raise_test(test, fragment):
     """Wrap a generated test so it passes only if it raises with ``fragment``."""
 
@@ -521,9 +544,7 @@ def _expect_raise_test(test, fragment):
         with pytest.raises(Exception, match=fragment):
             test(self)
 
-    # Marks the test for test_inductor_ops_lx_planning.py, which does not wrap it.
-    raising._expects_raise = True
-    return raising
+    return expects_raise(raising)
 
 
 class ParameterizedTestMeta(type):
@@ -1004,6 +1025,7 @@ def mock_op_split_space(
     *,
     op: Any = None,
     legal: Callable[[dict], bool] | None = None,
+    tiling: "TilingSpace | None" = None,
 ) -> "OpSplitSpace":
     """An ``OpSplitSpace`` over stated domains, legal wherever ``legal`` says
     (everywhere by default). The real legality rules are tested against the
@@ -1016,9 +1038,15 @@ def mock_op_split_space(
     context = MagicMock()
     context.axes = list(domains)
     context.is_legal.side_effect = legal or (lambda splits: True)
-    return OpSplitSpace(
+    context.factor_domain.side_effect = domains.__getitem__
+    space = OpSplitSpace(
         op=MagicMock() if op is None else op,
         context=context,
         output_axes=frozenset(output_axes),
         factor_domains=domains,
+        tiling=tiling,
     )
+    # Every tiling is judged in this one context: how a per-tile frame narrows
+    # a domain is the real context's business.
+    space._context = lambda tiling: context  # type: ignore[method-assign]
+    return space
