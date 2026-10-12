@@ -43,7 +43,7 @@ class AiuptiActivityApi {
 
   static AiuptiActivityApi& singleton();
 
-  static void pushCorrelationID(int id, CorrelationFlowType type);
+  static void pushCorrelationID(uint64_t id, CorrelationFlowType type);
   static void popCorrelationID(CorrelationFlowType type);
 
   void enableAiuptiActivities(
@@ -69,7 +69,6 @@ class AiuptiActivityApi {
   std::unique_ptr<AiuptiActivityBufferDeque> readyAiuTraceBuffers_;
   std::mutex mutex_;
   std::atomic<uint32_t> tracingEnabled_{0};
-  bool externalCorrelationEnabled_{false};
 
   int processActivitiesForBuffer(
       uint8_t* buf, size_t validSize,

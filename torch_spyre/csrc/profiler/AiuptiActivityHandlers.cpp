@@ -17,6 +17,9 @@
  */
 #include <libaiupti/aiupti_runtime_cbid.h>
 
+#include <cstring>
+#include <limits>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <unordered_map>
@@ -27,6 +30,30 @@
 #include "kernel_provenance_registry.h"
 
 namespace KINETO_NAMESPACE {
+
+namespace {
+
+// GenericTraceActivity stores a 32-bit flow ID, but ITraceActivity and Kineto's
+// loggers support 64 bits. Give submission flows their own ID range without
+// changing the batch IDs used by hardware-launch-to-device flows.
+class RuntimeTraceActivity : public libkineto::GenericTraceActivity {
+ public:
+  using GenericTraceActivity::GenericTraceActivity;
+
+  int64_t flowId() const override {
+    return submissionFlowId ? submissionFlowId : GenericTraceActivity::flowId();
+  }
+
+  void log(libkineto::ActivityLogger& logger) const override {
+    // handleGenericActivity copies a GenericTraceActivity and would slice away
+    // the 64-bit flow ID. The session transfers ownership in its trace buffer.
+    logger.handleActivity(*this);
+  }
+
+  int64_t submissionFlowId{0};
+};
+
+}  // namespace
 
 // =========== Session Private Methods ============= //
 void AiuptiActivityProfilerSession::removeCorrelatedPtiActivities(
@@ -77,11 +104,25 @@ inline bool AiuptiActivityProfilerSession::outOfRange(
   return out_of_range;
 }
 
+const libkineto::ITraceActivity*
+AiuptiActivityProfilerSession::linkedCpuActivity(uint64_t externalId) {
+  // Kineto's lookup callback currently accepts int32_t. Preserve wider IDs in
+  // metadata, but never truncate one into a different CPU activity's identity.
+  if (!cpuActivity_ || externalId == 0 ||
+      externalId > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+    return nullptr;
+  }
+  const auto* linked = cpuActivity_(static_cast<int32_t>(externalId));
+  return linked && linked->correlationId() == static_cast<int64_t>(externalId)
+             ? linked
+             : nullptr;
+}
+
 const libkineto::ITraceActivity* AiuptiActivityProfilerSession::linkedActivity(
     int32_t correlationId,
     const std::unordered_map<int64_t, int64_t>& correlationMap) {
   const auto& it = correlationMap.find(correlationId);
-  if (it != correlationMap.end()) return cpuActivity_(it->second);
+  if (it != correlationMap.end()) return linkedCpuActivity(it->second);
   return nullptr;
 }
 
@@ -285,36 +326,85 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
     const AIUpti_ActivityAPI* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
-  cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
   const libkineto::ITraceActivity* linked =
-      linkedActivity(activity->correlation_id, cpuCorrelationMap_);
+      linkedCpuActivity(activity->external_id);
   auto cbIDName =
       runtimeCbidName((AIUpti_runtime_api_trace_cbid)activity->cbid);
-  traceBuffer_.emplace_activity(traceBuffer_.span,
-                                libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
-                                cbIDName);
-  auto& runtime_activity = traceBuffer_.activities.back();
+  auto runtime = std::make_unique<RuntimeTraceActivity>(
+      traceBuffer_.span, libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
+      cbIDName);
+  auto* runtime_activity = runtime.get();
+  traceBuffer_.activities.push_back(std::move(runtime));
   runtime_activity->startTime = activity->start;
   runtime_activity->endTime = activity->end;
   runtime_activity->id = activity->correlation_id;
   runtime_activity->device = activity->process_id;
-  runtime_activity->resource = activity->thread_id;
+  const bool calibration = activity->calibration_id != 0;
+  // One explicitly logical lane per calibrator, retaining physical host TIDs
+  // in metadata. Measurement helper threads do not create extra trace tracks.
+  runtime_activity->resource =
+      calibration ? 1000000000 + activity->calibration_id : activity->thread_id;
   runtime_activity->threadId = activity->thread_id;
-  recordThreadStream(runtime_activity->device, runtime_activity->resource);
-  // only enable outgoing flow for launch control block runtime activities
-  if (activity->cbid == AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_CMPT) {
-    runtime_activity->flow.id = activity->correlation_id;
-  } else {
-    runtime_activity->flow.id = 0;
+  const std::string threadName(
+      activity->thread_name,
+      strnlen(activity->thread_name, sizeof(activity->thread_name)));
+  recordThreadStream(
+      runtime_activity->device, runtime_activity->resource,
+      calibration ? fmt::format("Spyre calibration (device {})",
+                                activity->calibration_id - 1)
+                  : fmt::format("{} ({})", threadName, activity->thread_id));
+  if (calibration) {
+    runtime_activity->addMetadata("calibration_device",
+                                  activity->calibration_id - 1);
+    runtime_activity->addMetadata("host_thread", activity->thread_id);
   }
+  if (activity->external_id)
+    runtime_activity->addMetadata("external_correlation",
+                                  activity->external_id);
+  if (activity->user_external_id)
+    runtime_activity->addMetadata("user_external_correlation",
+                                  activity->user_external_id);
+  const bool isLaunch =
+      activity->cbid >= AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB &&
+      activity->cbid <= AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_DMO;
+  const bool flowStart = !calibration && isLaunch &&
+                         deviceActivityIds_.count(activity->correlation_id);
+  runtime_activity->flow.id = flowStart ? activity->correlation_id : 0;
   runtime_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
-  runtime_activity->flow.start = static_cast<bool>(
-      std::find(correlateRuntimeOps_.begin(), correlateRuntimeOps_.end(),
-                cbIDName) != correlateRuntimeOps_.end());
+  runtime_activity->flow.start = flowStart;
   runtime_activity->linked = linked;
   runtime_activity->addMetadata("correlation", activity->correlation_id);
 
+  if (activity->cbid == AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE &&
+      !calibration && linked && linked->deviceId() == activity->process_id &&
+      linked->timestamp() <= runtime_activity->startTime) {
+    const auto flowId = ++nextSubmissionFlowId_;
+    runtime_activity->submissionFlowId = flowId;
+
+    // A CPU op can submit several batches, while each Kineto activity carries
+    // only one flow endpoint. Add a zero-duration marker per batch at the CPU
+    // origin instead of copying or mutating the original CPU activity. Keep it
+    // in the trace buffer so deferred exports retain the endpoint's lifetime.
+    auto source = std::make_unique<RuntimeTraceActivity>(
+        traceBuffer_.span, libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
+        "aiuCpuLaunch");
+    source->startTime = source->endTime = linked->timestamp();
+    source->device = linked->deviceId();
+    source->resource = linked->resourceId();
+    source->threadId = linked->getThreadId();
+    source->id = activity->correlation_id;
+    source->linked = linked;
+    source->submissionFlowId = flowId;
+    source->flow.type = libkineto::kLinkAsyncCpuGpu;
+    source->flow.start = true;
+    source->addMetadata("external_correlation", activity->external_id);
+    source->addMetadata("correlation", activity->correlation_id);
+    traceBuffer_.activities.push_back(std::move(source));
+    traceBuffer_.activities.back()->log(*logger);
+  }
+
   switch ((AIUpti_runtime_api_trace_cbid)activity->cbid) {
+    case AIUPTI_RUNTIME_TRACE_CBID_SUBMIT_TO_HARDWARE:
     case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB:
     case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_CMPT:
     case AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_DMI:
@@ -350,7 +440,6 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
     const AIUpti_ActivityCompute* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
-  cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
   const libkineto::ITraceActivity* linked =
       linkedActivity(activity->correlation_id, cpuCorrelationMap_);
   traceBuffer_.emplace_activity(traceBuffer_.span,
@@ -472,7 +561,6 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
     const AIUpti_ActivityMemcpy* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
-  cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
   const libkineto::ITraceActivity* linked =
       linkedActivity(activity->correlation_id, cpuCorrelationMap_);
   traceBuffer_.emplace_activity(
@@ -485,7 +573,7 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->device = activity->device_id;
   memcpy_activity->resource = getResourceId(activity);
   memcpy_activity->threadId = activity->stream_id;
-  memcpy_activity->flow.id = 0;
+  memcpy_activity->flow.id = activity->correlation_id;
   memcpy_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
   memcpy_activity->flow.start = 0;
   memcpy_activity->linked = linked;
@@ -546,7 +634,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
     traceBuffer_.span.opCount += 1;
     traceBuffer_.gpuOpCount += 1;
     const libkineto::ITraceActivity* linked =
-        linkedActivity(activity->correlation_id, cpuCorrelationMap_);
+        nullptr;  // Allocation IDs are separate from submission batch IDs.
     traceBuffer_.emplace_activity(
         traceBuffer_.span, libkineto::ActivityType::PRIVATEUSE1_DRIVER,
         fmt::format("Memory ({})",
@@ -627,10 +715,8 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
     const AIUpti_ActivityMemset* activity, libkineto::ActivityLogger* logger) {
   traceBuffer_.span.opCount += 1;
   traceBuffer_.gpuOpCount += 1;
-  // TODO(mamaral): implement the libaiupti to add external correlation ID
-  cpuCorrelationMap_[activity->correlation_id] = 0;  // fake add correlation
   const libkineto::ITraceActivity* linked =
-      linkedActivity(activity->correlation_id, cpuCorrelationMap_);
+      nullptr;  // Allocation IDs are separate from submission batch IDs.
   traceBuffer_.emplace_activity(traceBuffer_.span,
                                 libkineto::ActivityType::GPU_MEMSET,
                                 "Memset (Device)");
