@@ -31,6 +31,7 @@ It enables standard PyTorch models to run on the Spyre device with full
    getting_started/index
    user_guide/index
    api/index
+   release_notes
 
 .. toctree::
    :caption: For Developers

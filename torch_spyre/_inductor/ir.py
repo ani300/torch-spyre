@@ -37,6 +37,7 @@ from torch._inductor.virtualized import V
 import sympy
 from torch.utils._ordered_set import OrderedSet
 import torch._inductor.ir as ir
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("ir")
@@ -497,7 +498,7 @@ def _compute_device_num_elems(layout: "FixedLayout") -> int:
     A finalized device layout is required: logical numel can omit padding.
     """
     if not isinstance(layout, FixedTiledLayout):
-        raise NotImplementedError("Collective input requires a finalized device layout")
+        raise Unsupported("Collective input requires a finalized device layout")
     size_bytes = get_device_size_in_bytes(layout.device_layout)
     # The plan receives layout.dtype too. Device element count alone would
     # change byte coverage when host and device widths differ (e.g. int64).
@@ -525,7 +526,7 @@ def _collective_input_layout(input_tensor: IRNode) -> FixedLayout:
         # A view cannot borrow its base allocation's size, and logical numel
         # cannot establish the view's padded size. Reject missing metadata
         # rather than silently submitting a truncated collective.
-        raise NotImplementedError(
+        raise Unsupported(
             "Collective input view requires a finalized device layout matching "
             "its size, stride, offset, and dtype"
         )
@@ -739,7 +740,10 @@ class AllReduceAsyncFallback(ir.ExternKernel):
         x: IRNode,
         reduce_op: str,
         group_name: str,
+        mutation_target: Optional[IRNode] = None,
     ) -> None:
+        # A materialized in-place view must be copied back after its wait.
+        self.mutation_target = mutation_target
         x_device = x.get_device()
         x_dtype = x.get_dtype()
         x_size = x.get_size()

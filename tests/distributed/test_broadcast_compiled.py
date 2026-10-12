@@ -244,6 +244,32 @@ class TestBroadcastCompiled(TestCase):
                 atol=0,
             )
 
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("view_kind", ["reshape", "prefix", "offset"])
+    def test_broadcast_compiled_view(self, dtype, view_kind):
+        shape = (2, 2, 96) if view_kind == "reshape" else (5, 96)
+
+        def view(base):
+            if view_kind == "reshape":
+                return base.reshape(4, 96)
+            return base[:4] if view_kind == "prefix" else base[1:]
+
+        def fn(x):
+            base = x * 2.0
+            result = torch.ops._c10d_functional.broadcast(
+                view(base), self.comm_size - 1, _GROUP_NAME
+            )
+            ready = torch.ops._c10d_functional.wait_tensor(result)
+            return base * 0.5, ready * 0.5
+
+        compiled = torch.compile(fn, fullgraph=True)
+        local = _collective_rank_input(self.comm_rank, shape, dtype)
+        expected = view(_collective_rank_input(self.comm_size - 1, shape, dtype))
+        for _ in range(2):
+            base, result = compiled(local.to(DEVICE))
+            self.assertEqual(base.cpu(), local, rtol=0, atol=0)
+            self.assertEqual(result.cpu(), expected, rtol=0, atol=0)
+
     def test_broadcast_compiled_bfloat16_rejects_non_dl16_storage(self):
         x = _native_bfloat16_tensor(DEVICE)
         with self.assertRaisesRegex(

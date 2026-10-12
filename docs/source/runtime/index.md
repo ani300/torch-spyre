@@ -342,17 +342,21 @@ their bytes cannot be interpreted as DL16. This storage check runs when a
 tensor is submitted, since compile-time plans contain scalar metadata only.
 Both eager and compiled collective plans include the device allocation's
 padding, including padding introduced by a producer operation before a
-compiled collective.
+compiled collective. The storage-extent guard compares `numel()` with
+`dma_sizes`, which records the logical allocation shape, not the padded
+`device_size`. Ordinary allocated tensors therefore pass this guard even
+when their physical storage includes stick padding.
 
 Collectives require contiguous inputs with zero storage offset and a device
 storage descriptor covering the input's own elements. Prefix views that retain
 the base tensor's larger descriptor are rejected. A compiled view must have a
 finalized device layout describing its own size, stride, offset, and dtype;
 missing or incompatible view metadata is rejected instead
-of planning from an unpadded logical element count. Compiled allgather
-materializes view inputs into their own allocation before planning. For other
-collectives, materialize unsupported views into a fresh contiguous tensor
-before submission.
+of planning from an unpadded logical element count. Compiled broadcast,
+allgather, and allreduce materialize view inputs into their own allocation
+before planning. In-place compiled allreduce copies the completed result back
+to the original view after its wait. Eager callers must materialize unsupported
+views explicitly before submission.
 
 ### One device per process
 

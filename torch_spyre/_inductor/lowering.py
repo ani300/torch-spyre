@@ -2396,6 +2396,15 @@ def lower_any_def(x):
 # ============================================================================
 # Direct c10d Lowerings
 # ============================================================================
+def _realize_collective_input(tensor):
+    # Views can retain their base allocation's padded descriptor. A copy
+    # obtains a finalized device layout for exactly the contributed elements.
+    if isinstance(tensor.data, ir.BaseView):
+        tensor = ir.ExternKernel.copy_input(tensor)
+    tensor.realize()
+    return tensor
+
+
 @register_spyre_lowering(torch.ops._c10d_functional.broadcast.default)
 def lower_c10d_broadcast_async(tensor, src_rank, group_name):
     """
@@ -2416,7 +2425,7 @@ def lower_c10d_broadcast_async(tensor, src_rank, group_name):
         group_name,
     )
 
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
         BroadcastAsyncFallback(
             torch.ops.spyre.broadcast_async.default,
@@ -2441,12 +2450,22 @@ def lower_c10d_wait_tensor_async(tensor):
     logger.debug("Lowering _c10d_functional.wait_tensor to WaitWorkFallback")
 
     tensor.realize()
-    return ir.TensorBox.create(
+    result = ir.TensorBox.create(
         WaitWorkFallback(
             torch.ops.spyre.wait_work.default,
             tensor,
         )
     )
+
+    producer = V.graph.try_get_buffer(tensor.get_name())
+    if (
+        isinstance(producer, AllReduceAsyncFallback)
+        and producer.mutation_target is not None
+    ):
+        # In-place collectives become visible through the original view after
+        # the wait. Keep the copy dependent on the completed temporary buffer.
+        return lowering.mutate_to(producer.mutation_target, result)
+    return result
 
 
 @register_spyre_lowering(torch.ops._c10d_functional.all_gather_into_tensor.default)
@@ -2469,12 +2488,7 @@ def lower_c10d_all_gather_async(tensor, group_size, group_name):
         group_name,
     )
 
-    # A view can retain its base allocation's padded descriptor. Allgather
-    # is out-of-place, so materialize views before planning to obtain a
-    # finalized device layout for exactly the contributed elements.
-    if isinstance(tensor.data, ir.BaseView):
-        tensor = ir.ExternKernel.copy_input(tensor)
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     return ir.TensorBox.create(
         AllGatherAsyncFallback(
             torch.ops.spyre.all_gather_async.default,
@@ -2493,7 +2507,7 @@ def lower_c10d_all_reduce_async(tensor, reduce_op, group_name):
     Creates an async all_reduce operation that returns immediately without blocking.
     Output tensor has shape[0] = input.shape[0].
     """
-    tensor.realize()
+    tensor = _realize_collective_input(tensor)
     logger.debug(
         "Lowering _c10d_functional.all_reduce to AllReduceAsyncFallback "
         "(reduce_op=%s, group_name='%s')",
@@ -2519,7 +2533,8 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
     all_reduce_ when the output shape matches the input. This lowering catches
     that case and emits the same Spyre all_reduce op (always in-place on device).
     """
-    tensor.realize()
+    mutation_target = tensor if isinstance(tensor.data, ir.BaseView) else None
+    tensor = _realize_collective_input(tensor)
     logger.debug(
         "Lowering _c10d_functional.all_reduce_ to AllReduceAsyncFallback "
         "(reduce_op=%s, group_name='%s')",
@@ -2532,5 +2547,6 @@ def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
             tensor,
             reduce_op,
             group_name,
+            mutation_target=mutation_target,
         )
     )

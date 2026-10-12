@@ -40,6 +40,8 @@ from torch.testing._internal.common_utils import (
 from utils import (
     _bfloat16_collective_expected,
     _bfloat16_rank_input,
+    _collective_expected,
+    _collective_rank_input,
     _native_bfloat16_tensor,
 )
 
@@ -206,6 +208,7 @@ class TestAllReduceCompiled(TestCase):
         from torch._inductor.virtualized import V
 
         from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.errors import Unsupported
         from torch_spyre._inductor.ir import FixedTiledLayout, _collective_input_layout
 
         final = FixedTiledLayout(
@@ -230,7 +233,7 @@ class TestAllReduceCompiled(TestCase):
         producer = SimpleNamespace(get_layout=lambda: final)
         with V.set_graph_handler(SimpleNamespace(try_get_buffer=lambda _: producer)):
             with self.assertRaisesRegex(
-                NotImplementedError,
+                Unsupported,
                 "Collective input view requires a finalized device layout",
             ):
                 _collective_input_layout(source)
@@ -430,6 +433,75 @@ class TestAllReduceCompiled(TestCase):
                 rtol=0,
                 atol=0,
             )
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("view_kind", ["reshape", "prefix", "offset"])
+    @parametrize("inplace", [False, True])
+    def test_allreduce_compiled_view(self, dtype, view_kind, inplace):
+        shape = (2, 2, 96) if view_kind == "reshape" else (5, 96)
+
+        def view(base):
+            if view_kind == "reshape":
+                return base.reshape(4, 96)
+            return base[:4] if view_kind == "prefix" else base[1:]
+
+        def fn(x):
+            base = x * 2.0
+            value = view(base)
+            if inplace:
+                dist.all_reduce(value)
+                ready = value
+            else:
+                reduced = torch.ops._c10d_functional.all_reduce(
+                    value, "sum", _GROUP_NAME
+                )
+                ready = torch.ops._c10d_functional.wait_tensor(reduced)
+            return base * 0.5, ready * 0.5
+
+        compiled = torch.compile(fn, fullgraph=True)
+        local = _collective_rank_input(self.comm_rank, shape, dtype)
+        expected = view(_collective_expected("allreduce", shape, self.comm_size, dtype))
+        expected_base = local.clone()
+        if inplace:
+            view(expected_base).copy_(expected)
+        for _ in range(2):
+            base, result = compiled(local.to(DEVICE))
+            self.assertEqual(base.cpu(), expected_base, rtol=0, atol=0)
+            self.assertEqual(result.cpu(), expected, rtol=0, atol=0)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_allreduce_compiled_row_parallel_linear(self, dtype):
+        from unittest.mock import patch
+
+        from torch_spyre._inductor import lowering as spyre_lowering
+
+        def fn(x, weight):
+            partial = torch.nn.functional.linear(x, weight)
+            reduced = torch.ops._c10d_functional.all_reduce(partial, "sum", _GROUP_NAME)
+            return torch.ops._c10d_functional.wait_tensor(reduced)
+
+        realize = spyre_lowering._realize_collective_input
+        direct_inputs = []
+
+        def require_direct_input(tensor):
+            result = realize(tensor)
+            self.assertIs(result, tensor)
+            direct_inputs.append(tensor)
+            return result
+
+        x = torch.full((4, 64), self.comm_rank + 1, dtype=dtype).to(DEVICE)
+        weight = torch.full((96, 64), 1.0 / 64, dtype=dtype).to(DEVICE)
+        with patch.object(
+            spyre_lowering,
+            "_realize_collective_input",
+            side_effect=require_direct_input,
+        ):
+            result = torch.compile(fn, fullgraph=True)(x, weight)
+        self.assertTrue(direct_inputs)
+        expected = torch.full(
+            (4, 96), self.comm_size * (self.comm_size + 1) / 2, dtype=dtype
+        )
+        self.assertEqual(result.cpu(), expected, rtol=0, atol=0)
 
     def test_allreduce_compiled_bfloat16_rejects_non_dl16_storage(self):
         x = _native_bfloat16_tensor(DEVICE)
