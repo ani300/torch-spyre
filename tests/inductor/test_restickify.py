@@ -28,7 +28,11 @@ import math
 import pytest
 from unittest.mock import patch
 
+import sympy
 import torch
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import FixedLayout, InputBuffer
 from torch._inductor.virtualized import V
 from torch.spyre import SpyreTensorLayout
 
@@ -1235,6 +1239,48 @@ def test_sparse_dense_pointwise():
     b = torch.randn((S, S), dtype=torch.float16)
 
     _compare(lambda a, b: a.min(-1)[0] + b, a, b, optimal_cost=16384)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("packed_axes", [1, 2])
+def test_packed_broadcast_infeasible_edge(dtype, packed_axes):
+    """Unrepresentable sparse targets must be rejected by layout search."""
+    b, k, h = sympy.symbols("b k h", integer=True, nonnegative=True)
+    if packed_axes == 1:
+        # All 64 values fit in one stick; there is no outer chunk to promote.
+        shape, stride = [64], [1]
+        device_size, stride_map = [64], [1]
+        variables, sizes = (b, h), (64, 128)
+        index, out_index, out_shape = b, 128 * b + h, [64, 128]
+    else:
+        # The input stick combines two host axes, so neither host coordinate
+        # alone identifies the packed axis for the sparse conversion.
+        shape, stride = [4, 8], [8, 1]
+        device_size, stride_map = [1, 64], [64, 1]
+        variables, sizes = (b, k, h), (4, 8, 128)
+        index, out_index, out_shape = 8 * b + k, 1024 * b + 128 * k + h, [4, 8, 128]
+
+    source = SpyreTensorLayout(device_size, stride_map, get_device_dtype(dtype))
+    target = SpyreTensorLayout(out_shape, dtype)
+    graph = GraphLowering(torch.fx.symbolic_trace(lambda: None))
+    graph.name_to_buffer["input"] = InputBuffer(
+        name="input", layout=FixedLayout(DEVICE, dtype, shape, stride)
+    )
+    graph.name_to_buffer["output"] = InputBuffer(
+        name="output", layout=FixedLayout(DEVICE, dtype, out_shape)
+    )
+    with V.set_graph_handler(graph):
+        edge = _optimize_restickify.EdgeCostMap(
+            MemoryDep("input", index, variables, sizes),
+            [source],
+            [target],
+            MemoryDep("output", out_index, variables, sizes),
+            None,
+        )
+        assert edge.cost(source, target) == _optimize_restickify.INF
+        assert (
+            edge.layout(source, target) is _optimize_restickify.EdgeCostMap.INFEASIBLE
+        )
 
 
 @pytest.mark.parametrize("batch", [4, 64, 65])

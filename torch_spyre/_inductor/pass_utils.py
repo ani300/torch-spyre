@@ -2535,6 +2535,9 @@ def compute_restickify_needed(
         )
         old_host_dim = matching_dim(ic, idc[-1]) if broadcast_stick else None
         if broadcast_stick and old_host_dim is None:
+            # A packed combination of host axes has no scalar-per-stick
+            # target here. EdgeCostMap records (True, None) as INFEASIBLE
+            # with INF cost, so layout search can try another candidate.
             return True, None
         if k_chunk_dim is None and old_host_dim is not None:
             # A short packed axis (e.g. top-k's token axis) can use its
@@ -2560,6 +2563,8 @@ def compute_restickify_needed(
             y_sm[k_chunk_dim] = elem_stride
             y_sm[-1] = -1
             return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype)
+        # There is no outer chunk axis to promote. Reject just this candidate
+        # through the same infeasible-edge contract, rather than abort search.
         return True, None
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:

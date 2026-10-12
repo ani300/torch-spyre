@@ -79,6 +79,29 @@ conversion followed by a broadcast. Such a clone uses `AllSameNode` constraints
 with its fixed contiguous output layout, because a transpose alone cannot
 materialize the repeated lanes.
 
+If the packed stick does not match one host axis, or has no outer chunk axis
+to promote, `compute_restickify_needed` returns `(True, None)` (infeasible).
+`EdgeCostMap` assigns that pair `INF` cost and an `INFEASIBLE` layout sentinel;
+`FixedInOutNode` rejects it as an incompatible output. This preserves other
+layout candidates. As a final invariant check, `finalize_layouts` rejects a
+committed infeasible edge with the op, input, and source/target stride maps.
+
+The broadcast regression costs count logical elements converted by the
+restickify insertion plan, not physical padded bytes or execution time:
+
+| Test in `test_restickify.py` | Previous cost | Current cost | Conversion |
+| --- | --- | --- | --- |
+| `test_unsqueeze_broadcast_dense_pointwise` | `S*S = 16384` | `S = 128` | Convert the vector to scalar-per-stick; keep the matrix's layout. |
+| `test_unsqueeze_expand_broadcast_dense_pointwise` | `S*S = 16384` | `S = 128` | The expanded view still reads the same vector; convert it before broadcasting. |
+| `test_broadcast_outer_diff` | `2*BH*C = 8192` | `BH*C = 4096` | Convert one read to scalar-per-stick; retain the other's packed axis. |
+| `test_broadcast_expand_first` | `2*BH*C = 8192` | `BH*C = 4096` | Expanding the first read adds no stored input elements. |
+| `test_broadcast_expand_second` | `2*BH*C = 8192` | `BH*C = 4096` | Expanding the second read adds no stored input elements. |
+| `test_broadcast_expand_both` | `2*BH*C = 8192` | `BH*C = 4096` | Both expansions remain views; only one source read is converted. |
+
+All six tests also compare the compiled result with a CPU reference. The cost
+assertions inspect the actual insertion plan, so they check the selected
+conversion as well as its numerical result.
+
 **Mutation ops.** Mutation ops create additional stick constraints: they have
 two output dependencies — their logical output and the target buffer they write
 into — and both must be committed to the same STL. The optimizer enforces this
