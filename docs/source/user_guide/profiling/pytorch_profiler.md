@@ -202,3 +202,11 @@ them, are recorded alongside compute kernels on multi-AIU runs.
   alongside `torch.profiler`
 
 [torch-profiler-docs]: https://pytorch.org/docs/stable/profiler.html
+
+Device events include `timestamp_source`. Before device clock calibration is
+ready, the decoder estimates placement by anchoring elapsed device ticks
+(assuming 1 ns per tick) at host completion. These events are explicitly marked
+`estimated (host completion, 1 ns/tick)`; their absolute placement is approximate.
+Use `FLEX_TIMESTAMP_CALIBRATION=always` before initializing the device to start
+calibration during model loading/warmup when calibrated timings are needed from
+the beginning of the capture. The default starts calibration on a profiling session.

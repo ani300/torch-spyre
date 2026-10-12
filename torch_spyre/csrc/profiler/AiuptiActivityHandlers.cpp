@@ -359,6 +359,10 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   auto& kernel_activity = traceBuffer_.activities.back();
   kernel_activity->startTime = activity->start;
   kernel_activity->endTime = activity->end;
+  kernel_activity->addMetadataQuoted(
+      "timestamp_source", activity->timestamps_estimated
+                              ? "estimated (host completion, 1 ns/tick)"
+                              : "calibrated");
   kernel_activity->id = activity->correlation_id;
   kernel_activity->device = activity->device_id;
   kernel_activity->resource = activity->stream_id;
@@ -481,6 +485,10 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   auto& memcpy_activity = traceBuffer_.activities.back();
   memcpy_activity->startTime = activity->start;
   memcpy_activity->endTime = activity->end;
+  memcpy_activity->addMetadataQuoted(
+      "timestamp_source", activity->timestamps_estimated
+                              ? "estimated (host completion, 1 ns/tick)"
+                              : "calibrated");
   memcpy_activity->id = activity->correlation_id;
   memcpy_activity->device = activity->device_id;
   memcpy_activity->resource = getResourceId(activity);
