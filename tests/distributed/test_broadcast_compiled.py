@@ -28,6 +28,8 @@ from torch.testing._internal.common_utils import (
 from utils import (
     _bfloat16_collective_expected,
     _bfloat16_rank_input,
+    _collective_expected,
+    _collective_rank_input,
     _native_bfloat16_tensor,
 )
 
@@ -225,12 +227,43 @@ class TestBroadcastCompiled(TestCase):
                 atol=0,
             )
 
+    def test_broadcast_compiled_float16_padded_intermediate(self):
+        def fn(x):
+            x = x * 2.0
+            y = torch.ops._c10d_functional.broadcast(x, self.comm_size - 1, _GROUP_NAME)
+            return torch.ops._c10d_functional.wait_tensor(y) * 0.5
+
+        shape = (4, 96)
+        compiled = torch.compile(fn, fullgraph=True)
+        for _ in range(2):
+            x = _collective_rank_input(self.comm_rank, shape, torch.float16).to(DEVICE)
+            self.assertEqual(
+                compiled(x).cpu(),
+                _collective_expected("broadcast", shape, self.comm_size, torch.float16),
+                rtol=0,
+                atol=0,
+            )
+
     def test_broadcast_compiled_bfloat16_rejects_non_dl16_storage(self):
         x = _native_bfloat16_tensor(DEVICE)
         with self.assertRaisesRegex(
             RuntimeError, "BF16 collectives require DL16 device storage"
         ):
             torch.ops.spyre.broadcast_run(x, -1, 0)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("prefix", [False, True])
+    def test_broadcast_rejects_unsupported_storage_view(self, dtype, prefix):
+        expected = torch.ones((5, 96), dtype=dtype)
+        base = expected.to(DEVICE)
+        x = base[:-1] if prefix else base[1:]
+        self.assertEqual(x.storage_offset() == 0, prefix)
+        error = (
+            "matching device storage extent" if prefix else "nonzero storage offsets"
+        )
+        with self.assertRaisesRegex(RuntimeError, error):
+            torch.ops.spyre.broadcast_run(x, -1, 0)
+        self.assertTrue(torch.equal(base.cpu(), expected))
 
 
 if __name__ == "__main__":

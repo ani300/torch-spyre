@@ -28,6 +28,8 @@ from utils import (
     _assert_tensor_equal,
     _bfloat16_collective_expected,
     _bfloat16_rank_input,
+    _collective_expected,
+    _collective_rank_input,
     _native_bfloat16_tensor,
 )
 
@@ -195,7 +197,7 @@ class TestReduce(TestCase):
             shape=(4, 64), dtype=torch.float16, dst=dst_rank, async_op=True
         )
 
-    @parametrize("shape", [(128,), (4, 64)])
+    @parametrize("shape", [(128,), (4, 64), (4, 96)])
     @parametrize("async_op", [False, True])
     def test_reduce_bfloat16(self, shape, async_op):
         x = _bfloat16_rank_input(self.comm_rank, shape).to(DEVICE)
@@ -210,6 +212,22 @@ class TestReduce(TestCase):
         self.assertEqual(
             x.cpu(),
             _bfloat16_collective_expected("reduce", shape, self.comm_size),
+            rtol=0,
+            atol=0,
+        )
+
+    @parametrize("async_op", [False, True])
+    def test_reduce_float16_padded(self, async_op):
+        shape = (4, 96)
+        x = _collective_rank_input(self.comm_rank, shape, torch.float16).to(DEVICE)
+        work = dist.reduce(x, dst=self.comm_size - 1, async_op=async_op)
+        if async_op:
+            work.wait()
+        if self.comm_rank != self.comm_size - 1:
+            return
+        self.assertEqual(
+            x.cpu(),
+            _collective_expected("reduce", shape, self.comm_size, torch.float16),
             rtol=0,
             atol=0,
         )

@@ -2469,6 +2469,11 @@ def lower_c10d_all_gather_async(tensor, group_size, group_name):
         group_name,
     )
 
+    # A view can retain its base allocation's padded descriptor. Allgather
+    # is out-of-place, so materialize views before planning to obtain a
+    # finalized device layout for exactly the contributed elements.
+    if isinstance(tensor.data, ir.BaseView):
+        tensor = ir.ExternKernel.copy_input(tensor)
     tensor.realize()
     return ir.TensorBox.create(
         AllGatherAsyncFallback(

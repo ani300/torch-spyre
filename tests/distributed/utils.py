@@ -72,25 +72,33 @@ def _assert_tensor_equal(
             pytest.fail(error_msg)
 
 
-def _bfloat16_rank_input(rank, shape):
+def _collective_rank_input(rank, shape, dtype):
     # Signed powers of two are exact in BF16 and DL16; 2**20 also detects an
     # unintended conversion through IEEE FP16, whose range is smaller.
+    large = 2.0**20 if dtype == torch.bfloat16 else 16.0
     pattern = torch.tensor(
-        [2.0**20, -(2.0**20), 2.0**-20, -(2.0**-20), 0.5, -0.5, 1.5, -1.5],
-        dtype=torch.bfloat16,
+        [large, -large, 2.0**-20, -(2.0**-20), 0.5, -0.5, 1.5, -1.5], dtype=dtype
     )
     return (pattern.repeat(math.prod(shape) // len(pattern)) * (rank + 1)).reshape(
         shape
     )
 
 
-def _bfloat16_collective_expected(op, shape, world_size):
+def _bfloat16_rank_input(rank, shape):
+    return _collective_rank_input(rank, shape, torch.bfloat16)
+
+
+def _collective_expected(op, shape, world_size, dtype):
     if op == "broadcast":
-        return _bfloat16_rank_input(world_size - 1, shape)
-    values = [_bfloat16_rank_input(rank, shape) for rank in range(world_size)]
-    if op == "allgather":
+        return _collective_rank_input(world_size - 1, shape, dtype)
+    values = [_collective_rank_input(rank, shape, dtype) for rank in range(world_size)]
+    if op in ("allgather", "gather"):
         return torch.cat(values, dim=0)
     return torch.stack(values).sum(dim=0)
+
+
+def _bfloat16_collective_expected(op, shape, world_size):
+    return _collective_expected(op, shape, world_size, torch.bfloat16)
 
 
 def _native_bfloat16_tensor(device):

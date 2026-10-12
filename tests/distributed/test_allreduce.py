@@ -28,6 +28,8 @@ from utils import (
     _assert_tensor_equal,
     _bfloat16_collective_expected,
     _bfloat16_rank_input,
+    _collective_expected,
+    _collective_rank_input,
     _native_bfloat16_tensor,
 )
 
@@ -161,7 +163,7 @@ class TestAllReduce(TestCase):
         """Test allreduce with 2D tensor shapes using float16 and async_op=True."""
         self._test_allreduce_helper(shape=(4, 64), dtype=torch.float16, async_op=True)
 
-    @parametrize("shape", [(128,), (4, 64)])
+    @parametrize("shape", [(128,), (4, 64), (4, 96)])
     @parametrize("async_op", [False, True])
     def test_allreduce_bfloat16(self, shape, async_op):
         x = _bfloat16_rank_input(self.comm_rank, shape).to(DEVICE)
@@ -178,12 +180,40 @@ class TestAllReduce(TestCase):
             atol=0,
         )
 
+    @parametrize("async_op", [False, True])
+    def test_allreduce_float16_padded(self, async_op):
+        shape = (4, 96)
+        x = _collective_rank_input(self.comm_rank, shape, torch.float16).to(DEVICE)
+        work = dist.all_reduce(x, async_op=async_op)
+        if async_op:
+            work.wait()
+        self.assertEqual(
+            x.cpu(),
+            _collective_expected("allreduce", shape, self.comm_size, torch.float16),
+            rtol=0,
+            atol=0,
+        )
+
     def test_allreduce_bfloat16_rejects_non_dl16_storage(self):
         x = _native_bfloat16_tensor(DEVICE)
         with self.assertRaisesRegex(
             RuntimeError, "BF16 collectives require DL16 device storage"
         ):
             dist.all_reduce(x)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("prefix", [False, True])
+    def test_allreduce_rejects_unsupported_storage_view(self, dtype, prefix):
+        expected = torch.ones((5, 96), dtype=dtype)
+        base = expected.to(DEVICE)
+        x = base[:-1] if prefix else base[1:]
+        self.assertEqual(x.storage_offset() == 0, prefix)
+        error = (
+            "matching device storage extent" if prefix else "nonzero storage offsets"
+        )
+        with self.assertRaisesRegex(RuntimeError, error):
+            dist.all_reduce(x)
+        self.assertTrue(torch.equal(base.cpu(), expected))
 
 
 if __name__ == "__main__":

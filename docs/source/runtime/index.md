@@ -321,7 +321,7 @@ The following collectives are implemented:
 | `reduce` | Implemented |
 | `allreduce` | Implemented |
 
-`broadcast`, `allgather`, `reduce`, and `allreduce` also support
+`broadcast`, `gather`, `allgather`, `reduce`, and `allreduce` also support
 `async_op=True`; wait for completion with the returned work handle's `wait()`.
 The remaining process-group entries (`scatter`, `reduce_scatter`, `alltoall`,
 `alltoall_base`, `_allgather_base`, `allreduce_coalesced`) raise
@@ -331,16 +331,28 @@ unsupported: the protocol overhead is high and call sites are rare.
 ### BF16 collective tensors
 
 `torch.bfloat16` Spyre tensors use DL16 (`SEN169_FP16`) device storage by
-default. Eager broadcast, allgather, SUM reduce, and SUM allreduce communicate
+default. Eager broadcast, gather, allgather, SUM reduce, and SUM allreduce communicate
 that storage directly, preserving the public BF16 dtype. Compiled broadcast,
 allgather, and SUM allreduce use the same device format. No intermediate
 conversion through `torch.float16` is required.
 
 As with other BF16 Spyre operations, computation uses DL16 arithmetic.
 Explicit tensor layouts containing native BF16 device storage are rejected;
-their bytes cannot be interpreted as DL16. Compiled collective plans include
-the finalized allocation's padding, including padding introduced by a producer
-operation before the collective.
+their bytes cannot be interpreted as DL16. This storage check runs when a
+tensor is submitted, since compile-time plans contain scalar metadata only.
+Both eager and compiled collective plans include the device allocation's
+padding, including padding introduced by a producer operation before a
+compiled collective.
+
+Collectives require contiguous inputs with zero storage offset and a device
+storage descriptor covering the input's own elements. Prefix views that retain
+the base tensor's larger descriptor are rejected. A compiled view must have a
+finalized device layout describing its own size, stride, offset, and dtype;
+missing or incompatible view metadata is rejected instead
+of planning from an unpadded logical element count. Compiled allgather
+materializes view inputs into their own allocation before planning. For other
+collectives, materialize unsupported views into a fresh contiguous tensor
+before submission.
 
 ### One device per process
 

@@ -27,6 +27,7 @@
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
+#include "spyre_collective_utils.h"
 #include "spyre_composite_address.h"
 #include "spyre_stream.h"
 #include "spyre_tensor_impl.h"
@@ -323,29 +324,29 @@ convert_string_to_datatype_pair(const std::string& type_name) {
 
 spyre_comms::TensorInfo SpyreCCLBackend::getTensorInfo(
     const at::Tensor& input) {
-  std::vector<int64_t> shape;
-  if (input.dim() == 0) {
-    shape = {1};
-  } else {
-    for (const int64_t& element : input.sizes()) {
-      shape.push_back(element);
-    }
-  }
+  spyre::check_collective_storage(input);
   auto str_type = spyre::torchScalarToString[input.scalar_type()];
   const auto [sen_dtype_cpu, sen_dtype_dev] =
       convert_string_to_datatype_pair(str_type);
-  spyre_comms::TensorShape t_shape(shape);
+  auto dtype = sen_dtype_cpu;
   if (input.scalar_type() == c10::ScalarType::BFloat16) {
-    TORCH_CHECK(
-        spyre::get_spyre_tensor_layout(input).device_dtype ==
-            DataFormats::SEN169_FP16,
-        "BF16 collectives require DL16 device storage; explicit non-DL16 "
-        "device layouts are not supported");
-    // The borrowed device address already contains DL16, not host BF16.
-    return spyre_comms::TensorInfo{sen_dtype_dev, t_shape};
+    // convert_string_to_datatype_pair("bfloat16") is {bfloat16, sen_fp16}.
+    // check_collective_storage verified that the borrowed bytes are DL16.
+    TORCH_INTERNAL_ASSERT(sen_dtype_dev ==
+                          spyre_comms::TensorDataTypeEnum::sen_fp16);
+    dtype = sen_dtype_dev;
   }
-  spyre_comms::TensorInfo ti{sen_dtype_cpu, t_shape};
-  return ti;
+  const auto bytes =
+      spyre::get_device_size_in_bytes(spyre::get_spyre_tensor_layout(input));
+  const auto element_bytes = spyre_comms::DataTypeSizeBytes(dtype);
+  TORCH_CHECK(element_bytes > 0 && bytes % element_bytes == 0,
+              "Collective storage size is incompatible with its data type");
+  // The comms buffer is flat device storage, including stick padding. Count
+  // in the planner dtype's units so copy-only host/device width differences
+  // (for example int64) retain exactly the same byte coverage.
+  return spyre_comms::TensorInfo{
+      dtype,
+      spyre_comms::TensorShape({static_cast<int64_t>(bytes / element_bytes)})};
 }
 
 /**

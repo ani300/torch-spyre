@@ -22,6 +22,7 @@ Usage:
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import regex as re
@@ -198,6 +199,41 @@ class TestAllReduceCompiled(TestCase):
             dtype=torch.float16,
         )
         self.assertEqual(result.cpu(), expected, rtol=0, atol=0)
+
+    @parametrize("field", ["size", "stride", "offset", "dtype"])
+    def test_collective_rejects_unresolved_view_geometry(self, field):
+        from torch._inductor.ir import FixedLayout
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout, _collective_input_layout
+
+        final = FixedTiledLayout(
+            DEVICE,
+            torch.float16,
+            [4, 96],
+            [96, 1],
+            SpyreTensorLayout([4, 96], torch.float16),
+        )
+        view = FixedLayout(DEVICE, torch.float16, [4, 96], [96, 1])
+        setattr(
+            view,
+            field,
+            {
+                "size": [2, 96],
+                "stride": [128, 1],
+                "offset": 96,
+                "dtype": torch.bfloat16,
+            }[field],
+        )
+        source = SimpleNamespace(get_name=lambda: "view", get_layout=lambda: view)
+        producer = SimpleNamespace(get_layout=lambda: final)
+        with V.set_graph_handler(SimpleNamespace(try_get_buffer=lambda _: producer)):
+            with self.assertRaisesRegex(
+                NotImplementedError,
+                "Collective input view requires a finalized device layout",
+            ):
+                _collective_input_layout(source)
 
     def test_allreduce_compiled_fp16_larger(self):
         """Verify compiled allreduce works with larger fp16 tensors."""
@@ -401,6 +437,20 @@ class TestAllReduceCompiled(TestCase):
             RuntimeError, "BF16 collectives require DL16 device storage"
         ):
             torch.ops.spyre.allreduce_run(x, -1)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("prefix", [False, True])
+    def test_allreduce_rejects_unsupported_storage_view(self, dtype, prefix):
+        expected = torch.ones((5, 96), dtype=dtype)
+        base = expected.to(DEVICE)
+        x = base[:-1] if prefix else base[1:]
+        self.assertEqual(x.storage_offset() == 0, prefix)
+        error = (
+            "matching device storage extent" if prefix else "nonzero storage offsets"
+        )
+        with self.assertRaisesRegex(RuntimeError, error):
+            torch.ops.spyre.allreduce_run(x, -1)
+        self.assertTrue(torch.equal(base.cpu(), expected))
 
 
 if __name__ == "__main__":

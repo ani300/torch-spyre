@@ -494,17 +494,15 @@ def _dtype_to_int(dtype: torch.dtype) -> int:
 def _compute_device_num_elems(layout: "FixedLayout") -> int:
     """Count storage in the scalar-type units passed to the collective planner.
 
-    For FixedTiledLayout (has device_layout), uses the actual device size.
-    For plain FixedLayout (intermediates), falls back to logical numel.
+    A finalized device layout is required: logical numel can omit padding.
     """
-    if isinstance(layout, FixedTiledLayout):
-        size_bytes = get_device_size_in_bytes(layout.device_layout)
-        # The plan receives layout.dtype too. Device element count alone would
-        # change byte coverage when host and device widths differ (e.g. int64).
-        element_size = torch.tensor([], dtype=layout.dtype).element_size()
-        return size_bytes // element_size
-    numel = sympy.prod(layout.size)
-    return int(V.graph.sizevars.guarding_hint_or_throw(numel))
+    if not isinstance(layout, FixedTiledLayout):
+        raise NotImplementedError("Collective input requires a finalized device layout")
+    size_bytes = get_device_size_in_bytes(layout.device_layout)
+    # The plan receives layout.dtype too. Device element count alone would
+    # change byte coverage when host and device widths differ (e.g. int64).
+    element_size = torch.tensor([], dtype=layout.dtype).element_size()
+    return size_bytes // element_size
 
 
 def _collective_input_layout(input_tensor: IRNode) -> FixedLayout:
@@ -512,7 +510,7 @@ def _collective_input_layout(input_tensor: IRNode) -> FixedLayout:
     if not isinstance(layout, FixedTiledLayout):
         # ExternKernel inputs can retain a pre-scheduling buffer object after
         # the producer's device layout has been finalized. Use the allocation's
-        # padded layout, while preserving any distinct input view geometry.
+        # padded layout only when it describes this exact input geometry.
         producer = V.graph.try_get_buffer(input_tensor.get_name())
         if producer is not None:
             final_layout = producer.get_layout()
@@ -524,6 +522,13 @@ def _collective_input_layout(input_tensor: IRNode) -> FixedLayout:
                 and layout.dtype == final_layout.dtype
             ):
                 return final_layout
+        # A view cannot borrow its base allocation's size, and logical numel
+        # cannot establish the view's padded size. Reject missing metadata
+        # rather than silently submitting a truncated collective.
+        raise NotImplementedError(
+            "Collective input view requires a finalized device layout matching "
+            "its size, stride, offset, and dtype"
+        )
     return layout
 
 

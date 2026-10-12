@@ -28,6 +28,8 @@ from utils import (
     _assert_tensor_equal,
     _bfloat16_collective_expected,
     _bfloat16_rank_input,
+    _collective_expected,
+    _collective_rank_input,
     _native_bfloat16_tensor,
 )
 
@@ -179,7 +181,7 @@ class TestAllGather(TestCase):
         """Test allgather with 2D float16 tensors using async_op=True."""
         self._test_allgather_helper(shape=(4, 64), dtype=torch.float16, async_op=True)
 
-    @parametrize("shape", [(128,), (4, 64)])
+    @parametrize("shape", [(128,), (4, 64), (4, 96)])
     @parametrize("async_op", [False, True])
     def test_allgather_bfloat16(self, shape, async_op):
         x = _bfloat16_rank_input(self.comm_rank, shape).to(DEVICE)
@@ -193,6 +195,21 @@ class TestAllGather(TestCase):
         self.assertEqual(
             torch.cat([part.cpu() for part in outputs]),
             _bfloat16_collective_expected("allgather", shape, self.comm_size),
+            rtol=0,
+            atol=0,
+        )
+
+    @parametrize("async_op", [False, True])
+    def test_allgather_float16_padded(self, async_op):
+        shape = (4, 96)
+        x = _collective_rank_input(self.comm_rank, shape, torch.float16).to(DEVICE)
+        outputs = [torch.empty_like(x) for _ in range(self.comm_size)]
+        work = dist.all_gather(outputs, x, async_op=async_op)
+        if async_op:
+            work.wait()
+        self.assertEqual(
+            torch.cat([part.cpu() for part in outputs]),
+            _collective_expected("allgather", shape, self.comm_size, torch.float16),
             rtol=0,
             atol=0,
         )
