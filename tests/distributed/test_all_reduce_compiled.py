@@ -169,6 +169,24 @@ class TestAllReduceCompiled(TestCase):
             f"Expected {expected[0].item()}, got {result[0].to('cpu').item()}",
         )
 
+    def test_allreduce_compiled_fp16_padded_intermediate(self):
+        """The plan must cover the finalized producer's padded device storage."""
+
+        def fn(x):
+            y = torch.ops._c10d_functional.all_reduce(x * 2.0, "sum", _GROUP_NAME)
+            return torch.ops._c10d_functional.wait_tensor(y) * 0.5
+
+        x = torch.full(
+            (4, 96), float(self.comm_rank + 1), dtype=torch.float16, device=DEVICE
+        )
+        result = torch.compile(fn, fullgraph=True)(x)
+        expected = torch.full(
+            (4, 96),
+            self.comm_size * (self.comm_size + 1) / 2,
+            dtype=torch.float16,
+        )
+        self.assertEqual(result.cpu(), expected, rtol=0, atol=0)
+
     def test_allreduce_compiled_fp16_larger(self):
         """Verify compiled allreduce works with larger fp16 tensors."""
         x = torch.ones((256,), dtype=torch.float16, device=DEVICE)

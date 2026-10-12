@@ -507,6 +507,26 @@ def _compute_device_num_elems(layout: "FixedLayout") -> int:
     return int(V.graph.sizevars.guarding_hint_or_throw(numel))
 
 
+def _collective_input_layout(input_tensor: IRNode) -> FixedLayout:
+    layout = input_tensor.get_layout()
+    if not isinstance(layout, FixedTiledLayout):
+        # ExternKernel inputs can retain a pre-scheduling buffer object after
+        # the producer's device layout has been finalized. Use the allocation's
+        # padded layout, while preserving any distinct input view geometry.
+        producer = V.graph.try_get_buffer(input_tensor.get_name())
+        if producer is not None:
+            final_layout = producer.get_layout()
+            if (
+                isinstance(final_layout, FixedTiledLayout)
+                and layout.size == final_layout.size
+                and layout.stride == final_layout.stride
+                and layout.offset == final_layout.offset
+                and layout.dtype == final_layout.dtype
+            ):
+                return final_layout
+    return layout
+
+
 class BroadcastAsyncFallback(ir.ExternKernel):
     """IR node for spyre.broadcast_async — emits a runtime call to async broadcast.
 
@@ -521,7 +541,7 @@ class BroadcastAsyncFallback(ir.ExternKernel):
         src_rank, group_name = self.constant_args
         output_name = self.get_name()
 
-        input_layout = input_tensor.get_layout()
+        input_layout = _collective_input_layout(input_tensor)
         dtype_code = _dtype_to_int(input_layout.dtype)
         num_elems = _compute_device_num_elems(input_layout)
 
@@ -598,7 +618,7 @@ class AllGatherAsyncFallback(ir.ExternKernel):
         group_size, group_name = self.constant_args
         output_name = self.get_name()
 
-        input_layout = input_tensor.get_layout()
+        input_layout = _collective_input_layout(input_tensor)
         dtype_code = _dtype_to_int(input_layout.dtype)
         num_elems = _compute_device_num_elems(input_layout)
 
@@ -678,7 +698,7 @@ class AllReduceAsyncFallback(ir.ExternKernel):
         reduce_op, group_name = self.constant_args
         output_name = self.get_name()
 
-        input_layout = input_tensor.get_layout()
+        input_layout = _collective_input_layout(input_tensor)
         dtype_code = _dtype_to_int(input_layout.dtype)
         num_elems = _compute_device_num_elems(input_layout)
 
