@@ -309,8 +309,7 @@ The layers between user code and the device. Green boxes are in-tree (Apache-2.0
 
 ### Supported collectives
 
-The following collectives are implemented today, all in synchronous (blocking)
-mode:
+The following collectives are implemented:
 
 | Collective | Status |
 |---|---|
@@ -322,11 +321,26 @@ mode:
 | `reduce` | Implemented |
 | `allreduce` | Implemented |
 
-`asyncOp=True` is rejected uniformly across these methods. The remaining
-process-group entries (`scatter`, `reduce_scatter`, `alltoall`,
+`broadcast`, `allgather`, `reduce`, and `allreduce` also support
+`async_op=True`; wait for completion with the returned work handle's `wait()`.
+The remaining process-group entries (`scatter`, `reduce_scatter`, `alltoall`,
 `alltoall_base`, `_allgather_base`, `allreduce_coalesced`) raise
 `SpyreCCLNotSupportedException`. `recvAnysource` is intentionally
 unsupported: the protocol overhead is high and call sites are rare.
+
+### BF16 collective tensors
+
+`torch.bfloat16` Spyre tensors use DL16 (`SEN169_FP16`) device storage by
+default. Eager broadcast, allgather, SUM reduce, and SUM allreduce communicate
+that storage directly, preserving the public BF16 dtype. Compiled broadcast,
+allgather, and SUM allreduce use the same device format. No intermediate
+conversion through `torch.float16` is required.
+
+As with other BF16 Spyre operations, computation uses DL16 arithmetic.
+Explicit tensor layouts containing native BF16 device storage are rejected;
+their bytes cannot be interpreted as DL16. Compiled collective plans include
+the finalized allocation's padding, including padding introduced by a producer
+operation before the collective.
 
 ### One device per process
 

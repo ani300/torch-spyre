@@ -29,6 +29,7 @@
 #include "spyre_allocator.h"
 #include "spyre_composite_address.h"
 #include "spyre_stream.h"
+#include "spyre_tensor_impl.h"
 #include "types_mapping.h"
 
 namespace c10d {
@@ -334,6 +335,15 @@ spyre_comms::TensorInfo SpyreCCLBackend::getTensorInfo(
   const auto [sen_dtype_cpu, sen_dtype_dev] =
       convert_string_to_datatype_pair(str_type);
   spyre_comms::TensorShape t_shape(shape);
+  if (input.scalar_type() == c10::ScalarType::BFloat16) {
+    TORCH_CHECK(
+        spyre::get_spyre_tensor_layout(input).device_dtype ==
+            DataFormats::SEN169_FP16,
+        "BF16 collectives require DL16 device storage; explicit non-DL16 "
+        "device layouts are not supported");
+    // The borrowed device address already contains DL16, not host BF16.
+    return spyre_comms::TensorInfo{sen_dtype_dev, t_shape};
+  }
   spyre_comms::TensorInfo ti{sen_dtype_cpu, t_shape};
   return ti;
 }
@@ -475,11 +485,12 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
                            " Actual: " + std::to_string(opts.reduceOp);
     TORCH_CHECK(false, _err_msg);
   }
-  // Spyre Comms only supports float16 tensors because of the 'op' path
-  // through the compiler. The data transfers do not have this restriction.
-  if (spyre::torchScalarToString[tensors[0].scalar_type()] != "float16") {
+  // FP16 and BF16 both use DL16 for device-side SUM.
+  if (tensors[0].scalar_type() != c10::ScalarType::Half &&
+      tensors[0].scalar_type() != c10::ScalarType::BFloat16) {
     std::string _err_msg =
-        "[" + getBackendName() + "]: Allreduce only supports float16 tensors." +
+        "[" + getBackendName() +
+        "]: Allreduce only supports float16 and bfloat16 tensors." +
         " Actual: " + spyre::torchScalarToString[tensors[0].scalar_type()];
     TORCH_CHECK(false, _err_msg);
   }
@@ -601,11 +612,12 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
                            " Actual: " + std::to_string(opts.reduceOp);
     TORCH_CHECK(false, _err_msg);
   }
-  // Spyre Comms only supports float16 tensors because of the 'op' path
-  // through the compiler. The data transfers do not have this restriction.
-  if (spyre::torchScalarToString[tensors[0].scalar_type()] != "float16") {
+  // FP16 and BF16 both use DL16 for device-side SUM.
+  if (tensors[0].scalar_type() != c10::ScalarType::Half &&
+      tensors[0].scalar_type() != c10::ScalarType::BFloat16) {
     std::string _err_msg =
-        "[" + getBackendName() + "]: Reduce only supports float16 tensors." +
+        "[" + getBackendName() +
+        "]: Reduce only supports float16 and bfloat16 tensors." +
         " Actual: " + spyre::torchScalarToString[tensors[0].scalar_type()];
     TORCH_CHECK(false, _err_msg);
   }

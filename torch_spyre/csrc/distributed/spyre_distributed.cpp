@@ -34,6 +34,7 @@
 #include "../spyre_allocator.h"
 #include "../spyre_composite_address.h"
 #include "../spyre_stream.h"
+#include "../spyre_tensor_impl.h"
 
 namespace spyre {
 
@@ -117,7 +118,9 @@ spyre_comms::TensorDataTypeEnum torch_dtype_to_spyre_comms(
     case c10::ScalarType::Half:
       return spyre_comms::TensorDataTypeEnum::float16;
     case c10::ScalarType::BFloat16:
-      return spyre_comms::TensorDataTypeEnum::bfloat16;
+      // Ordinary BF16 Spyre tensors already contain DL16 device data. The
+      // collective borrows that storage; no host conversion is involved.
+      return spyre_comms::TensorDataTypeEnum::sen_fp16;
     case c10::ScalarType::Int:
       return spyre_comms::TensorDataTypeEnum::int32;
     case c10::ScalarType::Long:
@@ -132,6 +135,16 @@ spyre_comms::TensorDataTypeEnum torch_dtype_to_spyre_comms(
       return spyre_comms::TensorDataTypeEnum::boolean;
     default:
       TORCH_CHECK(false, "Unsupported dtype for spyre_comms: ", dtype);
+  }
+}
+
+static void check_bfloat16_collective_storage(const at::Tensor& tensor) {
+  if (tensor.scalar_type() == c10::ScalarType::BFloat16) {
+    TORCH_CHECK(
+        get_spyre_tensor_layout(tensor).device_dtype ==
+            DataFormats::SEN169_FP16,
+        "BF16 collectives require DL16 device storage; explicit non-DL16 "
+        "device layouts are not supported");
   }
 }
 
@@ -330,6 +343,8 @@ at::Tensor spyre_broadcast_run_impl(const at::Tensor& input,
   SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
                         << ", src_rank=" << src_rank;
 
+  check_bfloat16_collective_storage(input);
+
   auto context = ensure_context();
 
   std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
@@ -389,6 +404,8 @@ at::Tensor spyre_allreduce_run_impl(const at::Tensor& input,
                                     int64_t plan_handle) {
   SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle;
 
+  check_bfloat16_collective_storage(input);
+
   auto context = ensure_context();
 
   std::lock_guard<std::mutex> cache_lock(wsi_cache_mutex_);
@@ -445,6 +462,8 @@ at::Tensor spyre_allgather_run_impl(const at::Tensor& input,
                                     int64_t plan_handle, int64_t group_size) {
   SPYRE_RUNTIME_DEBUG() << "called with plan_handle=" << plan_handle
                         << ", group_size=" << group_size;
+
+  check_bfloat16_collective_storage(input);
 
   auto context = ensure_context();
 
