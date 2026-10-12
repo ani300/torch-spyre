@@ -27,6 +27,7 @@ Tests all 4 conversion cases:
 import pytest
 import torch
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+from torch_spyre._inductor import config
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
 
@@ -302,12 +303,12 @@ def test_int32_to_fp32_partial_stick_1d_then_rsqrt():
 # pair of FP32 sticks. Padding the conversions is enough while work division
 # leaves the stick dim unsplit, or while the stick dim rounded up to FP32 sticks
 # is a whole number of pairs; (68,) is the unsplit case.
-_PARTIAL_STICK_UPCAST_PASS = [(68,), (232,), (1000,), (4, 100), (4, 104)]
+_PARTIAL_STICK_UPCAST_PASS = [(68,), (196,), (232,), (1000,), (4, 100), (4, 104)]
 # Here work division splits the stick dim and the round-up ends in the middle of
 # a pair, so the pair's second stick is left to no core.
 # TODO: make work division handle staggered FP32, splitting the stick dim by
 # whole stick pairs.
-_PARTIAL_STICK_UPCAST_NEEDS_PAIRS = [(196,), (4100,), (4, 68), (4, 196)]
+_PARTIAL_STICK_UPCAST_NEEDS_PAIRS = [(4100,), (4, 68), (4, 196)]
 
 
 @pytest.mark.parametrize(
@@ -401,6 +402,25 @@ def test_stagger_to_standard_ea(x, fp16):
     spyre_result = compiled_fn(x.to("spyre"), fp16)
     ea = get_spyre_tensor_layout(spyre_result).element_arrangement
     assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
+
+
+@pytest.mark.parametrize("lx_planning", [False, True], ids=["hbm", "lx"])
+@pytest.mark.parametrize(
+    "fp16",
+    DtypeOpTable.fp16_types(),
+    ids=lambda dt: str(dt).replace("torch.", ""),
+)
+def test_stagger_to_standard_ea_one_core_row_order(lx_planning, fp16):
+    """Keep conflicting physical row segments local to one core (#4703)."""
+    torch._dynamo.reset()
+    # Distinct, exactly representable rows make a row permutation unambiguous.
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1)
+    x = x.expand(2, 4, 64).contiguous()
+    with config.patch({"sencores": 1, "lx_planning": lx_planning}):
+        compiled_fn = torch.compile(_stagger_fn, backend="inductor", fullgraph=True)
+        result = compiled_fn(x.to(DEVICE_NAME), fp16)
+    torch.testing.assert_close(result.cpu(), x.to(fp16), atol=0, rtol=0)
+    assert_ea(result, ElementArrangement.STANDARD)
 
 
 _SLICED_RMSNORM_SHAPES = {
