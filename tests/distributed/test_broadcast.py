@@ -277,6 +277,28 @@ class TestBroadcast(TestCase):
         ):
             dist.broadcast(x, src=0)
 
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("async_op", [False, True])
+    @parametrize("last_rank", [False, True])
+    def test_broadcast_scalar(self, dtype, async_op, last_rank):
+        """A logical scalar still communicates its full padded device stick."""
+        root = self.comm_size - 1 if last_rank else 0
+        value = 2.0**20 if dtype == torch.bfloat16 else 16.0
+        expected = torch.tensor(value, dtype=dtype)
+        x = torch.tensor(value if self.comm_rank == root else -1.0, dtype=dtype).to(
+            DEVICE
+        )
+        work = dist.broadcast(x, src=root, async_op=async_op)
+        if async_op:
+            self.assertIsNotNone(work)
+            work.wait()
+            self.assertTrue(work.is_completed())
+        else:
+            self.assertIsNone(work)
+        result = x.cpu()
+        self.assertEqual(result.shape, torch.Size([]))
+        self.assertEqual(result, expected, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     run_tests()

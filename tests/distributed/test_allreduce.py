@@ -65,6 +65,26 @@ C10D_BACKEND = "spyreccl"
 
 @instantiate_parametrized_tests
 class TestAllReduce(TestCase):
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("async_op", [False, True])
+    def test_allreduce_scalar(self, dtype, async_op):
+        """SUM covers a scalar's logical value within its padded allocation."""
+        scale = 2.0**20 if dtype == torch.bfloat16 else 16.0
+        x = torch.tensor(scale * (self.comm_rank + 1), dtype=dtype).to(DEVICE)
+        work = dist.all_reduce(x, op=dist.ReduceOp.SUM, async_op=async_op)
+        if async_op:
+            self.assertIsNotNone(work)
+            work.wait()
+            self.assertTrue(work.is_completed())
+        else:
+            self.assertIsNone(work)
+        expected = torch.tensor(
+            scale * self.comm_size * (self.comm_size + 1) / 2, dtype=dtype
+        )
+        result = x.cpu()
+        self.assertEqual(result.shape, torch.Size([]))
+        self.assertEqual(result, expected, rtol=0, atol=0)
+
     @classmethod
     def setUpClass(cls):
         """Set up the distributed environment once for all tests."""

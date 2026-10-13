@@ -349,14 +349,31 @@ when their physical storage includes stick padding.
 
 Collectives require contiguous inputs with zero storage offset and a device
 storage descriptor covering the input's own elements. Prefix views that retain
-the base tensor's larger descriptor are rejected. A compiled view must have a
-finalized device layout describing its own size, stride, offset, and dtype;
-missing or incompatible view metadata is rejected instead
+the base tensor's larger descriptor are rejected. A compiled collective buffer
+must have a finalized device layout describing its own size, stride, offset,
+and dtype; missing or incompatible metadata is rejected instead
 of planning from an unpadded logical element count. Compiled broadcast,
 allgather, and allreduce materialize view inputs into their own allocation
-before planning. In-place compiled allreduce copies the completed result back
-to the original view after its wait. Eager callers must materialize unsupported
-views explicitly before submission.
+before planning. In-place compiled allreduce copies the full completed result
+back to the original view even when waiting on a slice or reshape of the
+collective result. Reshapes or other stride-changing views before a wait require
+the original target to cover its full allocation; a stride-changing wait on a
+partial-allocation target raises an explicit error.
+Repeated waits reuse the current target, preserving mutations made after the first wait.
+Dtype-changing views of an outstanding in-place collective result are rejected;
+wait before changing the view's dtype.
+Eager callers must materialize unsupported views explicitly before submission.
+
+**Compatibility note:** eager collectives now diagnose nonzero storage offsets
+and descriptors that still cover a larger base allocation. Contiguity was
+already required. Materialize those views before an eager collective;
+compiled broadcast, allgather, and allreduce materialize them automatically.
+
+Zero-dimensional FP16/BF16 broadcast and SUM allreduce retain scalar shape.
+A scalar has one logical element (`dma_sizes` is empty, whose product is
+one), while its DL16 allocation occupies a full 64-element stick. Collective
+plans communicate that physical allocation, just as they do for padded
+multidimensional tensors; the host result remains a single scalar.
 
 ### One device per process
 

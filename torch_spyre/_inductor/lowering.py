@@ -2441,7 +2441,7 @@ def lower_c10d_wait_tensor_async(tensor):
     """
     Direct lowering for _c10d_functional.wait_tensor using ASYNC pattern.
 
-    Synchronizes on the async broadcast operation, blocking until communication completes.
+    Synchronizes on the async collective operation, blocking until communication completes.
 
     Flow:
       _c10d_functional.wait_tensor → This lowering → WaitWorkFallback
@@ -2450,21 +2450,20 @@ def lower_c10d_wait_tensor_async(tensor):
     logger.debug("Lowering _c10d_functional.wait_tensor to WaitWorkFallback")
 
     tensor.realize()
-    result = ir.TensorBox.create(
-        WaitWorkFallback(
-            torch.ops.spyre.wait_work.default,
-            tensor,
+    producer = WaitWorkFallback.get_copy_back_producer(tensor)
+    if producer is not None and producer.copy_back_result is not None:
+        # The first wait already copied back. Preserve aliases of the current
+        # target, including mutations performed since that wait.
+        return WaitWorkFallback.copy_back_view(
+            tensor, producer, producer.copy_back_result
         )
-    )
-
-    producer = V.graph.try_get_buffer(tensor.get_name())
-    if (
-        isinstance(producer, AllReduceAsyncFallback)
-        and producer.mutation_target is not None
-    ):
-        # In-place collectives become visible through the original view after
-        # the wait. Keep the copy dependent on the completed temporary buffer.
-        return lowering.mutate_to(producer.mutation_target, result)
+    wait = WaitWorkFallback(torch.ops.spyre.wait_work.default, tensor)
+    result = ir.TensorBox.create(wait)
+    if wait.copy_back_producer is not None:
+        producer = wait.copy_back_producer
+        target = lowering.mutate_to(producer.mutation_target, result)
+        producer.copy_back_result = target
+        return wait.copy_back_view(wait.waited_tensor, producer, target)
     return result
 
 

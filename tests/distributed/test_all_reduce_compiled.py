@@ -35,8 +35,10 @@ from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
+    subtest,
 )
 
+from inductor.utils_inductor import expects_raise
 from utils import (
     _bfloat16_collective_expected,
     _bfloat16_rank_input,
@@ -468,6 +470,163 @@ class TestAllReduceCompiled(TestCase):
             base, result = compiled(local.to(DEVICE))
             self.assertEqual(base.cpu(), expected_base, rtol=0, atol=0)
             self.assertEqual(result.cpu(), expected, rtol=0, atol=0)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize(
+        "wait_kind",
+        [
+            "direct",
+            "slice",
+            "reshape",
+            "nested",
+            "repeated",
+            # TODO: Make these positive when view lowering can represent
+            # stride changes across a partial allocation.
+            subtest("offset_reshape", decorators=[expects_raise]),
+            subtest("offset_nested", decorators=[expects_raise]),
+            subtest("prefix_reshape", decorators=[expects_raise]),
+        ],
+    )
+    @parametrize("rebind", [False, True])
+    def test_allreduce_compiled_copy_back_dataflow(self, dtype, wait_kind, rebind):
+        from unittest.mock import patch
+
+        from torch._inductor import config as inductor_config
+        from torch._inductor import ir
+        from torch._inductor import lowering
+        from torch._inductor.exc import InductorError
+        from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor import lowering as spyre_lowering
+        from torch_spyre._inductor.ir import WaitWorkFallback
+
+        full_allocation = wait_kind in ("reshape", "nested")
+        shape = (2, 2, 96) if full_allocation else (5, 96)
+        rejects_partial_view = wait_kind.startswith(("offset_", "prefix_"))
+
+        def target_view(x):
+            if full_allocation:
+                return x.reshape(4, 96)
+            return x[:4] if wait_kind == "prefix_reshape" else x[1:]
+
+        def waited_view(x):
+            if wait_kind in ("slice", "repeated"):
+                return x[1:3]
+            if wait_kind.endswith("reshape"):
+                return x.reshape(2, 2, 96)
+            if wait_kind.endswith("nested"):
+                return x.reshape(2, 2, 96)[1:]
+            return x
+
+        def fn(x):
+            base = x * 2.0
+            target = target_view(base)
+            reduced = torch.ops._c10d_functional.all_reduce(target, "sum", _GROUP_NAME)
+            ready = torch.ops._c10d_functional.wait_tensor(waited_view(reduced))
+            if wait_kind == "repeated":
+                again = torch.ops._c10d_functional.wait_tensor(reduced)
+                return base * 0.5, ready * 0.5, again * 0.5
+            return base * 0.5, ready * 0.5
+
+        wait_impl = spyre_lowering.lower_c10d_wait_tensor_async
+        rebound = []
+        mutations = []
+
+        def wait_with_test_mutations(tensor):
+            producer = WaitWorkFallback.get_copy_back_producer(tensor)
+            if (
+                wait_kind == "repeated"
+                and producer is not None
+                and producer.copy_back_result is not None
+            ):
+                # Inject the actual backend mutation between waits. A frontend
+                # add_ would be functionalized into a new base allocation and
+                # would not exercise the live copy-back target's alias chain.
+                target = producer.mutation_target
+                lowering.mutate_to(target, lowering.add(target, 2.0))
+                mutations.append(producer)
+            if not rebind:
+                return wait_impl(tensor)
+            graph = V.graph
+            name = tensor.get_name()
+            old = graph.name_to_buffer[name]
+            # Simulate a pass replacing the name registry entry while this
+            # consumer still holds the original producer through its IR edges.
+            replacement = ir.InputBuffer(name=name, layout=old.get_layout())
+            graph.name_to_buffer[name] = replacement
+            try:
+                rebound.append(name)
+                return wait_impl(tensor)
+            finally:
+                graph.name_to_buffer[name] = old
+
+        # Trace a functional op, then exercise its in-place backend lowering.
+        # Directly tracing all_reduce_ is rejected by AOT functionalization;
+        # this models the operator substitution done by Inductor's reinplacer.
+        overrides = {
+            torch.ops._c10d_functional.all_reduce.default: spyre_lowering.lower_c10d_all_reduce_inplace,
+            torch.ops._c10d_functional.wait_tensor.default: wait_with_test_mutations,
+        }
+        local = _collective_rank_input(self.comm_rank, shape, dtype)
+        expected = target_view(
+            _collective_expected("allreduce", shape, self.comm_size, dtype)
+        )
+        if wait_kind == "repeated":
+            expected = expected + 1.0
+        expected_base = local.clone()
+        target_view(expected_base).copy_(expected)
+        torch._dynamo.reset()
+        with (
+            inductor_config.patch(fx_graph_cache=False),
+            patch.dict(spyre_lowering.spyre_lowerings, overrides),
+        ):
+            compiled = torch.compile(fn, fullgraph=True)
+            if rejects_partial_view:
+                with pytest.raises(
+                    InductorError,
+                    match="stride-changing waits on an in-place collective",
+                ):
+                    compiled(local.to(DEVICE))
+                if rebind:
+                    self.assertTrue(rebound)
+                return
+            for _ in range(2):
+                outputs = compiled(local.to(DEVICE))
+                self.assertEqual(outputs[0].cpu(), expected_base, rtol=0, atol=0)
+                self.assertEqual(
+                    outputs[1].cpu(), waited_view(expected), rtol=0, atol=0
+                )
+                if wait_kind == "repeated":
+                    self.assertEqual(outputs[2].cpu(), expected, rtol=0, atol=0)
+        if rebind:
+            self.assertTrue(rebound)
+        if wait_kind == "repeated":
+            self.assertEqual(len(mutations), 1)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    @parametrize("view_kind", ["dtype", "reinterpret"])
+    @expects_raise
+    def test_allreduce_compiled_copy_back_rejects_dtype_view(self, dtype, view_kind):
+        from torch._inductor import ir
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.ir import WaitWorkFallback
+
+        layout = ir.FixedLayout(DEVICE, dtype, [4, 96], [96, 1])
+        target = ir.TensorBox.create(ir.InputBuffer(name="target", layout=layout))
+        if view_kind == "dtype":
+            view = ir.DtypeView(data=target.data, target_dtype=torch.int16)
+        else:
+            view = ir.ReinterpretView(
+                data=target.data,
+                layout=ir.FixedLayout(DEVICE, torch.int16, [4, 96], [96, 1]),
+            )
+        producer = SimpleNamespace(get_dtype=lambda: dtype)
+        with pytest.raises(
+            Unsupported,
+            match="dtype-changing views of an in-place collective before its wait",
+        ):
+            WaitWorkFallback.copy_back_view(ir.TensorBox(view), producer, target)
 
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_allreduce_compiled_row_parallel_linear(self, dtype):
