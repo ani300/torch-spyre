@@ -1717,12 +1717,7 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
                 )
             bursts = _read_burst_arg_excess(op, arg, p)
             price = t - nbytes / p.bw_peak_gbps - (0 if bursts is None else bursts)
-            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
-            price = sympy.sympify(price)
-            if price.free_symbols:
-                total += (1 - is_lx) * sympy.Max(0, price)
-            else:
-                total += (1 - is_lx) * max(0.0, float(price))
+            total += (1 - arg.is_lx) * max(0.0, price)
     return total
 
 
@@ -2389,20 +2384,16 @@ def _pointwise_core_excess_ns(ops: list, p: "CostParams"):
         if transport_dma_cost_available(op, p) and not op.transport_compute_read:
             continue
         cores = op.cores
-        symbolic = isinstance(cores, sympy.Basic) and bool(cores.free_symbols)
-        if symbolic:
-            per_byte = sympy.Max(0, 1 / (cores * rate) - sympy.Float(1 / peak))
-        else:
-            per_byte = max(0.0, 1.0 / (max(1, int(cores)) * rate) - 1.0 / peak)
-            if per_byte == 0:
-                continue
+        per_byte = max(0.0, 1.0 / (cores * rate) - 1.0 / peak)
+        if per_byte == 0:
+            continue
         for arg in op.args:
             if arg.role == "input" and arg.broadcast:
                 continue
             nbytes = arg.elems * (arg.loop_factor or 1) * op.dtype_bytes
             if _is_sym(nbytes) or nbytes < p.pointwise_core_min_bytes:
                 continue
-            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
+            is_lx = arg.is_lx
             if arg.role == "output" and arg.is_graph_boundary:
                 is_lx = 0  # the clone-out still writes it
             total += (1 - is_lx) * nbytes * per_byte
@@ -2681,7 +2672,7 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
             excess = _read_burst_arg_excess(op, arg, p)
             if excess is None:
                 continue
-            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
+            is_lx = arg.is_lx
             lf = getattr(arg, "loop_factor", 1) or 1
             total += (1 - is_lx) * lf * excess
     return total
