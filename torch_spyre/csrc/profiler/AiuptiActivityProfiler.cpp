@@ -20,6 +20,7 @@
 #include <libaiupti/aiupti_runtime_cbid.h>
 
 #include <chrono>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <set>
@@ -69,12 +70,17 @@ void AiuptiActivityProfilerSession::processTrace(
                                            "__aiu_profiler__");
   traceBuffer_.span.iteration = iterationCount_++;
 
+  threadNames_.clear();
   auto aiuBuffer = api_.activityBuffers();
   if (aiuBuffer) {
     // Records from different queues need not arrive in causal order. Build the
     // batch -> CPU association before processing any device activities.
     api_.processActivities(*aiuBuffer, [this](const Pti_Activity* record) {
-      if (record->kind == AIUPTI_ACTIVITY_KIND_RUNTIME) {
+      if (record->kind == AIUPTI_ACTIVITY_KIND_THREAD) {
+        const auto* a = reinterpret_cast<const AIUpti_ActivityThread*>(record);
+        threadNames_[{a->process_id, a->thread_id}] =
+            std::string(a->name, strnlen(a->name, sizeof(a->name)));
+      } else if (record->kind == AIUPTI_ACTIVITY_KIND_RUNTIME) {
         const auto* a = reinterpret_cast<const AIUpti_ActivityAPI*>(record);
         if (a->calibration_id != 0) return;
         const bool isSubmit =

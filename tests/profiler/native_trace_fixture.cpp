@@ -46,6 +46,7 @@ using libkineto::Pti_Activity;
 class SyntheticApi : public AiuptiActivityApi {
  public:
   std::vector<AIUpti_ActivityAPI> runtime;
+  std::vector<AIUpti_ActivityThread> threads;
   std::vector<AIUpti_ActivityCompute> kernels;
 
   std::unique_ptr<AiuptiActivityBufferDeque> activityBuffers() override {
@@ -62,7 +63,11 @@ class SyntheticApi : public AiuptiActivityApi {
     for (const auto& record : runtime) {
       handler(reinterpret_cast<const Pti_Activity*>(&record));
     }
-    return {runtime.size() + kernels.size(), 0};
+    // Names arrive after their events, as can happen across separate queues.
+    for (const auto& record : threads) {
+      handler(reinterpret_cast<const Pti_Activity*>(&record));
+    }
+    return {runtime.size() + kernels.size() + threads.size(), 0};
   }
 };
 
@@ -76,6 +81,7 @@ class SyntheticSession : public AiuptiActivityProfilerSession {
 
   void start() override {
     syntheticApi.runtime.clear();
+    syntheticApi.threads.clear();
     syntheticApi.kernels.clear();
     externalIds.clear();
   }
@@ -125,7 +131,16 @@ uint64_t emitBatch(uint32_t batch, const std::string& mode) {
   submit.end = now + 5000;
   submit.correlation_id = batch;
   submit.external_id = external;
-  std::memcpy(submit.thread_name, "test-scheduler", sizeof("test-scheduler"));
+  // One thread intentionally has no metadata, exercising the numeric fallback.
+  if (mode == "orphan" || batch == 8) ++submit.thread_id;
+  if (syntheticApi.threads.empty()) {
+    AIUpti_ActivityThread thread{};
+    thread.activity_kind = AIUPTI_ACTIVITY_KIND_THREAD;
+    thread.process_id = submit.process_id;
+    thread.thread_id = submit.thread_id;
+    std::memcpy(thread.name, "test-scheduler", sizeof("test-scheduler"));
+    syntheticApi.threads.push_back(thread);
+  }
   if (mode == "orphan") submit.external_id = 0;
   if (mode == "wide") submit.external_id |= uint64_t{1} << 40;
   if (mode == "calibration") submit.calibration_id = 1;

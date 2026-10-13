@@ -345,14 +345,24 @@ void AiuptiActivityProfilerSession::handleRuntimeActivity(
   runtime_activity->resource =
       calibration ? 1000000000 + activity->calibration_id : activity->thread_id;
   runtime_activity->threadId = activity->thread_id;
-  const std::string threadName(
-      activity->thread_name,
-      strnlen(activity->thread_name, sizeof(activity->thread_name)));
-  recordThreadStream(
-      runtime_activity->device, runtime_activity->resource,
-      calibration ? fmt::format("Spyre calibration (device {})",
-                                activity->calibration_id - 1)
-                  : fmt::format("{} ({})", threadName, activity->thread_id));
+  if (!hasDeviceResource(runtime_activity->device,
+                         runtime_activity->resource)) {
+    std::string name;
+    if (calibration) {
+      name = fmt::format("Spyre calibration (device {})",
+                         activity->calibration_id - 1);
+    } else {
+      const auto found =
+          threadNames_.find({activity->process_id, activity->thread_id});
+      if (found != threadNames_.end() && !found->second.empty()) {
+        name = fmt::format("{} ({})", found->second, activity->thread_id);
+      }
+    }
+    // Missing metadata only affects the label; numeric identity and flows
+    // remain.
+    recordThreadStream(runtime_activity->device, runtime_activity->resource,
+                       name);
+  }
   if (calibration) {
     runtime_activity->addMetadata("calibration_device",
                                   activity->calibration_id - 1);
@@ -763,6 +773,9 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
 void AiuptiActivityProfilerSession::handlePtiActivity(
     const AIUpti_Activity* record, libkineto::ActivityLogger* logger) {
   switch (record->kind) {
+    case (uint8_t)AIUPTI_ACTIVITY_KIND_THREAD:
+      // Names were collected by the prepass; metadata is not a timeline span.
+      break;
     case (uint8_t)AIUPTI_ACTIVITY_KIND_RUNTIME:
       handleRuntimeActivity(reinterpret_cast<const AIUpti_ActivityAPI*>(record),
                             logger);

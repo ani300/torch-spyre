@@ -117,6 +117,7 @@ class AiuptiActivityProfilerSession
   uint32_t kExceedMaxTid = 1000;
 
   std::map<std::pair<int64_t, int64_t>, libkineto::ResourceInfo> resourceInfo_;
+  std::map<std::pair<uint32_t, uint32_t>, std::string> threadNames_;
   bool hasDeviceResource(uint32_t device, uint32_t id);
   void recordStream(uint32_t device, uint32_t id);
   void recordMemoryStream(uint32_t device, uint32_t id, std::string kind);

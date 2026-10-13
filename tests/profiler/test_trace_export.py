@@ -99,6 +99,21 @@ def test_standard_export_contains_both_flow_stages(native_traces, filename):
     assert wide["args"]["external_correlation"] > 2**40
     assert "External id" not in wide["args"]
     assert "spyre_submission_links" not in trace
+    names = {
+        (e["pid"], e["tid"]): e["args"]["name"]
+        for e in events
+        if e.get("ph") == "M" and e.get("name") == "thread_name"
+    }
+    normal = next(e for e in submits if e["args"]["correlation"] == 7)
+    assert names[normal["pid"], normal["tid"]] == f"test-scheduler ({normal['tid']})"
+    unnamed = next(e for e in submits if e["args"]["correlation"] == 8)
+    assert names[unnamed["pid"], unnamed["tid"]] == f"Thread {unnamed['tid']}"
+    orphan = next(e for e in submits if e["args"]["correlation"] == 9)
+    assert names[orphan["pid"], orphan["tid"]] == f"Thread {orphan['tid']}"
+    calibration = next(e for e in submits if e["args"]["correlation"] == 11)
+    assert (
+        names[calibration["pid"], calibration["tid"]] == "Spyre calibration (device 0)"
+    )
 
 
 def _capture_native_traces(output):

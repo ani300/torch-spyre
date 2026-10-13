@@ -227,6 +227,7 @@ void AiuptiActivityApi::enableAiuptiActivities(
       activityEnabled = true;
     }
     if (activity == libkineto::ActivityType::PRIVATEUSE1_RUNTIME) {
+      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_THREAD));
       AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_RUNTIME));
       activityEnabled = true;
     }
@@ -248,6 +249,7 @@ void AiuptiActivityApi::enableAiuptiActivities(
       AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_MEMORY));
       AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_MEMSET));
       AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_CMPT));
+      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_THREAD));
       AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_RUNTIME));
       AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_DRIVER));
     }
@@ -281,6 +283,7 @@ void AiuptiActivityApi::disablePtiActivities(
     }
     if (activity == libkineto::ActivityType::PRIVATEUSE1_RUNTIME) {
       AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_RUNTIME));
+      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_THREAD));
       activityDisabled = true;
     }
     if (activity == libkineto::ActivityType::PRIVATEUSE1_DRIVER) {
@@ -299,6 +302,7 @@ void AiuptiActivityApi::disablePtiActivities(
       AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_MEMSET));
       AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_CMPT));
       AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_RUNTIME));
+      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_THREAD));
       AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_DRIVER));
     }
   }
