@@ -202,42 +202,6 @@ from .work_division import (
 from . import config
 
 
-class ResidencyGatedPrice(sympy.Function):
-    """``ResidencyGatedPrice(is_lx, price)``: ``(1 - is_lx) * price``, a
-    charge paid only while an arg stays in HBM, whose ``price`` is a function of
-    one op's core-division split symbols alone.
-
-    Written out as algebra, that product of a residency literal and a nested
-    Piecewise over the op's splits and core count (``_read_burst_excess_ns``)
-    lowered to a literal per branch condition plus a product variable per
-    branch: on a GPT-2 prefill graph about 10k of the solver's 19k variables,
-    with an LP relaxation weak enough that CP-SAT stopped FEASIBLE at its 30 s
-    limit where it had proven OPTIMAL in about 10 s without the term. As one
-    function node the term is opaque to the rewrite passes, and the CP-SAT
-    printer tabulates ``price`` over the op's candidate divisions and charges
-    each priced level through a single literal, exactly
-    ``division in level and not is_lx``
-    (``_SympyExprToCpSat._lower_gated_prices``): the same objective with a
-    tight relaxation. ``lambdify`` evaluates the node through :meth:`_imp_`, and
-    ``eval`` folds it once ``is_lx`` is 1 or both arguments are numeric.
-    """
-
-    is_real = True
-
-    @classmethod
-    def eval(cls, is_lx, price):
-        if is_lx.is_Number:
-            if is_lx == 1:
-                return sympy.S.Zero
-            if price.is_Number:
-                return (1 - is_lx) * price
-        return None
-
-    @staticmethod
-    def _imp_(is_lx, price):
-        return (1 - is_lx) * price
-
-
 @dataclasses.dataclass
 class ArgTraffic:
     """Traffic for one tensor argument of an op."""
@@ -1693,8 +1657,7 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
     divisions whose slices are small cost nothing extra. A replicated operand
     that is not a shared load keeps ``_replicated_operand_reads``. Single-pass
     bundles only (``_is_single_pass``), and operands of at least
-    ``mm_stream_min_bytes``. With symbolic splits each read is one
-    :class:`ResidencyGatedPrice` over the op's splits.
+    ``mm_stream_min_bytes``.
     """
     gbps = p.mm_stream_gbps_per_core
     unicast = p.mm_stream_unicast_ns_per_request
@@ -1757,7 +1720,7 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
             is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
             price = sympy.sympify(price)
             if price.free_symbols:
-                total += ResidencyGatedPrice(is_lx, sympy.Max(0, price))
+                total += (1 - is_lx) * sympy.Max(0, price)
             else:
                 total += (1 - is_lx) * max(0.0, float(price))
     return total
@@ -2411,9 +2374,7 @@ def _pointwise_core_excess_ns(ops: list, p: "CostParams"):
     cores (5 or more at the defaults) are unaffected, and so are args smaller
     than ``pointwise_core_min_bytes``. Matmuls, reductions, indirect stores
     and plain copies keep their own core-count terms; a one-input arithmetic
-    op pays this as well as its request-law read. With
-    symbolic cores each arg is one :class:`ResidencyGatedPrice` over the op's
-    splits.
+    op pays this as well as its request-law read.
     """
     rate, peak = p.pointwise_gbps_per_core, p.bw_peak_gbps
     if rate <= 0 or rate >= peak:
@@ -2444,10 +2405,7 @@ def _pointwise_core_excess_ns(ops: list, p: "CostParams"):
             is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
             if arg.role == "output" and arg.is_graph_boundary:
                 is_lx = 0  # the clone-out still writes it
-            if symbolic:
-                total += ResidencyGatedPrice(is_lx, nbytes * per_byte)
-            else:
-                total += (1 - is_lx) * nbytes * per_byte
+            total += (1 - is_lx) * nbytes * per_byte
     return total
 
 
@@ -2725,12 +2683,7 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
                 continue
             is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
             lf = getattr(arg, "loop_factor", 1) or 1
-            if isinstance(excess, sympy.Basic) and excess.free_symbols:
-                # One node per read, not the algebraic product: see
-                # ResidencyGatedPrice for what the expanded form cost CP-SAT.
-                total += lf * ResidencyGatedPrice(is_lx, excess)
-            else:
-                total += (1 - is_lx) * lf * excess
+            total += (1 - is_lx) * lf * excess
     return total
 
 

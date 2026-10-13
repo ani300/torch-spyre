@@ -286,13 +286,12 @@ def test_cpsat_keeps_the_burst_price_when_replication_resolves_to_one():
         assert solver.objective_value == pytest.approx(expected, abs=1)
 
 
-def test_cpsat_tabulates_a_gated_burst_price_over_the_op_divisions():
-    """A symbolic burst price is one ResidencyGatedPrice node, which CP-SAT
-    lowers to a table over the op's candidate divisions: no branch literals,
+def test_cpsat_tabulates_a_burst_price_over_the_op_divisions():
+    """CP-SAT lowers a symbolic burst price to a table over the op's
+    candidate divisions: no branch literals,
     and the objective equals the concrete price for every division and
     residency."""
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.cost_model import ResidencyGatedPrice
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
         _CoreDivisionBufferWithCpVars,
         _SympyExprToCpSat,
@@ -322,7 +321,7 @@ def test_cpsat_tabulates_a_gated_burst_price_over_the_op_divisions():
         cores=split[d0] * split[d1],
     )
     expr = sympy.sympify(TRIPS * _read_burst_excess_ns([op], p))
-    assert expr.atoms(ResidencyGatedPrice)
+    assert expr.free_symbols
 
     is_lx = model.new_bool_var(resident.name)
     sym_map = {resident.name: is_lx}
@@ -333,7 +332,9 @@ def test_cpsat_tabulates_a_gated_burst_price_over_the_op_divisions():
     before = len(model.proto.variables)
     model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
     added = [v.name for v in model.proto.variables][before:]
-    assert not [n for n in added if n.startswith(("cond_", "piecewise_", "_product"))]
+    assert not [n for n in added if n.startswith(("cond_", "piecewise_"))]
+    # Residency gates the table through linear constraints, not a product.
+    assert not any(c.has_int_prod() for c in model.proto.constraints)
 
     solver = cp_model.CpSolver()
     for index, (a, b) in enumerate(shapes):
@@ -428,10 +429,7 @@ def test_small_pointwise_args_keep_a_division_invariant_price():
 
 
 def test_low_core_pointwise_price_is_symbolic_in_the_split():
-    from torch_spyre._inductor.cost_model import (
-        ResidencyGatedPrice,
-        _pointwise_core_excess_ns,
-    )
+    from torch_spyre._inductor.cost_model import _pointwise_core_excess_ns
 
     split = sympy.Symbol("split_buf1_d0", integer=True, positive=True)
     resident = sympy.Symbol("is_lx_buf0", integer=True, nonnegative=True)
@@ -439,7 +437,7 @@ def test_low_core_pointwise_price_is_symbolic_in_the_split():
     expr = sympy.sympify(
         _pointwise_core_excess_ns([_pointwise(split, resident=resident)], p)
     )
-    assert expr.atoms(ResidencyGatedPrice)
+    assert expr.free_symbols
     for cores in (1, 2, 4, 32):
         for lx in (0, 1):
             concrete = _pointwise_core_excess_ns(
@@ -618,10 +616,7 @@ def test_an_m_only_split_pays_for_every_core_streaming_the_whole_weight():
 
 
 def test_reused_operand_stream_price_is_symbolic_in_the_split():
-    from torch_spyre._inductor.cost_model import (
-        ResidencyGatedPrice,
-        _reused_operand_stream_excess_ns,
-    )
+    from torch_spyre._inductor.cost_model import _reused_operand_stream_excess_ns
 
     heads, rows = sympy.symbols("split_buf42_d0 split_buf42_d1", integer=True)
     p = CostParams()
@@ -631,7 +626,7 @@ def test_reused_operand_stream_price_is_symbolic_in_the_split():
                 [_decode_pv(heads * rows, rows, run=run)], p
             )
         )
-        assert expr.atoms(ResidencyGatedPrice)
+        assert expr.free_symbols
         for h, r in ((1, 1), (1, 2), (4, 1), (4, 2), (8, 2), (1, 16)):
             concrete = _reused_operand_stream_excess_ns(
                 [_decode_pv(h * r, r, run=run)], p
@@ -658,10 +653,7 @@ def test_the_stream_price_subtracts_the_burst_excess_it_overlaps():
 
 def test_cpsat_tabulates_the_reused_stream_price_over_the_op_divisions():
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.cost_model import (
-        ResidencyGatedPrice,
-        _reused_operand_stream_excess_ns,
-    )
+    from torch_spyre._inductor.cost_model import _reused_operand_stream_excess_ns
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
         _CoreDivisionBufferWithCpVars,
         _SympyExprToCpSat,
@@ -690,7 +682,7 @@ def test_cpsat_tabulates_the_reused_stream_price_over_the_op_divisions():
     op.args[1].is_lx = resident
     op.args[1].read_run_bytes = 2048 / split[d1]
     expr = sympy.sympify(_reused_operand_stream_excess_ns([op], p))
-    assert expr.atoms(ResidencyGatedPrice)
+    assert expr.free_symbols
 
     is_lx = model.new_bool_var(resident.name)
     sym_map = {resident.name: is_lx}
@@ -701,7 +693,9 @@ def test_cpsat_tabulates_the_reused_stream_price_over_the_op_divisions():
     before = len(model.proto.variables)
     model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
     added = [v.name for v in model.proto.variables][before:]
-    assert not [n for n in added if n.startswith(("cond_", "piecewise_", "_product"))]
+    assert not [n for n in added if n.startswith(("cond_", "piecewise_"))]
+    # Residency gates the table through linear constraints, not a product.
+    assert not any(c.has_int_prod() for c in model.proto.constraints)
 
     solver = cp_model.CpSolver()
     for index, (a, b) in enumerate(shapes):
@@ -717,11 +711,10 @@ def test_cpsat_tabulates_the_reused_stream_price_over_the_op_divisions():
     assert float(expr.xreplace({split[d0]: 2, split[d1]: 1, resident: 0})) > 0
 
 
-def test_cpsat_merges_gated_price_levels_an_ulp_apart():
+def test_cpsat_merges_tabular_price_levels_an_ulp_apart():
     """Two divisions whose prices are equal but for float rounding share one
-    level, so they share one gated literal instead of adding one each."""
+    level, so they share one level literal instead of adding one each."""
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.cost_model import ResidencyGatedPrice
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
         _CoreDivisionBufferWithCpVars,
         _SympyExprToCpSat,
@@ -755,11 +748,9 @@ def test_cpsat_merges_gated_price_levels_an_ulp_apart():
         split.name: wrapper.cp_core_divs[d0],
     }
     buffer_map = {split.name: (wrapper, wrapper.cp_core_divs_raw[d0])}
-    _SympyExprToCpSat(model, sym_map, buffer_map).convert(
-        ResidencyGatedPrice(resident, price)
-    )
-    gated = [v.name for v in model.proto.variables if v.name.startswith("gated_")]
-    assert len(gated) == 1
+    _SympyExprToCpSat(model, sym_map, buffer_map).convert((1 - resident) * price)
+    levels = [v.name for v in model.proto.variables if v.name.startswith("level_")]
+    assert levels == ["level_div_buf7_1_2"]
 
 
 # ------------------------------------------------- stick-plane run geometry
