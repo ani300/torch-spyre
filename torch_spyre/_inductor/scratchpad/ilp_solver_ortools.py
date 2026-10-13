@@ -680,7 +680,6 @@ class _SympyExprToCpSat(Printer):
         self._expr_cache: dict = {}
         self._untabled_expr_cache: dict = {}
         self._conjunction_cache: dict = {}
-        self._candidate_cache: dict = {}
         self._division_table_cache: dict = {}
         # (buffer, residency symbol, price table) -> the symbol standing for
         # that ResidencyGatedPrice's linear form, so equal reads share it.
@@ -697,18 +696,14 @@ class _SympyExprToCpSat(Printer):
             )
         return self._expr_cache[expr]
 
-    def _candidate_values(self, expr):
+    @memoize_method
+    def _evaluate_candidates(self, expr):
         """Evaluate an expression over at most one buffer's division menu.
 
         Residency and other free decisions stop evaluation at that node. Work
         on the rewritten expression, including its reciprocal/log scales and
         Min/Max rounding, so tabulation does not change the cost model.
         """
-        if expr not in self._candidate_cache:
-            self._candidate_cache[expr] = self._evaluate_candidates(expr)
-        return self._candidate_cache[expr]
-
-    def _evaluate_candidates(self, expr):
         if expr in (sympy.true, sympy.false):
             return None, bool(expr)
         if expr.is_Number:
@@ -749,7 +744,7 @@ class _SympyExprToCpSat(Printer):
             if expr.is_Piecewise
             else expr.args
         )
-        evaluated = [self._candidate_values(arg) for arg in args]
+        evaluated = [self._evaluate_candidates(arg) for arg in args]
         if any(value is None for value in evaluated):
             return None
         owners = [value[0] for value in evaluated if value[0] is not None]
@@ -786,7 +781,7 @@ class _SympyExprToCpSat(Printer):
         return owner, result
 
     def _division_table(self, expr):
-        evaluated = self._candidate_values(expr)
+        evaluated = self._evaluate_candidates(expr)
         if evaluated is None:
             return None
         owner, values = evaluated
