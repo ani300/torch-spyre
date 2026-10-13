@@ -188,6 +188,36 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
     )
 
 
+def _is_hbm_term(expr):
+    """``c * is_hbm_X`` if ``expr`` is exactly ``c - c*is_lx_X`` for a
+    number ``c``, else None."""
+    if not expr.is_Add or len(expr.args) != 2:
+        return None
+    c, term = expr.args
+    if not c.is_Number:
+        c, term = term, c
+    if not c.is_Number:
+        return None
+    coeff, s = term.as_coeff_Mul()
+    if not (s.is_Symbol and s.name.startswith("is_lx_") and coeff == -c):
+        return None
+    hbm = sympy.Symbol(
+        "is_hbm_" + s.name.removeprefix("is_lx_"), integer=True, nonnegative=True
+    )
+    return c * hbm
+
+
+def _is_literal(arg) -> bool:
+    """Whether ``arg`` is a CP-SAT variable or a negated boolean literal."""
+    return isinstance(arg, (cp_model.IntVar, cp_model_helper.NotBooleanVariable))
+
+
+def _is_bool_literal(arg) -> bool:
+    if isinstance(arg, cp_model_helper.NotBooleanVariable):
+        return True
+    return isinstance(arg, cp_model.IntVar) and arg.is_boolean
+
+
 def _eq_fact(rel):
     """``(lhs, number)`` for ``Eq``/``Ne`` with a numeric side, else None."""
     lhs, rhs = rel.args
@@ -932,6 +962,11 @@ class _SympyExprToCpSat(Printer):
             lambda e: e.func == sympy.floor,
             lambda e: e.args[0],
         )
+        # `c - c*is_lx_X` -> `c*is_hbm_X`, so that expand keeps the HBM charge
+        # as one term gated by the complement literal.
+        cost_expr = cost_expr.replace(
+            lambda e: _is_hbm_term(e) is not None, _is_hbm_term
+        )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
             lambda e: e.func in [sympy.log, sympy.Piecewise],
@@ -1238,12 +1273,12 @@ class _SympyExprToCpSat(Printer):
     def _print_multiply_two(self, a, b):
         if isinstance(a, (int, float)) or isinstance(b, (int, float)):
             return a * b
+        if _is_literal(a) and _is_literal(b):
+            return self._print_multiply([a, b])
         if isinstance(a, cp_model_helper.NotBooleanVariable):
             return b - self._print_multiply_two(a.Not(), b)
         if isinstance(b, cp_model_helper.NotBooleanVariable):
             return self._print_multiply_two(b, a)
-        if isinstance(a, cp_model.IntVar) and isinstance(b, cp_model.IntVar):
-            return self._print_multiply([a, b])
         if isinstance(a, (cp_model_helper.IntAffine, cp_model_helper.FloatAffine)):
             return (
                 a.coefficient * self._print_multiply_two(a.expression, b) + a.offset * b
@@ -1264,20 +1299,21 @@ class _SympyExprToCpSat(Printer):
         raise NotImplementedError(f"multiplying {type(a)} by {type(b)}")
 
     def _print_multiply(self, args):
-        ints = [arg for arg in args if isinstance(arg, cp_model.IntVar)]
-        nonints = [arg for arg in args if not isinstance(arg, cp_model.IntVar)]
+        ints = [arg for arg in args if _is_literal(arg)]
+        nonints = [arg for arg in args if not _is_literal(arg)]
         if len(ints) == 1:
             return self._print_multiply_two(math.prod(nonints), ints[0])
         elif len(ints) == 0:
             return math.prod(nonints)
 
         # Names need not be unique: in particular, both Boolean constants
-        # have an empty name. Cache by the variables' actual model identity.
+        # have an empty name. Cache by the variables' actual model identity
+        # (a negated literal's index is negative, so it differs too).
         name = "_product_" + "_".join(str(arg.index) for arg in ints)
         if name in self._sym_map:
             return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
-        if any(arg.is_boolean for arg in ints):
+        if any(_is_bool_literal(arg) for arg in ints):
             product = self._print_gated_product(ints, name)
             self._sym_map[name] = product
             return self._print_multiply_two(math.prod(nonints), product)
@@ -1315,8 +1351,8 @@ class _SympyExprToCpSat(Printer):
         otherwise, two linear constraints enforced on the literal (as in
         ``_print_RelayoutCharge``), instead of a ``multiplication_equality``
         the solver can only propagate through bounds."""
-        gates = [arg for arg in ints if arg.is_boolean]
-        rest = [arg for arg in ints if not arg.is_boolean]
+        gates = [arg for arg in ints if _is_bool_literal(arg)]
+        rest = [arg for arg in ints if not _is_bool_literal(arg)]
         if not rest:
             value, gates = gates[0], gates[1:]
         elif len(rest) == 1:
@@ -1340,6 +1376,12 @@ class _SympyExprToCpSat(Printer):
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:
             return self._sym_map[expr.name]
+        if expr.name.startswith("is_hbm_"):
+            # The complement of `is_lx_X` (see _is_hbm_term): its negated
+            # literal, so no variable or linking constraint is added.
+            in_buffer = "is_lx_" + expr.name.removeprefix("is_hbm_")
+            if in_buffer in self._sym_map:
+                return self._sym_map[in_buffer].Not()
         if not expr.name.startswith(("log2_", "inv_")):
             raise NotImplementedError(f"not implemented. expr: {expr}")
         name = expr.name[5:] if expr.name.startswith("log2_") else expr.name[4:]
@@ -1493,6 +1535,8 @@ class _SympyExprToCpSat(Printer):
     def _affine_bounds(expr):
         if isinstance(expr, cp_model.IntVar):
             lb, ub = expr.domain.min(), expr.domain.max()
+        elif isinstance(expr, cp_model_helper.NotBooleanVariable):
+            lb, ub = 0, 1
         elif isinstance(expr, (int, float)):
             lb, ub = expr, expr
         elif isinstance(expr, cp_model_helper.IntAffine):
