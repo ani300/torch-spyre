@@ -84,6 +84,11 @@ class TestSpyreConfig(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xAFFE)
 
+    # Greedy work division uses every configured core; the co-optimizer may
+    # price fewer as no slower (an 8-way split of this abs runs 1.36 ms on
+    # device against 2.00 ms for 32 cores), so its plan says nothing about
+    # which core count reached codegen.
+    @config.patch({"co_optimizing_lx_planning": False})
     def test_config_default(self):
         fn = torch.abs
         x = torch.randn((256, 128, 512)).to("spyre")
@@ -93,8 +98,7 @@ class TestSpyreConfig(InductorTestCase):
         # print("test_config_default")
         # print(source_codes[0])
         FileCheck().check("sdsc_fused_abs").run(source_codes[0])
-        # Co-optimization spreads the split across dims; the product of the
-        # per-dim split factors must add up to the configured core count.
+        # The product of the per-dim split factors is the core count used.
         self.assertEqual(_total_core_split(source_codes[0]), config.sencores)
 
     @config.patch({"sencores": 64})
