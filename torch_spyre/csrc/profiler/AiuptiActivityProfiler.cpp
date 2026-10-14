@@ -35,8 +35,6 @@ namespace KINETO_NAMESPACE {
 uint32_t AiuptiActivityProfilerSession::iterationCount_ = 0;
 std::vector<std::array<unsigned char, 16>>
     AiuptiActivityProfilerSession::deviceUUIDs_ = {};
-std::vector<std::string> AiuptiActivityProfilerSession::correlateRuntimeOps_ = {
-    "aiuLaunchControlBlocks"};
 
 // =========== Session Constructor ============= //
 AiuptiActivityProfilerSession::AiuptiActivityProfilerSession(
@@ -72,6 +70,8 @@ void AiuptiActivityProfilerSession::processTrace(
 
   // Associations and lane metadata belong to this capture, even if the
   // session is reused and batch IDs or thread IDs appear again.
+  // iterationCount_ and nextSubmissionFlowId_ intentionally persist across
+  // captures so span iterations and CPU-to-submit flow IDs are not reused.
   cpuCorrelationMap_.clear();
   deviceActivityIds_.clear();
   launchActivityIds_.clear();

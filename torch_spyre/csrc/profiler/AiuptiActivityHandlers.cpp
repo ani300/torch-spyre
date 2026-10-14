@@ -108,6 +108,7 @@ const libkineto::ITraceActivity*
 AiuptiActivityProfilerSession::linkedCpuActivity(uint64_t externalId) {
   // Kineto's lookup callback currently accepts int32_t. Preserve wider IDs in
   // metadata, but never truncate one into a different CPU activity's identity.
+  // Full-width lookup: https://github.com/torch-spyre/torch-spyre/issues/5498
   if (!cpuActivity_ || externalId == 0 ||
       externalId > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
     return nullptr;

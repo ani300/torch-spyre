@@ -93,7 +93,8 @@ to the device activity.
 Missing CPU origins, calibration traffic, and correlation IDs that Kineto's
 32-bit lookup cannot represent do not receive CPU-to-submit arrows. The full
 external correlation ID remains in the runtime event metadata. No links are
-inferred from timestamp proximity.
+inferred from timestamp proximity. Support for full-width CPU lookups is tracked
+in [issue #5498](https://github.com/torch-spyre/torch-spyre/issues/5498).
 
 JSON, `.json.gz`, and scheduled exports all use the normal PyTorch API, for
 example `on_trace_ready=lambda p: p.export_chrome_trace(f"trace-{p.step_num}.json")`.

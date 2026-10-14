@@ -15,8 +15,9 @@
 """
 Spyre profiling package.
 
-The public API provides FFDC retrieval (``get_diagnostic_report``, also bound as
-``torch.spyre.get_diagnostic_report``). Device presence is
+FFDC retrieval is the public API on this package
+(``get_diagnostic_report``, also bound as ``torch.spyre.get_diagnostic_report``).
+Device-side timing uses upstream ``torch.profiler``. Device presence is
 ``torch.spyre.is_available()``, not a flag on this package.
 """
 

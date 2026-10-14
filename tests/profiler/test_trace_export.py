@@ -26,12 +26,25 @@ import pytest
 
 @pytest.fixture(scope="module")
 def native_traces(tmp_path_factory):
+    unavailable = None
     if os.environ.get("USE_SPYRE_PROFILER", "1") == "0":
-        pytest.skip("Spyre profiler support is disabled")
-    if not os.environ.get("RUNTIME_INSTALL_DIR"):
-        pytest.skip("Requires the native build environment (RUNTIME_INSTALL_DIR)")
+        unavailable = "Spyre profiler support is disabled"
+    elif not os.environ.get("RUNTIME_INSTALL_DIR"):
+        unavailable = "Requires the native build environment (RUNTIME_INSTALL_DIR)"
+    if unavailable:
+        # mandatory_success selects tests; it does not reject fixture skips.
+        # GHA clears CI, and the OOT runner sets PYTORCH_TEST_CONFIG.
+        if os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get(
+            "PYTORCH_TEST_CONFIG"
+        ):
+            pytest.fail(
+                f"{unavailable}; native trace export is required in CI/configured suites",
+                pytrace=False,
+            )
+        pytest.skip(unavailable)
     output = tmp_path_factory.mktemp("native_spyre_trace")
-    env = dict(os.environ, TORCH_DEVICE_BACKEND_AUTOLOAD="0", MAX_JOBS="4")
+    env = dict(os.environ, TORCH_DEVICE_BACKEND_AUTOLOAD="0")
+    env.setdefault("MAX_JOBS", "4")
     # An isolated process avoids backend auto-init and scopes the synthetic
     # Kineto child profiler to these CPU-only tests.
     subprocess.run(

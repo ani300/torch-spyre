@@ -89,12 +89,13 @@ class AiuptiActivityProfilerSession
 
   static uint32_t iterationCount_;
   static std::vector<std::array<unsigned char, 16>> deviceUUIDs_;
-  static std::vector<std::string> correlateRuntimeOps_;
 
   int64_t captureWindowStartTime_{0};
   int64_t captureWindowEndTime_{0};
   int64_t profilerStartTs_{0};
   int64_t profilerEndTs_{0};
+  // Capture-local hardware batch ID -> external CPU correlation ID (0 means
+  // unknown). Membership alone does not imply a resolved CPU activity.
   std::unordered_map<int64_t, int64_t> cpuCorrelationMap_;
   std::unordered_set<uint32_t> deviceActivityIds_;
   std::unordered_set<uint32_t> launchActivityIds_;
