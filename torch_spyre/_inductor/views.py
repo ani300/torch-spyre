@@ -116,7 +116,7 @@ def find_repeat_vars(index_exprs, var_ranges):
                 continue
 
             vars_in_expr = expr.free_symbols
-            term = expr.xreplace({v: 0 for v in vars_in_expr - {var}})
+            term = expr.xreplace(dict.fromkeys(vars_in_expr - {var}, 0))
 
             if term == node:
                 repeat_info[var] = {
@@ -352,7 +352,7 @@ def compute_coordinates(
                 coordinates[primary_dim] += var * step // primary_stride
 
     vars = index.free_symbols
-    offset = index.xreplace({v: 0 for v in vars})
+    offset = index.xreplace(dict.fromkeys(vars, 0))
     if offset > 0:
         index = index - offset
         # A concrete offset is decomposed positionally so a padded layout does
