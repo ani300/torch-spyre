@@ -124,7 +124,7 @@ from torch_spyre._inductor.constants import (
 )
 
 from torch_spyre._inductor import config
-from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 from torch_spyre._inductor.loop_info import (
     CarriedReductionRecord,
     LoopCarryRecord,
@@ -2475,7 +2475,7 @@ def _check_and_add_matmul_options(
     parsed = _matmul_axis_parse(op)
     options = {_candidate_key(seed): seed}
     for source in matmul_roles:
-        candidate = {sym: 1 for sym in iteration_space_from_op(op)}
+        candidate = dict.fromkeys(iteration_space_from_op(op), 1)
         for role, (sym, extent, _factor) in parsed.items():
             factor = source.get(role, 1)
             candidate[sym] = factor if factor > 1 and extent % factor == 0 else 1
@@ -2512,7 +2512,7 @@ def _enum_split_options(
             return [seed]
         options = {_candidate_key(seed): seed}
         for candidate in _factored_bm_splits(_reduction_bm_axes(op)):
-            full_candidate = {sym: 1 for sym in iteration_space_from_op(op)}
+            full_candidate = dict.fromkeys(iteration_space_from_op(op), 1)
             full_candidate.update(candidate)
             options.setdefault(_candidate_key(full_candidate), full_candidate)
         return _legal_split_options(op, options.values())
@@ -4714,7 +4714,11 @@ def _make_cpsat_solver(
 
         return CpSatLayoutSolver(buffers, size)
     except ImportError as exc:
-        logger.warning(
+        # Once per process: this factory runs for every allocation, so a missing
+        # ortools otherwise repeats the same warning millions of times.
+        warn_once(
+            logger,
+            "cpsat_unavailable",
             "cpsat layout solver unavailable (%s); falling back to the "
             "default greedy allocator.",
             exc,
