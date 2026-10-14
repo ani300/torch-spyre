@@ -138,6 +138,21 @@ metadata:
   IDs are strings, and JavaScript consumers must keep them as strings rather
   than coercing them to numbers.
 
+Kernel and memcpy events include `args.timestamp_source`, with the value
+`calibrated` or `estimated (host completion, 1 ns/tick)`. Before device clock
+calibration is ready, the decoder estimates placement by anchoring elapsed device
+ticks (assuming 1 ns per tick) at host completion; absolute placement is approximate.
+Use `FLEX_TIMESTAMP_CALIBRATION=always` before initializing the device to start
+calibration during model loading/warmup when calibrated timings are needed from
+the beginning of the capture. The default starts calibration on a profiling session.
+
+Memory management events use `args.timestamp_source = "host"`. This includes
+`Memset (Device)` (libaiupti's representation of memory allocation),
+`Memory (Release)`, and the `[memory]` instant events. Their timestamps come from
+the host clock and do not depend on device-clock calibration. Libaiupti's memset
+and memory records therefore do not carry the `timestamps_estimated` flag used
+by compute and memcpy records.
+
 Kernel events (and, once counters are available, memcpy events) carry
 `args.cycles_ts`, a JSON array of five raw device timestamps
 `[TS1, TS2, TS3, TS4, TS5]` recorded at the pipeline stage boundaries:
@@ -202,11 +217,3 @@ them, are recorded alongside compute kernels on multi-AIU runs.
   alongside `torch.profiler`
 
 [torch-profiler-docs]: https://pytorch.org/docs/stable/profiler.html
-
-Device events include `timestamp_source`. Before device clock calibration is
-ready, the decoder estimates placement by anchoring elapsed device ticks
-(assuming 1 ns per tick) at host completion. These events are explicitly marked
-`estimated (host completion, 1 ns/tick)`; their absolute placement is approximate.
-Use `FLEX_TIMESTAMP_CALIBRATION=always` before initializing the device to start
-calibration during model loading/warmup when calibrated timings are needed from
-the beginning of the capture. The default starts calibration on a profiling session.
