@@ -70,7 +70,14 @@ void AiuptiActivityProfilerSession::processTrace(
                                            "__aiu_profiler__");
   traceBuffer_.span.iteration = iterationCount_++;
 
+  // Associations and lane metadata belong to this capture, even if the
+  // session is reused and batch IDs or thread IDs appear again.
+  cpuCorrelationMap_.clear();
+  deviceActivityIds_.clear();
+  launchActivityIds_.clear();
   threadNames_.clear();
+  resourceInfo_.clear();
+  activeThreadMap_.clear();
   auto aiuBuffer = api_.activityBuffers();
   if (aiuBuffer) {
     // Records from different queues need not arrive in causal order. Build the
@@ -88,6 +95,7 @@ void AiuptiActivityProfilerSession::processTrace(
         const bool isLaunch =
             a->cbid >= AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB &&
             a->cbid <= AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_DMO;
+        if (isLaunch) launchActivityIds_.insert(a->correlation_id);
         // Comms schedule IDs have a different namespace; never use them here.
         if ((isSubmit || isLaunch) && a->external_id != 0) {
           cpuCorrelationMap_[a->correlation_id] = a->external_id;

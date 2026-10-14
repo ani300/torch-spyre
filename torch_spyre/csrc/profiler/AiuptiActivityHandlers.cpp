@@ -462,7 +462,9 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->device = activity->device_id;
   kernel_activity->resource = activity->stream_id;
   kernel_activity->threadId = activity->stream_id;
-  kernel_activity->flow.id = activity->correlation_id;
+  kernel_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
+                                 ? activity->correlation_id
+                                 : 0;
   kernel_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
   kernel_activity->flow.start = 0;
   kernel_activity->linked = linked;
@@ -583,7 +585,9 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   memcpy_activity->device = activity->device_id;
   memcpy_activity->resource = getResourceId(activity);
   memcpy_activity->threadId = activity->stream_id;
-  memcpy_activity->flow.id = activity->correlation_id;
+  memcpy_activity->flow.id = launchActivityIds_.count(activity->correlation_id)
+                                 ? activity->correlation_id
+                                 : 0;
   memcpy_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
   memcpy_activity->flow.start = 0;
   memcpy_activity->linked = linked;

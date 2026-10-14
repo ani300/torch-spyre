@@ -54,6 +54,9 @@ class AiuptiActivityApi {
 
   virtual std::unique_ptr<AiuptiActivityBufferDeque> activityBuffers();
 
+  // Iterate every buffer to exhaustion without releasing its storage. A
+  // completed iteration resets libaiupti's cursor, so the deque can be
+  // replayed.
   virtual const std::pair<int, int> processActivities(
       AiuptiActivityBufferDeque&,
       std::function<void(const Pti_Activity*)> handler);

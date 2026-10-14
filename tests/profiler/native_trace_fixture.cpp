@@ -19,6 +19,7 @@
 #include <ATen/record_function.h>
 #include <libaiupti/aiupti_runtime_cbid.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -36,6 +37,7 @@
 namespace {
 using libkineto::ActivityType;
 using libkineto::AiuptiActivityApi;
+using libkineto::AiuptiActivityBuffer;
 using libkineto::AiuptiActivityBufferDeque;
 using libkineto::AiuptiActivityProfilerSession;
 using libkineto::Config;
@@ -48,44 +50,80 @@ class SyntheticApi : public AiuptiActivityApi {
   std::vector<AIUpti_ActivityAPI> runtime;
   std::vector<AIUpti_ActivityThread> threads;
   std::vector<AIUpti_ActivityCompute> kernels;
+  std::vector<AIUpti_ActivityMemcpy> copies;
 
   std::unique_ptr<AiuptiActivityBufferDeque> activityBuffers() override {
-    return std::make_unique<AiuptiActivityBufferDeque>();
+    auto buffers = std::make_unique<AiuptiActivityBufferDeque>();
+    // Use real buffers and the production processActivities implementation,
+    // including libaiupti's record iterator. Device records precede runtime
+    // attribution, and names arrive last across separate buffers.
+    appendBuffer(*buffers, kernels);
+    appendBuffer(*buffers, copies);
+    appendBuffer(*buffers, runtime);
+    appendBuffer(*buffers, threads);
+    return buffers;
   }
 
-  const std::pair<int, int> processActivities(
-      AiuptiActivityBufferDeque&,
-      std::function<void(const Pti_Activity*)> handler) override {
-    // Deliberately deliver device records before their CPU attribution.
-    for (const auto& record : kernels) {
-      handler(reinterpret_cast<const Pti_Activity*>(&record));
-    }
-    for (const auto& record : runtime) {
-      handler(reinterpret_cast<const Pti_Activity*>(&record));
-    }
-    // Names arrive after their events, as can happen across separate queues.
-    for (const auto& record : threads) {
-      handler(reinterpret_cast<const Pti_Activity*>(&record));
-    }
-    return {runtime.size() + kernels.size() + threads.size(), 0};
+ private:
+  template <typename Record>
+  static void appendBuffer(AiuptiActivityBufferDeque& buffers,
+                           const std::vector<Record>& records) {
+    if (records.empty()) return;
+    auto buffer =
+        std::make_unique<AiuptiActivityBuffer>(records.size() * sizeof(Record));
+    std::memcpy(buffer->data(), records.data(), buffer->size());
+    auto* data = buffer->data();
+    buffers.emplace_back(data, std::move(buffer));
   }
 };
 
 SyntheticApi syntheticApi;
 thread_local std::vector<uint64_t> externalIds;
+std::vector<int32_t> cpuLookups;
 
-class SyntheticSession : public AiuptiActivityProfilerSession {
+// Kineto may create a new wrapper for each capture; deliberately reuse the
+// production session underneath to exercise its capture-lifetime state.
+class SyntheticSession : public IActivityProfilerSession {
  public:
-  SyntheticSession(const Config& config, const std::set<ActivityType>& types)
-      : AiuptiActivityProfilerSession(syntheticApi, config, types) {}
+  explicit SyntheticSession(
+      std::shared_ptr<AiuptiActivityProfilerSession> session)
+      : session_(std::move(session)) {}
 
   void start() override {
     syntheticApi.runtime.clear();
     syntheticApi.threads.clear();
     syntheticApi.kernels.clear();
+    syntheticApi.copies.clear();
     externalIds.clear();
+    cpuLookups.clear();
   }
   void stop() override {}
+  std::vector<std::string> errors() override {
+    return session_->errors();
+  }
+  void processTrace(libkineto::ActivityLogger& logger) override {
+    session_->processTrace(logger);
+  }
+  void processTrace(libkineto::ActivityLogger& logger,
+                    libkineto::getLinkedActivityCallback lookup, int64_t start,
+                    int64_t end) override {
+    session_->processTrace(
+        logger,
+        [lookup](int32_t id) {
+          cpuLookups.push_back(id);
+          return lookup(id);
+        },
+        start, end);
+  }
+  std::unique_ptr<libkineto::DeviceInfo> getDeviceInfo() override {
+    return session_->getDeviceInfo();
+  }
+  std::vector<libkineto::ResourceInfo> getResourceInfos() override {
+    return session_->getResourceInfos();
+  }
+  std::unique_ptr<libkineto::CpuTraceBuffer> getTraceBuffer() override {
+    return session_->getTraceBuffer();
+  }
   void pushCorrelationId(uint64_t id) override {
     externalIds.push_back(id);
   }
@@ -94,6 +132,9 @@ class SyntheticSession : public AiuptiActivityProfilerSession {
   }
   void pushUserCorrelationId(uint64_t) override {}
   void popUserCorrelationId() override {}
+
+ private:
+  std::shared_ptr<AiuptiActivityProfilerSession> session_;
 };
 
 class SyntheticProfiler : public IActivityProfiler {
@@ -106,7 +147,11 @@ class SyntheticProfiler : public IActivityProfiler {
   }
   std::unique_ptr<IActivityProfilerSession> configure(
       const std::set<ActivityType>&, const Config& config) override {
-    return std::make_unique<SyntheticSession>(config, types_);
+    if (!session_) {
+      session_ = std::make_shared<AiuptiActivityProfilerSession>(
+          syntheticApi, config, types_);
+    }
+    return std::make_unique<SyntheticSession>(session_);
   }
   std::unique_ptr<IActivityProfilerSession> configure(
       int64_t, int64_t, const std::set<ActivityType>& types,
@@ -117,6 +162,7 @@ class SyntheticProfiler : public IActivityProfiler {
  private:
   const std::string name_{"synthetic_spyre"};
   const std::set<ActivityType> types_{ActivityType::CPU_OP};
+  std::shared_ptr<AiuptiActivityProfilerSession> session_;
 };
 
 uint64_t emitBatch(uint32_t batch, const std::string& mode) {
@@ -163,6 +209,45 @@ uint64_t emitBatch(uint32_t batch, const std::string& mode) {
   }
   return external;
 }
+
+void emitMemcpy(uint32_t batch, bool launch, bool calibration = false) {
+  const auto now = libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  AIUpti_ActivityMemcpy copy{};
+  copy.activity_kind = AIUPTI_ACTIVITY_KIND_MEMCPY;
+  copy.copy_kind = AIUPTI_ACTIVITY_MEMCPY_KIND_HTOD;
+  copy.correlation_id = batch;
+  copy.start = now + 1000;
+  copy.end = now + 3000;
+  copy.bytes = 64;
+  syntheticApi.copies.push_back(copy);
+  if (launch) {
+    AIUpti_ActivityAPI record{};
+    record.activity_kind = AIUPTI_ACTIVITY_KIND_RUNTIME;
+    record.cbid = AIUPTI_RUNTIME_TRACE_CBID_LAUNCH_CB_DMI;
+    record.process_id = getpid();
+    record.thread_id = getpid() + 1000;
+    record.correlation_id = batch;
+    record.calibration_id = calibration ? 1 : 0;
+    record.start = now;
+    record.end = now + 1000;
+    syntheticApi.runtime.push_back(record);
+  }
+}
+
+void checkBufferReplay() {
+  auto buffers = syntheticApi.activityBuffers();
+  std::vector<const Pti_Activity*> first;
+  const auto counts = syntheticApi.processActivities(
+      *buffers,
+      [&first](const Pti_Activity* record) { first.push_back(record); });
+  std::vector<const Pti_Activity*> second;
+  const auto replayCounts = syntheticApi.processActivities(
+      *buffers,
+      [&second](const Pti_Activity* record) { second.push_back(record); });
+  TORCH_CHECK(
+      !first.empty() && first == second && counts == replayCounts,
+      "Production buffer iteration must preserve all records on replay");
+}
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
@@ -182,4 +267,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
                   "Expected an active CPU correlation ID");
     }
   });
+  module.def("emit_flow_pairs", [] {
+    emitMemcpy(13, true);
+    emitMemcpy(14, false);
+    emitMemcpy(16, true, true);
+    emitBatch(15, "normal");
+    syntheticApi.runtime.resize(2);  // Keep only the two memcpy launches.
+    emitBatch(17, "orphan");
+    emitMemcpy(17, false);  // A submit alone cannot start a device flow.
+    auto unmatched = syntheticApi.runtime.front();
+    unmatched.correlation_id = 18;
+    syntheticApi.runtime.push_back(unmatched);
+    checkBufferReplay();
+  });
+  module.def("emit_capture_window", [](int window) {
+    at::RecordFunction origin(at::RecordScope::FUNCTION);
+    origin.before("test_cpu_origin");
+    const auto external = emitBatch(window == 0 ? 20 : 30, "normal");
+    emitMemcpy(window == 0 ? 21 : 31, true);
+    if (window != 0) {
+      // Reuse a previous launch ID without its device, and a previous device
+      // ID without its launch. Neither side may link across captures.
+      auto launch = syntheticApi.runtime[1];
+      launch.correlation_id = 21;
+      launch.external_id = 0;
+      syntheticApi.runtime.push_back(launch);
+      auto kernel = syntheticApi.kernels.front();
+      kernel.correlation_id = 20;
+      syntheticApi.kernels.push_back(kernel);
+      emitMemcpy(20, false);
+      syntheticApi.threads.clear();  // Names must not leak either.
+    }
+    return external;
+  });
+  module.def("cpu_lookups", [] { return cpuLookups; });
 }

@@ -46,6 +46,14 @@ def _read(path):
         return json.load(stream)
 
 
+def _flows(events):
+    flows = {}
+    for event in events:
+        if event.get("ph") in ("s", "f") and event.get("cat") == "ac2g":
+            flows.setdefault(event["id"], []).append(event)
+    return flows
+
+
 @pytest.mark.parametrize(
     "filename",
     [
@@ -75,10 +83,7 @@ def test_standard_export_contains_both_flow_stages(native_traces, filename):
         for event in markers
     )
     assert {event["args"]["correlation"] for event in markers} == {7, 8}
-    flows = {}
-    for event in events:
-        if event.get("ph") in ("s", "f") and event.get("cat") == "ac2g":
-            flows.setdefault(event["id"], []).append(event)
+    flows = _flows(events)
     assert len(flows) == 4
     for flow_id, endpoints in flows.items():
         assert len(endpoints) == 2
@@ -114,6 +119,60 @@ def test_standard_export_contains_both_flow_stages(native_traces, filename):
     assert (
         names[calibration["pid"], calibration["tid"]] == "Spyre calibration (device 0)"
     )
+
+
+def test_device_flows_require_both_endpoints(native_traces):
+    events = _read(native_traces / "flow-pairs.json")["traceEvents"]
+    spans = [event for event in events if event.get("ph") == "X"]
+    copies = [event for event in spans if event["name"] == "Memcpy (HtoD)"]
+    assert {event["args"]["correlation"] for event in copies} == {13, 14, 16, 17}
+    assert any(event["name"] == "synthetic_kernel" for event in spans)
+    assert any(event["args"].get("correlation") == 18 for event in spans)
+    # Only 13 has both a non-calibration launch and a device record. Orphan
+    # memcpy/kernel records, calibration and submit-only IDs emit no endpoints.
+    flows = _flows(events)
+    assert flows.keys() == {13}
+    assert sorted(event["ph"] for event in flows[13]) == ["f", "s"]
+    finish = next(event for event in flows[13] if event["ph"] == "f")
+    copy = next(event for event in copies if event["args"]["correlation"] == 13)
+    assert (finish["pid"], finish["tid"], finish["ts"]) == (
+        copy["pid"],
+        copy["tid"],
+        copy["ts"],
+    )
+
+
+@pytest.mark.parametrize("prefix", ["reused", "scheduled-reused"])
+def test_capture_state_does_not_leak(native_traces, prefix):
+    snapshots = [_read(native_traces / f"{prefix}-{window}.json") for window in (0, 1)]
+    flows = [_flows(snapshot["traceEvents"]) for snapshot in snapshots]
+    assert {key for key in flows[0] if key < 2**32} == {20, 21}
+    assert {key for key in flows[1] if key < 2**32} == {30, 31}
+    for capture in flows:
+        assert len(capture) == 3  # Two device flows and one CPU-to-submit flow.
+        assert all(
+            sorted(event["ph"] for event in endpoints) == ["f", "s"]
+            for endpoints in capture.values()
+        )
+    # Submission IDs stay unique even when these captures share an export.
+    assert not flows[0].keys() & flows[1].keys()
+    events = snapshots[1]["traceEvents"]
+    spans = [event for event in events if event.get("ph") == "X"]
+    stale = [event for event in spans if event.get("args", {}).get("correlation") == 20]
+    assert {event["name"] for event in stale} == {"synthetic_kernel", "Memcpy (HtoD)"}
+    assert all("External id" not in event["args"] for event in stale)
+    assert any(event.get("args", {}).get("correlation") == 21 for event in spans)
+    names = {
+        (event["pid"], event["tid"]): event["args"]["name"]
+        for event in events
+        if event.get("ph") == "M" and event.get("name") == "thread_name"
+    }
+    submit = next(event for event in spans if event["name"] == "aiuSubmitToHardware")
+    assert names[submit["pid"], submit["tid"]] == f"Thread {submit['tid']}"
+    lookups = _read(native_traces / f"{prefix}-lookups.json")
+    # Even an unsuccessful lookup of the old CPU origin indicates stale state.
+    assert lookups[0]["origin"] not in lookups[1]["lookups"]
+    assert lookups[1]["origin"] in lookups[1]["lookups"]
 
 
 def _capture_native_traces(output):
@@ -180,6 +239,39 @@ def _capture_native_traces(output):
             if prof.current_action == torch.profiler.ProfilerAction.RECORD_AND_SAVE:
                 fixture.emit_batches()
             prof.step()
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as prof:
+        fixture.emit_flow_pairs()
+    prof.export_chrome_trace(str(output / "flow-pairs.json"))
+
+    lookups = []
+    for window in range(2):
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        ) as prof:
+            origin = fixture.emit_capture_window(window)
+        prof.export_chrome_trace(str(output / f"reused-{window}.json"))
+        lookups.append({"origin": origin, "lookups": fixture.cpu_lookups()})
+    (output / "reused-lookups.json").write_text(json.dumps(lookups))
+
+    lookups = []
+
+    def save_window(prof):
+        prof.export_chrome_trace(str(output / f"scheduled-reused-{len(lookups)}.json"))
+        lookups.append({"origin": origin, "lookups": fixture.cpu_lookups()})
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=2),
+        on_trace_ready=save_window,
+    ) as prof:
+        for _ in range(4):
+            if prof.current_action == torch.profiler.ProfilerAction.RECORD_AND_SAVE:
+                origin = fixture.emit_capture_window(len(lookups))
+            prof.step()
+    (output / "scheduled-reused-lookups.json").write_text(json.dumps(lookups))
 
 
 if __name__ == "__main__":

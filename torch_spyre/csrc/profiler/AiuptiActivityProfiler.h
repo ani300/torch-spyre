@@ -97,7 +97,9 @@ class AiuptiActivityProfilerSession
   int64_t profilerEndTs_{0};
   std::unordered_map<int64_t, int64_t> cpuCorrelationMap_;
   std::unordered_set<uint32_t> deviceActivityIds_;
+  std::unordered_set<uint32_t> launchActivityIds_;
   // Keep CPU-to-submit flows separate from the 32-bit hardware batch IDs.
+  // Stay unique when multiple captures from this session share an export.
   int64_t nextSubmissionFlowId_{int64_t{1} << 32};
   std::unordered_map<int64_t, int64_t> userCorrelationMap_;
   std::unordered_map<int64_t, const libkineto::ITraceActivity*>
