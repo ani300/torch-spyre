@@ -1651,37 +1651,56 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
     (``_read_burst_arg_excess``) -- is added, after compute overlap, so
     divisions whose slices are small cost nothing extra. A replicated operand
     that is not a shared load keeps ``_replicated_operand_reads``. Single-pass
-    bundles only (``_is_single_pass``), and operands of at least
-    ``mm_stream_min_bytes``.
+    bundles only, and operands of at least ``mm_stream_min_bytes``. A
+    candidate tile count keeps the single-pass condition symbolic, so its
+    untiled candidate pays the same stream price as the concrete op.
     """
     gbps = p.mm_stream_gbps_per_core
     unicast = p.mm_stream_unicast_ns_per_request
     multicast = p.mm_stream_multicast_ns_per_request
     burst = p.transport_dma_word_bytes * p.transport_dma_max_burst_words
-    if gbps <= 0 or burst <= 0 or not all(_is_single_pass(op) for op in ops):
+    if gbps <= 0 or burst <= 0:
+        return 0.0
+    single_pass = sympy.And(
+        *(
+            sympy.And(
+                sympy.Eq(op.loop_trip, 1),
+                sympy.Not(op.tiles_output_dim),
+                sympy.Not(op.tiles_reduction_dim),
+                *(sympy.Eq(arg.loop_factor, 1) for arg in op.args),
+            )
+            for op in ops
+        )
+    )
+    if single_pass is sympy.false:
         return 0.0
     total = 0.0
     for op in ops:
         if not op.is_matmul:
             continue
         for arg in op.args:
+            elems = arg.elems
+            # Stream prices apply only in HBM, which retains the full extent
+            # when the candidate's LX allocation would hold a single tile.
+            if _is_sym(arg.is_lx):
+                elems = sympy.sympify(elems).subs(arg.is_lx, 0)
             if (
                 arg.role != "input"
-                or _is_sym(op.matmul_macs, arg.elems)
-                or not op.matmul_macs > arg.elems > 0
+                or _is_sym(op.matmul_macs, elems)
+                or not op.matmul_macs > elems > 0
             ):
                 continue
             replication = sympy.sympify(arg.replication)
             if not arg.broadcast and replication.is_number and replication != 1:
                 continue
-            nbytes = arg.elems * op.dtype_bytes
+            nbytes = elems * op.dtype_bytes
             if nbytes < p.mm_stream_min_bytes:
                 continue
             per_core = nbytes * replication / op.cores
             run = arg.batch_run_bytes
             if run is None:
                 run = arg.read_run_bytes
-            if op.matmul_macs > p.mm_stream_short_run_max_reuse * arg.elems:
+            if op.matmul_macs > p.mm_stream_short_run_max_reuse * elems:
                 # Short runs were measured slow at decode reuse only (see
                 # mm_stream_short_run_max_reuse); price full bursts above it.
                 run = None
@@ -1713,7 +1732,7 @@ def _reused_operand_stream_excess_ns(ops: list, p: "CostParams"):
             bursts = _read_burst_arg_excess(op, arg, p)
             price = t - nbytes / p.bw_peak_gbps - (0 if bursts is None else bursts)
             total += (1 - arg.is_lx) * max(0.0, price)
-    return total
+    return _select(single_pass, total, 0.0)
 
 
 def _loop_reread_bytes(ops: list) -> float:

@@ -565,6 +565,41 @@ def test_few_cores_stream_a_reused_matmul_operand_at_their_own_rate():
     assert "reused matmul operand streaming" in explain([_decode_pv(2, 2)], p)
 
 
+@pytest.mark.parametrize("symbolic_residency", [False, True])
+def test_reused_stream_price_matches_a_candidate_tile_count(symbolic_residency):
+    from torch_spyre._inductor.cost_model import _reused_operand_stream_excess_ns
+
+    tiles = sympy.Symbol("tile_buf42_d0", integer=True, positive=True)
+    resident = sympy.Symbol("is_lx_arg10_1", integer=True, nonnegative=True)
+    p = CostParams()
+    op = _decode_pv(2, 2)
+    op.loop_trip = tiles
+    op.tiles_output_dim = tiles > 1
+    arg = op.args[1]
+    full_elems = arg.elems
+    if symbolic_residency:
+        arg.is_lx = resident
+        arg.elems = full_elems * (1 - resident) + full_elems / tiles * resident
+    expr = sympy.sympify(_reused_operand_stream_excess_ns([op], p))
+    for count in (1, 4):
+        for is_lx in (False, True) if symbolic_residency else (False,):
+            concrete_arg = dataclasses.replace(
+                arg,
+                is_lx=is_lx,
+                elems=full_elems // count if is_lx else full_elems,
+            )
+            concrete = dataclasses.replace(
+                op,
+                loop_trip=count,
+                tiles_output_dim=count > 1,
+                args=[op.args[0], concrete_arg],
+            )
+            expected = float(_reused_operand_stream_excess_ns([concrete], p))
+            assert (expected > 0) == (count == 1 and not is_lx)
+            actual = float(expr.subs({tiles: count, resident: int(is_lx)}))
+            assert actual == pytest.approx(expected)
+
+
 def test_long_runs_stream_a_reused_operand_at_the_byte_rate():
     """A head-first value cache, or a GEMM weight, is read in full bursts: a
     fraction of the per-row request cost, whatever the reuse."""
