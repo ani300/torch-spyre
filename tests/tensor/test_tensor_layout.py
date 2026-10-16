@@ -554,7 +554,9 @@ class TestSpyreTensorLayout(TestCase):
                     if event.get("cat") == "gpu_memcpy" and "DtoH" in event["name"]
                 ]
         self.assertTrue(copies, "The profiler must record the actual device transfer")
-        self.assertEqual(sum(event["args"]["bytes"] for event in copies), expected)
+        self.assertEqual(
+            sum(event.get("args", {}).get("bytes", 0) for event in copies), expected
+        )
 
     @parametrize(
         "dtype,device_format",

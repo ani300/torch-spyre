@@ -58,7 +58,7 @@ std::optional<flex::CompositeAddress> narrowD2HRange(
       (layout.device_dtype != DataFormats::SEN169_FP16 &&
        layout.device_dtype != DataFormats::IEEE_FP32 &&
        layout.device_dtype != DataFormats::IEEE_INT32) ||
-      dci.dcsi_.empty()) {
+      dci.dcsi_.empty() || dci.input_shape_.empty()) {
     return std::nullopt;
   }
 
@@ -92,13 +92,22 @@ std::optional<flex::CompositeAddress> narrowD2HRange(
     return std::nullopt;
   }
 
+  // Single-chunk STANDARD storage is a dense sequence of 128-byte sticks.
+  // get_device_stride_infos builds contiguous physical device strides, so DCI
+  // offsets already include layout padding; no extra inter-stick/tile gaps
+  // need to be added when converting physical element offsets to byte offsets.
   auto chunk = allocation.chunks().front();
   chunk.addr.offset += first * element_bytes;
   chunk.size = (last - first) * element_bytes;
   for (auto& stride : dci.dcsi_) {
     stride.offset_src_ -= first;
   }
-  dci.input_shape_ = {last - first};
+  // Describe the flat staged range while preserving the original DCI rank.
+  // Shapes are innermost-first: collapse the outer dimensions to 1 so the
+  // product remains the staged element count. dcsi_ retains the view strides.
+  auto& shape = dci.input_shape_;
+  std::fill(shape.begin() + 1, shape.end(), 1);
+  shape.front() = last - first;
   return flex::CompositeAddress(chunk);
 }
 
@@ -265,7 +274,7 @@ void SpyreStream::copyAsync(const at::Tensor& src,
       if (auto range = narrowD2HRange(dci, stl, *allocation)) {
         // Flex clones the descriptor when enqueuing; the tensor continues to
         // own the underlying allocation, just as in the full-storage path.
-        copyAsyncImpl(cpu_ptr, cpu_storage_bytes, &*range, &dci, false);
+        copyAsyncImpl(cpu_ptr, cpu_storage_bytes, &*range, &dci, host2device);
         return;
       }
     }
