@@ -1119,6 +1119,8 @@ def overlapping_window_split_domains(
                         for v in c.free_symbols
                         if v in ranges and _moves_coordinate(c, v, ranges[v])
                     )
+    # Keep the per-core extent bound below in sync with the negative-backGap
+    # guard in codegen.superdsc._create_sdsc_tensors.
     # A reduced window variable may also stay whole (split 1): its outer
     # variables are then pinned instead.
     allowed = {

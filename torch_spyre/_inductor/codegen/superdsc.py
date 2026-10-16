@@ -1539,6 +1539,8 @@ def _create_sdsc_tensors(
                     and -(-it_dim_size // int(op_spec.iteration_space[dim_coord][1]))
                     <= dev_dim_size
                 ):
+                    # Keep the per-core extent guard above in sync with
+                    # work_division_constraints.overlapping_window_split_domains.
                     # An overlapping read (``x.unfold(d, 4, 2)``: device row
                     # ``2*w + k``) gives the window variable a device dimension
                     # smaller than its range; it spills into the next outer
