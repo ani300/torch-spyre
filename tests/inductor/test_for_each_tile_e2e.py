@@ -41,16 +41,16 @@ is the case that exercises the full splice -> DimHint synthesis ->
 coarse-tile -> single scf.for pipeline.
 
 TestForEachTilePointwiseE2E adds simpler single-level pointwise/softmax
-coverage (add, abs, a 3-operand abs(a+b)*c chain, row-tiled softmax),
-ported down from test_coarse_tile_e2e.py's HINT-driven test_add_*/test_abs_*
-and test_hint_softmax_row_tiling families -- for_each_tile doesn't need
-coarse_tile's exhaustive combinatorial coverage, but benefits from its own
-easy-to-debug cases, including a multi-stick tile_size variant of each
-(multi-stick tiling has been a historical source of bugs; see
-test_hint_softmax_row_tiling's docstring on the device_size[1] invariant).
+coverage (add, abs, a 3-operand abs(a+b)*c chain, row-tiled softmax).
+for_each_tile doesn't need an exhaustive combinatorial grid of shapes and tile
+counts, but benefits from easy-to-debug cases of its own, including a
+multi-stick tile_size variant of each (multi-stick tiling has been a historical
+source of bugs: it exercises the per-tile device_size[1] invariant described
+on softmax_row_tiled_fn in for_each_tile_fixtures.py).
 """
 
 import functools
+import math
 import unittest
 import warnings
 from unittest.mock import patch
@@ -59,8 +59,11 @@ import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre._inductor import config
 from torch_spyre._inductor import passes as ts_passes
+from torch_spyre._inductor.constants import RESTICKIFY_OP
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     PrescribedRegion,
     prescribed_regions,
@@ -90,7 +93,14 @@ from for_each_tile_fixtures import (
     add_tiled_fn,
     add_tiled_reference,
     batched_online_softmax_fn,
+    carried_expert_sum_fn,
     carried_reduction_fn,
+    fill_add_tiled_fn,
+    matmul_x_yt_nested_fn,
+    matmul_x_yt_tile_m_fn,
+    matmul_x_yt_tile_n_fn,
+    matmul_xt_y_nested_fn,
+    matmul_xt_y_tile_n_fn,
     moe_tile_experts_fn,
     nested_restickify_add_fn,
     outside_consumer_fn,
@@ -137,7 +147,7 @@ from for_each_tile_fixtures import (
     triple_nested_stardep_outer_fn,
     triple_nested_stardep_outer_reference,
 )
-from utils_inductor import cached_randn, cached_xavier, dl16_round
+from utils_inductor import cached_randn, cached_xavier, dl16_round, opspec_summaries
 
 
 def _with_dynamo_reset(test_fn):
@@ -444,8 +454,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         The index is a point read whose address advances with the spliced loop
         and has no iteration dim, so this drives
         coarse_tile._point_splice_advance_for_dep (record the per-trip
-        advance), _full_buffer_read_deps' point-read exclusion (leave the read
-        direct instead of staging a 1-element int32 into scratch),
+        advance), leave the read direct (never staged into scratch),
         _rebase_point_splice_reads (pin the index to iteration 0 so the
         advance is not applied twice), and insert_restickify's per-dep advance
         handover. Numerics, not just compilation: every one of those can be
@@ -512,14 +521,13 @@ class TestForEachTileE2E(_DynamoResetTestCase):
 class TestForEachTilePointwiseE2E(_DynamoResetTestCase):
     """Single-level map-mode pointwise/softmax fixtures, simpler than TestForEachTileE2E.
 
-    for_each_tile doesn't need coarse_tile_e2e's exhaustive combinatorial
-    coverage (see test_add_*/test_abs_* there); these cases exist to give
-    the lowering pipeline easy-to-debug pointwise/reduction coverage of its
-    own. Each op is tested at a small, single-stick debug size and again at
-    a tile_size that spans multiple 64-fp16-element sticks -- multi-stick
-    tiling has historically been a source of bugs (see
-    test_hint_softmax_row_tiling's device_size[1] docstring in
-    test_coarse_tile_e2e.py), so both sizes are kept as separate tests
+    for_each_tile doesn't need an exhaustive combinatorial grid of shapes and
+    tile counts; these cases exist to give the lowering pipeline easy-to-debug
+    pointwise/reduction coverage of its own. Each op is tested at a small,
+    single-stick debug size and again at a tile_size that spans multiple
+    64-fp16-element sticks -- multi-stick tiling has historically been a source
+    of bugs (see the device_size[1] note on softmax_row_tiled_fn in
+    for_each_tile_fixtures.py), so both sizes are kept as separate tests
     rather than only covering the large one.
 
     References here skip dl16_round: unlike TestForEachTileE2E's matmuls,
@@ -922,7 +930,10 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
     def _compile(self, fn, *args):
         _CollectRegions.operations = []
         _CollectRegions.regions = []
-        with patch.object(ts_passes, "CustomPreSchedulingPasses", _CollectRegions):
+        with (
+            patch.object(ts_passes, "CustomPreSchedulingPasses", _CollectRegions),
+            torch._inductor.config.patch(force_disable_caches=True),
+        ):
             torch.compile(fn, backend="inductor", fullgraph=True)(*args)
         return _CollectRegions.operations, _CollectRegions.regions
 
@@ -1177,10 +1188,9 @@ class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
 class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
     """for_each_tile bodies that exercise passes beyond plain tiling.
 
-    Ported from the retired hint-driven coarse-tile e2e suite: each case
-    keeps the scenario (restickify inside a tile, a view feeding a tiled head
-    dim, an outside consumer, expert-tiled matmul, carried reductions) and
-    drops the hint plumbing.  Every test asserts the loop really formed (a
+    Each case is a scenario beyond plain tiling: restickify inside a tile, a
+    view feeding a tiled head dim, an outside consumer, expert-tiled matmul,
+    carried reductions.  Every test asserts the loop really formed (a
     ``LoopSpec`` with the expected trip count in the generated source) and
     that numerics match CPU, so a silently-untiled compile cannot pass.
     """
@@ -1188,7 +1198,7 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
     ATOL = 0.1
     RTOL = 0.1
 
-    def _check(self, fn, inputs, ref, trips, atol=None, rtol=None):
+    def _check(self, fn, inputs, ref, trips, atol=None, rtol=None, ops=()):
         import regex as re
         from torch._inductor.utils import run_and_get_code
 
@@ -1197,6 +1207,8 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         src = "\n".join(code)
         counts = [int(c) for c in re.findall(r"count=sympify\('(\d+)'\)", src)]
         self.assertIn("LoopSpec(", src)
+        for op in ops:
+            self.assertIn(f"op='{op}'", src, f"expected {op} in:\n{src}")
         expected = trips if isinstance(trips, list) else [trips]
         self.assertEqual(
             sorted(counts), sorted(expected), f"unexpected loop trip counts in:\n{src}"
@@ -1236,6 +1248,90 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         a, x = shaped_randn(256, 128), shaped_randn(128, 256, seed=1)
         ref = a.float().t() + x.float()
         self._check(nested_restickify_add_fn, (a, x), ref, trips=[2, 2])
+
+    def test_matmul_x_yt_tiled_on_m(self):
+        """x @ y.t() (the nn.Linear weight pattern): a weight restickify per trip."""
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float() @ y.float().t()
+        self._check(
+            matmul_x_yt_tile_m_fn, (x, y), ref, trips=2, atol=0.5, ops=(RESTICKIFY_OP,)
+        )
+
+    def test_matmul_x_yt_tiled_on_n(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float() @ y.float().t()
+        self._check(
+            matmul_x_yt_tile_n_fn, (x, y), ref, trips=2, atol=0.5, ops=(RESTICKIFY_OP,)
+        )
+
+    def test_matmul_x_yt_nested_tiles(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float() @ y.float().t()
+        self._check(
+            matmul_x_yt_nested_fn,
+            (x, y),
+            ref,
+            trips=[2, 2],
+            atol=0.5,
+            ops=(RESTICKIFY_OP,),
+        )
+
+    def test_matmul_xt_y_tiled_on_n(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float().t() @ y.float()
+        self._check(
+            matmul_xt_y_tile_n_fn, (x, y), ref, trips=2, atol=0.5, ops=(RESTICKIFY_OP,)
+        )
+
+    def test_matmul_xt_y_nested_tiles(self):
+        x, y = shaped_randn(128, 256), shaped_randn(128, 256, seed=1)
+        ref = x.float().t() @ y.float()
+        self._check(
+            matmul_xt_y_nested_fn,
+            (x, y),
+            ref,
+            trips=[2, 2],
+            atol=0.5,
+            ops=(RESTICKIFY_OP,),
+        )
+
+    def test_loop_invariant_fill_write_does_not_advance(self):
+        """A loop-invariant op's own write inside the loop never advances.
+
+        ``torch.full`` lowers to a scalar-fill ComputedBuffer with no tiled
+        loop variable, so its output is the same buffer on every trip and its
+        TensorArg must carry no ``device_tile_advance_expr``; if it did, the
+        compiler would advance the fill's address each trip.  The advancing
+        references are the tiled add and the copy-out of its tile; the fill's
+        own write is fixed.
+        """
+        import regex as re
+        from torch._inductor.utils import run_and_get_code
+
+        x = shaped_randn(256, 64)
+        compiled = torch.compile(
+            lambda x: fill_add_tiled_fn(x, 64), backend="inductor", fullgraph=True
+        )
+        out, code = run_and_get_code(compiled, x.to(DEVICE_NAME))
+        src = "\n".join(code)
+
+        advances = {
+            m.group(1): m.group(2).count("device_tile_advance_expr=")
+            for m in re.finditer(
+                r"ir_chain=\('(\w+)'[^)]*\).*?args=\[(.*?)\n\s*\]\n", src, re.DOTALL
+            )
+        }
+        self.assertIn("full", advances, f"no OpSpec for the fill in:\n{src}")
+        self.assertEqual(advances["full"], 0, "the fill's own write must not advance")
+        self.assertEqual(
+            sum(advances.values()),
+            2,
+            "expected exactly the tiled add and the copy-out to advance; if this "
+            f"changes, another reference's fixed/advancing status changed: {advances}",
+        )
+        torch.testing.assert_close(
+            out.cpu().float(), x.float() + 0.5, atol=self.ATOL, rtol=self.RTOL
+        )
 
     def test_outside_consumer_after_loop(self):
         a, b, c = (shaped_randn(256, 128, seed=s) for s in range(3))
@@ -1340,19 +1436,27 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
             tensor_args.append((ast.literal_eval(keywords["is_input"]), size, advance))
 
         # Only the expert weights advance; every other input read is fixed.
-        weight_size = [1, hidden, experts, ffn]
+        #
+        # A TensorArg's device_size is the compiler's device layout for that
+        # read, and its axis order and padding depend on the shapes (the
+        # weights come out as [1, 64, 3, 64] here but [64, 2, 3, 64] for
+        # ffn=128), so identify the weight read by its element count, which
+        # no layout change affects, rather than by a layout-specific shape.
+        weight_elements = experts * hidden * ffn
+        is_weight = lambda size: math.prod(size) == weight_elements  # noqa: E731
         weight_reads = [
             advance
             for is_input, size, advance in tensor_args
-            if is_input and size == weight_size
+            if is_input and is_weight(size)
         ]
         self.assertEqual(len(weight_reads), 1)
         self.assertIsInstance(weight_reads[0], str)
         other_advances = [
             advance
             for is_input, size, advance in tensor_args
-            if is_input and size != weight_size
+            if is_input and not is_weight(size)
         ]
+        self.assertTrue(other_advances, "expected a fixed activation read")
         self.assertEqual(other_advances, [None] * len(other_advances))
         weight_step = re.fullmatch(r"floor\((\d+)\*[^)]+\)", weight_reads[0])
         self.assertIsNotNone(weight_step)
@@ -1379,6 +1483,132 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
             v, lambda acc, s: torch.minimum(acc, s.amin(0)), 65504.0
         )
         self._check(fn, (v,), v.float().amin(0), trips=4)
+
+
+class TestForEachTileCarriedSumE2E(_DynamoResetTestCase):
+    """A terminal sum over E carried through a ``for_each_tile`` loop.
+
+    The accumulator should stay in LX across the whole loop, with each core
+    owning the output rows named by ``work_div``, and be written to HBM once
+    after the loop.  The init value is built next to the loop and carries no
+    ``work_div`` of its own: the solver has to give it the update's split,
+    otherwise the pinned update and the unpinned init cannot share an LX
+    buffer and the accumulator silently lands in HBM.  That is why the
+    ``work_div`` values here include ones other than the default 32-way split.
+    """
+
+    CONFIG = {"sencores": 32, "lx_planning": True}
+
+    def _named(self, values):
+        """Device copy of ``values`` named ``["E", "T", "H"]`` for the hint."""
+        _pnd.reset()
+        for name, size in zip(("E", "T", "H"), values.shape):
+            _pnd.declare_tensor_dim(name, size)
+        return _pnd.name_tensor_dims(values.to(DEVICE_NAME), ["E", "T", "H"])
+
+    def _compile(self, fn, *inputs, extra_config=None):
+        from torch._inductor.utils import run_and_get_code
+
+        torch._inductor.codecache.FxGraphCache.clear()
+        compiled = torch.compile(
+            fn, dynamic=False, fullgraph=True, options={"epilogue_fusion": False}
+        )
+        with config.patch({**self.CONFIG, **(extra_config or {})}):
+            out, code = run_and_get_code(compiled, *inputs)
+        return out.cpu(), "\n".join(code)
+
+    def _assert_lx_resident_carry(self, source):
+        """The accumulate runs entirely in LX and one copy writes HBM after it."""
+        ops = opspec_summaries(source)
+        self.assertIn(
+            ["lx", "lx", "lx"],
+            [o["allocations"] for o in ops if o["op"] == "add"],
+            f"expected an LX-resident accumulate in:\n{source}",
+        )
+        self.assertIn(
+            ["lx", "hbm"],
+            [o["allocations"] for o in ops if o["op"] == "identity"],
+            f"expected one lx->hbm copy of the finished sum in:\n{source}",
+        )
+
+    @staticmethod
+    def _linspace_values(experts, lo=-4.0, hi=4.0):
+        base = torch.linspace(lo, hi, experts * 64 * 64, dtype=torch.float32)
+        return base.reshape(experts, 64, 64).to(torch.float16)
+
+    def test_carried_sum_accumulates_in_lx(self):
+        values = self._linspace_values(2)
+        out, src = self._compile(
+            lambda v: carried_expert_sum_fn(v, 32), self._named(values)
+        )
+
+        self.assertEqual(src.count("LoopSpec("), 1)
+        self.assertIn("count=sympify('2')", src)
+        self._assert_lx_resident_carry(src)
+        torch.testing.assert_close(
+            out.float(), values.float().sum(0), atol=0.05, rtol=0.05
+        )
+
+    def test_carried_sum_row_split_follows_work_div(self):
+        """Every stage takes the requested split and the carry stays in LX."""
+        values = self._linspace_values(2)
+        for split in (8, 16, 32):
+            with self.subTest(work_div=split):
+                out, src = self._compile(
+                    lambda v: carried_expert_sum_fn(v, split), self._named(values)
+                )
+                self._assert_lx_resident_carry(src)
+                row_splits = {o["splits"][0] for o in opspec_summaries(src)}
+                self.assertEqual(row_splits, {split}, src)
+                torch.testing.assert_close(
+                    out.float(), values.float().sum(0), atol=0.05, rtol=0.05
+                )
+
+    def test_carried_sum_e128_matches_ordinary_and_cpu(self):
+        """128 trips: the carried sum agrees with the untiled device sum."""
+        values = self._linspace_values(128, lo=-3.0, hi=4.0)
+        named = self._named(values)
+        ordinary, _ = self._compile(lambda v: v.sum(dim=0), named)
+        carried, src = self._compile(lambda v: carried_expert_sum_fn(v, 32), named)
+
+        self.assertIn("count=sympify('128')", src)
+        self._assert_lx_resident_carry(src)
+        torch.testing.assert_close(carried, ordinary, atol=1.0, rtol=0.05)
+        torch.testing.assert_close(
+            carried.float(), values.float().sum(0), atol=1.0, rtol=0.05
+        )
+
+    def test_carried_sum_spills_to_hbm_correctly(self):
+        """With no LX to spare the accumulator stays in HBM and is still right."""
+        torch.manual_seed(0)
+        values = torch.randn(2, 64, 64, dtype=torch.float16) * 0.1
+        out, src = self._compile(
+            lambda v: carried_expert_sum_fn(v, 32),
+            self._named(values),
+            extra_config={"dxp_lx_frac_avail": 1.0},
+        )
+
+        self.assertNotIn("'lx'", src)
+        torch.testing.assert_close(
+            out.float(), values.float().sum(0), atol=0.05, rtol=0.05
+        )
+
+    def test_carried_sum_allows_outside_pointwise_consumer(self):
+        """An op after the loop reads the finished sum."""
+        torch.manual_seed(0)
+        values = torch.randn(4, 64, 64, dtype=torch.float16) * 0.1
+        out, src = self._compile(
+            lambda v: carried_expert_sum_fn(v, 32) + 1, self._named(values)
+        )
+
+        self.assertEqual(src.count("LoopSpec("), 1)
+        self.assertIn(
+            ["lx", "lx", "lx"],
+            [o["allocations"] for o in opspec_summaries(src) if o["op"] == "add"],
+        )
+        torch.testing.assert_close(
+            out.float(), values.float().sum(0) + 1, atol=0.05, rtol=0.05
+        )
 
 
 if __name__ == "__main__":
