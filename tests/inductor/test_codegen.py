@@ -638,6 +638,14 @@ class TestOverlappingWindowCoreOffsets(InductorTestCase):
                     op_info={},
                 )
                 sdsc, mapping = parse_op_spec(spec)
+                # With at most two window rows per core, a negative backGap
+                # brings the window dim back to its two physical rows, so the
+                # outer dims keep their real strides (issue #5347). Unsplit,
+                # each core has a single position and no gap is needed.
+                self.assertEqual(
+                    sdsc.args[0].backGap.get(mapping[window]),
+                    -2 if window_splits > 1 else None,
+                )
                 for pos in range(7):
                     for part in range(window_splits):
                         slices = {str(dim): 0 for dim in sdsc.work_slices}

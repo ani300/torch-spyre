@@ -98,6 +98,20 @@ def test_the_excess_is_linear_in_symbolic_residency_and_can_be_disabled():
     assert _loop_repeated_read_excess_ns([_carry_reader(resident=False)], off) == 0
 
 
+def test_the_excess_follows_a_candidate_tile_count():
+    # The co-optimizer prices a tileable op with its undecided tile count, so an
+    # invariant input's loop factor is a tile-count symbol.
+    tiles = sympy.Symbol("tile_buf21_o0", integer=True, positive=True)
+    p = CostParams()
+    excess = _loop_repeated_read_excess_ns(
+        [_carry_reader(resident=False, loop_factor=tiles)], p
+    )
+    assert excess.subs(tiles, 1) == 0
+    assert excess.subs(tiles, TRIPS) == _loop_repeated_read_excess_ns(
+        [_carry_reader(resident=False)], p
+    )
+
+
 def test_predict_and_explain_include_the_excess():
     p = CostParams()
     spilled, resident = _carry_reader(resident=False), _carry_reader(resident=True)
@@ -207,6 +221,31 @@ def test_burst_excess_follows_a_symbolic_split():
     stick = p.transport_dma_word_bytes
     expr = _read_burst_excess_ns([_streamed(64 * stick / split)], p)
     assert float(expr.subs(split, 32)) > float(expr.subs(split, 1))
+
+
+def test_burst_price_uses_the_hbm_extent_under_a_candidate_tiling():
+    resident = sympy.Symbol("is_lx_buf0", integer=True, nonnegative=True)
+    tiles = sympy.Symbol("tile_buf0_d0", integer=True, positive=True)
+    p = CostParams()
+    op = _streamed(p.transport_dma_word_bytes, resident=resident)
+    arg = op.args[1]
+    full_elems = arg.elems
+    arg.elems = full_elems * (1 - resident) + full_elems / tiles * resident
+    arg.loop_factor = tiles
+    expr = sympy.sympify(_read_burst_excess_ns([op], p))
+    assert float(expr.subs({resident: 0, tiles: 1})) > 0
+    for count in (1, 4):
+        for is_lx in (False, True):
+            concrete_arg = dataclasses.replace(
+                arg,
+                is_lx=is_lx,
+                elems=full_elems // count if is_lx else full_elems,
+                loop_factor=count,
+            )
+            concrete = dataclasses.replace(op, args=[op.args[0], concrete_arg])
+            expected = float(_read_burst_excess_ns([concrete], p))
+            actual = float(expr.subs({resident: int(is_lx), tiles: count}))
+            assert actual == pytest.approx(expected)
 
 
 @pytest.mark.parametrize("broadcast", [False, True])
@@ -875,6 +914,16 @@ def test_unbatched_or_disabled_batch_split_costs_nothing(monkeypatch):
     cm, op = _bmm(monkeypatch, 16, 8, 1024, 1)
     off = dataclasses.replace(CostParams(), mm_batch_split_ns_per_step=0.0)
     assert cm._matmul_batch_split_ns([op], off) == 0
+
+
+def test_batch_split_cost_scales_with_a_candidate_tile_count(monkeypatch):
+    # The co-optimizer prices a tileable op with its undecided tile count.
+    tiles = sympy.Symbol("tiles", integer=True, positive=True)
+    p = CostParams()
+    cm, op = _bmm(monkeypatch, 16, 4, 1024, 2, loop_trip=tiles)
+    assert (
+        cm._matmul_batch_split_ns([op], p) == p.mm_batch_split_ns_per_step * tiles * 2
+    )
 
 
 def test_batch_split_cost_follows_symbolic_splits(monkeypatch):
