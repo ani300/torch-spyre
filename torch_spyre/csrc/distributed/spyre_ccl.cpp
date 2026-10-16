@@ -448,8 +448,18 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
   }
   check_vector_tensor(inputTensors, 1, 1);
 
+  auto input = inputTensors[0];
+  spyre::check_collective_device(input);
+  if (input.storage_offset() == 0 &&
+      c10::multiply_integers(spyre::get_spyre_tensor_sizes(input)) !=
+          input.numel()) {
+    // Eager LM-head unpadding can return a contiguous prefix with its base
+    // allocation's descriptor. Copy the view before borrowing its device
+    // address; communicating the base would include unrelated elements.
+    input = input.clone(at::MemoryFormat::Contiguous);
+  }
   spyre_comms::Tensor input_tensor;
-  prepare_tensor(inputTensors[0], &input_tensor);
+  prepare_tensor(input, &input_tensor);
 
   std::vector<spyre_comms::Tensor> output_tensors;
   for (auto& outputTensor : outputTensors[0]) {
@@ -460,6 +470,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
 
   c10::intrusive_ptr<SpyreCCLWork> work =
       c10::make_intrusive<SpyreCCLWork>(OpType::ALLGATHER);
+  work->input_tensor_ = input;
   work->work_schedule_ =
       group_context_->allgather(output_tensors, input_tensor);
   work->work_schedule_->start();

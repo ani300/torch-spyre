@@ -23,9 +23,20 @@
 
 namespace spyre {
 
-inline void check_collective_storage(const at::Tensor& tensor) {
+inline void check_collective_device(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone(),
               "Collective tensor must be on the Spyre device");
+  if (tensor.scalar_type() == c10::ScalarType::BFloat16) {
+    TORCH_CHECK(
+        get_spyre_tensor_layout(tensor).device_dtype ==
+            DataFormats::SEN169_FP16,
+        "BF16 collectives require DL16 device storage; explicit non-DL16 "
+        "device layouts are not supported");
+  }
+}
+
+inline void check_collective_storage(const at::Tensor& tensor) {
+  check_collective_device(tensor);
   TORCH_CHECK(tensor.is_contiguous(), "Collective tensor must be contiguous");
   TORCH_CHECK(tensor.storage_offset() == 0,
               "Collectives do not support nonzero storage offsets");
@@ -34,13 +45,6 @@ inline void check_collective_storage(const at::Tensor& tensor) {
   TORCH_CHECK(
       c10::multiply_integers(get_spyre_tensor_sizes(tensor)) == tensor.numel(),
       "Collective input view requires matching device storage extent");
-  if (tensor.scalar_type() == c10::ScalarType::BFloat16) {
-    TORCH_CHECK(
-        get_spyre_tensor_layout(tensor).device_dtype ==
-            DataFormats::SEN169_FP16,
-        "BF16 collectives require DL16 device storage; explicit non-DL16 "
-        "device layouts are not supported");
-  }
 }
 
 }  // namespace spyre

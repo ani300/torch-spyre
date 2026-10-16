@@ -348,8 +348,11 @@ compiled collective. The storage-extent guard compares `numel()` with
 when their physical storage includes stick padding.
 
 Collectives require contiguous inputs with zero storage offset and a device
-storage descriptor covering the input's own elements. Prefix views that retain
-the base tensor's larger descriptor are rejected. A compiled collective buffer
+storage descriptor covering the input's own elements. Eager allgather materializes
+contiguous zero-offset input views with larger base descriptors into their own
+allocation, including prefix slices from a padded logits projection. Its work
+handle retains that allocation through asynchronous completion. Other eager
+collectives and allgather outputs reject these views. A compiled collective buffer
 must have a finalized device layout describing its own size, stride, offset,
 and dtype; missing or incompatible metadata is rejected instead
 of planning from an unpadded logical element count. Compiled broadcast,
@@ -362,12 +365,13 @@ partial-allocation target raises an explicit error.
 Repeated waits reuse the current target, preserving mutations made after the first wait.
 Dtype-changing views of an outstanding in-place collective result are rejected;
 wait before changing the view's dtype.
-Eager callers must materialize unsupported views explicitly before submission.
+Eager callers must materialize other unsupported views explicitly before submission.
 
 **Compatibility note:** eager collectives now diagnose nonzero storage offsets
 and descriptors that still cover a larger base allocation. Contiguity was
-already required. Materialize those views before an eager collective;
-compiled broadcast, allgather, and allreduce materialize them automatically.
+already required. Eager allgather materializes zero-offset input views, and
+compiled broadcast, allgather, and allreduce materialize view inputs automatically.
+Materialize other unsupported views before submission.
 
 Zero-dimensional FP16/BF16 broadcast and SUM allreduce retain scalar shape.
 A scalar has one logical element (`dma_sizes` is empty, whose product is
