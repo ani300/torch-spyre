@@ -37,13 +37,13 @@ a 534x ratio below any useful threshold.
 Bounds are calibrated on the two graphs below rather than on the sweep, because
 the sweep measures the pre-scheduling pipeline over model shapes while these
 tests count a whole ``torch.compile`` of a small graph. Measured per operation
-(``_calibrate``, torch 2.13 and torch-spyre main ``c30e6bc0`` on a Spyre pod):
+(``_calibrate``, torch 2.14 and the upgrade on main ``349135c9`` on a Spyre pod):
 
 =================  ====  ========  ============  ==================  ========
 workload            ops    misses   extractions  device coordinates  requests
 =================  ====  ========  ============  ==================  ========
-matmul_chain          4      1.50        135.50               52.50    270.50
-elementwise_chain    32      1.03        149.00               52.13    282.78
+matmul_chain          4      1.50        139.75               57.50    286.50
+elementwise_chain    32      1.03        156.28               57.94    300.22
 =================  ====  ========  ============  ==================  ========
 
 Taken with ``sencores=32``, ``lx_planning=True``, ``hbm_pool_planning=True``
@@ -84,14 +84,15 @@ WORKLOADS = ("matmul_chain", "elementwise_chain")
 #: Measured 1.03-1.50 here, 1.32 on the sweep, against a cold-cache floor of 1.0.
 MAX_MISSES_PER_OP = 4.0
 #: Per workload, because this is the bound a bypass has to breach and a single
-#: figure covering both has to sit above the looser one. Measured 135.50 and
-#: 149.00; each bound sits midway to what bypassing the memo at the 12
-#: ``op_read_writes(op)`` sites in ``scratchpad/utils.py`` measures (166.25 and
-#: 207.94), so it catches that bypass. A counter this reproducible -- 0.03%
+#: figure covering both has to sit above the looser one. Measured 139.75 and
+#: 156.28 on torch 2.14, still within the existing bounds. On torch 2.13, each
+#: bound sat midway between the baseline (135.50 and 149.00) and bypassing the
+#: memo at the 12 ``op_read_writes(op)`` sites in ``scratchpad/utils.py`` (166.25
+#: and 207.94), catching that bypass. A counter this reproducible -- 0.03%
 #: p90 across the sweep -- can carry a tight bound; a legitimate change that
 #: breaches it should re-measure and move it rather than widen it blindly.
 MAX_EXTRACTIONS_PER_OP = {"matmul_chain": 150.0, "elementwise_chain": 175.0}
-#: Measured 52-53 here. Unmemoized, so the count is the work.
+#: Measured 57-58 here. Unmemoized, so the count is the work.
 MAX_DEVICE_COORDS_PER_OP = 100.0
 
 
