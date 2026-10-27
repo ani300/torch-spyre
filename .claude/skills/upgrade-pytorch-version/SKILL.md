@@ -502,15 +502,28 @@ After all changes:
      background. `pytest-timeout` is not installed, so don't pass
      `--timeout`.
    - A test that faults the device leaves it in an error state
-     (`StreamError`) and `conftest.py` then **skips** every later test in
-     that process. A sudden run of skips is not a pass: rerun the affected
-     tests one per process to get real results.
+     (`StreamError`) and `conftest.py` then reports later tests in that
+     process as device errors. Restart the process before rerunning the
+     affected tests.
    - CI runs tests through the OOT runner (`tests/run_test.sh <config>.yaml`),
      which can differ from plain pytest (test order within a process,
      generated wrapper classes). Reproduce CI failures with the same
      config.
 
-6. **Run the full CI.** Local runs cover only a slice, and the local lower
+6. **Re-calibrate the frontend work bounds** (needs a Spyre device).
+   `tests/inductor/test_frontend_work_bounds.py` bounds read-writes
+   extractions per operation, and upstream's own `get_read_writes` calls
+   are part of that count, so a torch bump can move it. Re-measure, then
+   update `MAX_EXTRACTIONS_PER_OP` and the calibration table in the
+   module docstring if the figures moved:
+   ```bash
+   cd $TORCH_SPYRE_DIR
+   python3 -c "import sys; sys.argv=[sys.argv[0]]; \
+       sys.path.insert(0, 'tests/inductor'); import torch, torch_spyre; \
+       from test_frontend_work_bounds import _calibrate; _calibrate()"
+   ```
+
+7. **Run the full CI.** Local runs cover only a slice, and the local lower
    stack may differ from CI's. The fastest full signal is a draft PR.
    Before calling a failure local-only, confirm it passes in CI.
 
@@ -538,6 +551,7 @@ After completing all steps, report:
    - [ ] Regenerate uv.lock + requirements/*.txt via `./tools/update-requirements.sh` (needs wheels on index)
    - [ ] Rebuild torch-spyre + any downstream C++ extensions (vllm, ...)
    - [ ] Run test suite
+   - [ ] Re-calibrate test_frontend_work_bounds.py (Step 10.6)
    - [ ] Check torch_spyre/_monkey_patch.py & torch_spyre/ops/eager.py
          for API drift against the new PyTorch (Dynamo guards, ATen ops)
 ```

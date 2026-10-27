@@ -312,7 +312,7 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         that would silently drift if _compute_size_bytes's stick-alignment
         changes for unrelated reasons.
         """
-        from torch_spyre._inductor.constants import MAX_REGION_SIZE
+        from torch_spyre._inductor.constants import SEGMENT_SIZE
         from torch_spyre._inductor.hbm_pool_planning import (
             Allocator,
             _compute_size_bytes,
@@ -327,7 +327,7 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
 
         hbm_pool_planning([bundle])
 
-        expected_alloc = Allocator(MAX_REGION_SIZE)
+        expected_alloc = Allocator(SEGMENT_SIZE)
         # buf0's live range ends at "mid" (step 1), buf1's starts there --
         # sorted by (start, end, name) as in the real implementation,
         # buf0 allocates first.
@@ -771,7 +771,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             f"{seen_pool_sizes}",
         )
 
-    @config.patch({"lx_planning": False})
+    @config.patch({"lx_planning": False, "frontend_pool_allocation": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
         """A CPU-fallback op (torch.tril) splits the graph into multiple
@@ -854,7 +854,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             f"kernels were {kernel_names}",
         )
 
-    @config.patch({"lx_planning": False})
+    @config.patch({"lx_planning": False, "frontend_pool_allocation": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_no_python_side_pool_tensor_allocated(self):
         """With frontend_pool_allocation at its default (False), no bundle
