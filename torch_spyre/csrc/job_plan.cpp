@@ -86,9 +86,8 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
         flex::createDmaParams(host_address_, device_address->total_size(),
                               /*to_device=*/false, device_address.get());
     params->pipeline_barrier = pipeline_barrier_;
-    // Flex versions differ in whether they pass completion metadata. This
-    // callback only retains the allocation, so it accepts either signature.
-    params->callback = [device_address](void*, auto...) {};
+    params->callback = [device_address](void*,
+                                        const flex::FlexCallbackMetadata*) {};
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   }
@@ -217,7 +216,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   dma_params->pipeline_barrier = pipeline_barrier_;
   // The managed buffer is freed when the callback is destroyed, which happens
   // after the DMA completes or is cancelled.
-  dma_params->callback = [host_buffer](void*, auto...) {};
+  dma_params->callback = [host_buffer](void*,
+                                       const flex::FlexCallbackMetadata*) {};
 
   try {
     stream.launchH2D(dma_params);
