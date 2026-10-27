@@ -37,7 +37,7 @@ a 534x ratio below any useful threshold.
 Bounds are calibrated on the two graphs below rather than on the sweep, because
 the sweep measures the pre-scheduling pipeline over model shapes while these
 tests count a whole ``torch.compile`` of a small graph. Measured per operation
-(``_calibrate``, torch 2.14 and the upgrade on main ``349135c9`` on a Spyre pod):
+(``_calibrate``, torch 2.14.1 and the upgrade on main ``349135c9`` on a Spyre pod):
 
 =================  ====  ========  ============  ==================  ========
 workload            ops    misses   extractions  device coordinates  requests
@@ -49,6 +49,22 @@ elementwise_chain    32      1.03        156.28               57.94    300.22
 Taken with ``sencores=32``, ``lx_planning=True``, ``hbm_pool_planning=True``
 and ``layout_solver="cpsat"``, which ``_counted_compile`` pins so the bounds do
 not float on the shell's environment.
+
+On the same checkout and torch 2.14.1, replacing
+``scratchpad.utils.op_read_writes`` with ``lambda op: op.get_read_writes()``
+bypasses the memo at all 14 call sites in that module. Extractions per operation:
+
+=================  ========  =====  ======
+workload           baseline  bound  bypass
+=================  ========  =====  ======
+matmul_chain         139.75    150  170.50
+elementwise_chain    156.28    175  215.22
+=================  ========  =====  ======
+
+Both bypass measurements exceed the unchanged bounds. The previous torch 2.13
+calibration used main ``c30e6bc0``; differences from those historical counts
+include changes to both torch and torch-spyre, so they do not isolate the cost
+of the torch upgrade.
 
 At the first calibration (main ``1a56c846``), the sweep's figures over 4,443
 operations counted at pre-scheduling-pipeline entry -- 1.32 misses, 90.7
@@ -85,10 +101,10 @@ WORKLOADS = ("matmul_chain", "elementwise_chain")
 MAX_MISSES_PER_OP = 4.0
 #: Per workload, because this is the bound a bypass has to breach and a single
 #: figure covering both has to sit above the looser one. Measured 139.75 and
-#: 156.28 on torch 2.14, still within the existing bounds. On torch 2.13, each
-#: bound sat midway between the baseline (135.50 and 149.00) and bypassing the
-#: memo at the 12 ``op_read_writes(op)`` sites in ``scratchpad/utils.py`` (166.25
-#: and 207.94), catching that bypass. A counter this reproducible -- 0.03%
+#: 156.28 on torch 2.14.1. Bypassing all 14 helper call sites in scratchpad/utils.py
+#: on that same checkout measures 170.50 and 215.22. Each unchanged bound lies
+#: between its baseline and bypass, so it still catches wholesale memo bypass.
+#: A counter this reproducible -- 0.03%
 #: p90 across the sweep -- can carry a tight bound; a legitimate change that
 #: breaches it should re-measure and move it rather than widen it blindly.
 MAX_EXTRACTIONS_PER_OP = {"matmul_chain": 150.0, "elementwise_chain": 175.0}
@@ -223,11 +239,11 @@ class TestFrontendWorkBounds(TestCase):
         ``ComputedBuffer.get_read_writes`` only: the scheduler extracts directly
         in ``SchedulerNode._compute_attrs``, and so do several ``ir.py`` classes.
 
-        Scope, measured rather than claimed: bypassing 12 call sites in
-        ``scratchpad/utils.py`` raises this 23% on ``matmul_chain`` and 40% on
-        ``elementwise_chain``, which the bound catches. Bypassing a *single* site
-        moves it by a few percent and no bound with usable headroom would see it.
-        This guards wholesale memo failure and multi-site drift, not one call.
+        On torch 2.14.1, bypassing all 14 helper call sites in
+        ``scratchpad/utils.py`` raises extractions per op from 139.75 to 170.50
+        on ``matmul_chain`` and from 156.28 to 215.22 on ``elementwise_chain``.
+        Both cross the bounds. This guards wholesale memo failure and multi-site
+        drift; a single-site bypass may still fall within the bounds.
         """
         deltas, ops = self._counts(shape)
         extractions = deltas.get(READ_WRITES_EXTRACTIONS, 0)
