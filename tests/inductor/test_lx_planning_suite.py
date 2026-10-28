@@ -175,6 +175,34 @@ class TestLxPlanningSuiteGeneration(unittest.TestCase):
 
         self.assertEqual(lx._canonical_test_names(Fake), {"test_a_good"})
 
+    def test_canonical_subset_normalizes_decimal_names(self):
+        class Fake:
+            PARAMS = {
+                ("test_a", "base"): {
+                    "ops_dict": {"op1": None},
+                    "param_sets": {"0.5": (), "1.0": ()},
+                    "expect_raise": {"op1_0.5": "boom"},
+                },
+                ("test_b", "base"): {
+                    "param_sets": {"0.5": (), "1.0": ()},
+                    "expect_fail": {"0.5": "rejected"},
+                },
+            }
+
+        # Select using raw PARAMS keys, then match the generated method names.
+        self.assertEqual(
+            lx._canonical_test_names(Fake), {"test_a_op1_1p0", "test_b_1p0"}
+        )
+
+    def test_fp8_representative_is_copied(self):
+        # In reduced mode, the decimal scales used to silently drop this cell.
+        name = "test_fp8_scaled_mm_128x128x128_1p0_1p0_0p0"
+        self.assertIn(name, _tests(ops.TestOps))
+        for cls in _LX_CLASSES:
+            with self.subTest(cls=cls.__name__):
+                copied = {re.sub(r"_lx_planning_\w+$", "", n) for n in _tests(cls)}
+                self.assertIn(name, copied)
+
     def test_canonical_subset_skips_xfail_cases(self):
         class Fake:
             PARAMS = {

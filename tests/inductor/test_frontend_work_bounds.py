@@ -242,6 +242,9 @@ class TestFrontendWorkBounds(TestCase):
         On torch 2.14.1, bypassing all 14 helper call sites in
         ``scratchpad/utils.py`` raises extractions per op from 139.75 to 170.50
         on ``matmul_chain`` and from 156.28 to 215.22 on ``elementwise_chain``.
+        For example, 139.75 is 559 read/write-set extractions divided by the
+        four lowered operations at pre-scheduling entry over one cold compile;
+        repeated analysis across passes counts each time, including upstream calls.
         Both cross the bounds. This guards wholesale memo failure and multi-site
         drift; a single-site bypass may still fall within the bounds.
         """

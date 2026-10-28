@@ -606,6 +606,13 @@ After upgrading, watch for:
    Fix: pass `guard.user_stack` (or `None`) as the third argument. Check
    signatures in `torch/_C/_dynamo/guards.pyi` after the upgrade and
    cross-reference against torch-spyre's patches.
+   Also re-check `torch._dynamo.eval_frame._is_eager_on_nested_compile`, used
+   by `spyre__copy_from` to avoid recursively compiling a device copy during
+   compiler-internal tracing. This flag can be set while the Python dispatch
+   key remains enabled, so it is distinct from `no_dispatch()`. Run
+   `TestCopyFromD2DNestedCompile` in `test_copy_from_d2d_offsets.py` on supported
+   patch releases; it exercises the private `_use_eager_on_nested_compile`
+   context as well as the predicate.
 6. **Skipped-version accumulation** — If skipping versions, multiple breaking
    changes may compound. Consider reading PyTorch release notes for each
    skipped version to anticipate issues.
