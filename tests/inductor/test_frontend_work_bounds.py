@@ -48,23 +48,12 @@ elementwise_chain    32      1.03        156.28               57.94    300.22
 
 Taken with ``sencores=32``, ``lx_planning=True``, ``hbm_pool_planning=True``
 and ``layout_solver="cpsat"``, which ``_counted_compile`` pins so the bounds do
-not float on the shell's environment.
+not float on the shell's environment. These tests run with normal memoization
+enabled.
 
-On the same checkout and torch 2.14.1, replacing
-``scratchpad.utils.op_read_writes`` with ``lambda op: op.get_read_writes()``
-bypasses the memo at all 14 call sites in that module. Extractions per operation:
-
-=================  ========  =====  ======
-workload           baseline  bound  bypass
-=================  ========  =====  ======
-matmul_chain         139.75    150  170.50
-elementwise_chain    156.28    175  215.22
-=================  ========  =====  ======
-
-Both bypass measurements exceed the unchanged bounds. The previous torch 2.13
-calibration used main ``c30e6bc0``; differences from those historical counts
-include changes to both torch and torch-spyre, so they do not isolate the cost
-of the torch upgrade.
+The previous torch 2.13 calibration used main ``c30e6bc0``; differences from
+those historical counts include changes to both torch and torch-spyre, so they
+do not isolate the cost of the torch upgrade.
 
 At the first calibration (main ``1a56c846``), the sweep's figures over 4,443
 operations counted at pre-scheduling-pipeline entry -- 1.32 misses, 90.7
@@ -99,14 +88,9 @@ WORKLOADS = ("matmul_chain", "elementwise_chain")
 
 #: Measured 1.03-1.50 here, 1.32 on the sweep, against a cold-cache floor of 1.0.
 MAX_MISSES_PER_OP = 4.0
-#: Per workload, because this is the bound a bypass has to breach and a single
-#: figure covering both has to sit above the looser one. Measured 139.75 and
-#: 156.28 on torch 2.14.1. Bypassing all 14 helper call sites in scratchpad/utils.py
-#: on that same checkout measures 170.50 and 215.22. Each unchanged bound lies
-#: between its baseline and bypass, so it still catches wholesale memo bypass.
-#: A counter this reproducible -- 0.03%
-#: p90 across the sweep -- can carry a tight bound; a legitimate change that
-#: breaches it should re-measure and move it rather than widen it blindly.
+#: Per-workload limits above the normal 2.14.1 measurements of 139.75 and 156.28.
+#: See the module docstring for calibration.
+#: Re-measure legitimate work increases before adjusting these limits.
 MAX_EXTRACTIONS_PER_OP = {"matmul_chain": 150.0, "elementwise_chain": 175.0}
 #: Measured 57-58 here. Unmemoized, so the count is the work.
 MAX_DEVICE_COORDS_PER_OP = 100.0
@@ -232,21 +216,15 @@ class TestFrontendWorkBounds(TestCase):
 
     @parametrize("shape", WORKLOADS)
     def test_extractions_per_operation_are_bounded(self, shape: str) -> None:
-        """The counter a memo bypass moves.
+        """Bound read/write-set extractions per lowered graph operation.
 
-        A caller switching from ``op_read_writes(op)`` to ``op.get_read_writes()``
-        leaves misses alone and raises this. Covers
-        ``ComputedBuffer.get_read_writes`` only: the scheduler extracts directly
-        in ``SchedulerNode._compute_attrs``, and so do several ``ir.py`` classes.
+        For example, the normal matmul compile performs 559 extractions over
+        four operations, giving 139.75 extractions/op. Repeated analysis across
+        passes counts each time, including upstream calls. Memoization remains
+        enabled during this test.
 
-        On torch 2.14.1, bypassing all 14 helper call sites in
-        ``scratchpad/utils.py`` raises extractions per op from 139.75 to 170.50
-        on ``matmul_chain`` and from 156.28 to 215.22 on ``elementwise_chain``.
-        For example, 139.75 is 559 read/write-set extractions divided by the
-        four lowered operations at pre-scheduling entry over one cold compile;
-        repeated analysis across passes counts each time, including upstream calls.
-        Both cross the bounds. This guards wholesale memo failure and multi-site
-        drift; a single-site bypass may still fall within the bounds.
+        Counts ``ComputedBuffer.get_read_writes`` calls only. Direct extraction
+        in ``SchedulerNode._compute_attrs`` and other IR classes is not counted.
         """
         deltas, ops = self._counts(shape)
         extractions = deltas.get(READ_WRITES_EXTRACTIONS, 0)
