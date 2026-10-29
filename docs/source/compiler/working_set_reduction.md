@@ -250,8 +250,9 @@ Diagnostic Python actions such as appending trace information are trace-time
 only. Operators must also declare accurate aliasing/mutation schemas; hidden
 side effects in an incorrectly declared custom operator cannot be checked here.
 
-Python scalar constants and static metadata are specialized by tracing. For
-symbolic sizes, read the size from an explicit body operand instead of closing
+Python scalar constants and static metadata are specialized by tracing.
+Metadata-only reads of captured tensors need not leave tensor constants in the
+graph, so the capture check does not reliably detect them. For symbolic sizes, read the size from an explicit body operand instead of closing
 over an outer symbolic value (which may raise an untracked-proxy error). Tensor
 value-dependent Python branches or scalar extraction are subject to make_fx's
 data-dependency errors; use tensor operations such as `torch.where` for runtime
