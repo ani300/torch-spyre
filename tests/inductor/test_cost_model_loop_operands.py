@@ -286,7 +286,7 @@ def test_burst_price_agrees_before_and_after_replication_is_chosen(broadcast):
 
 def test_cpsat_keeps_the_burst_price_when_replication_resolves_to_one():
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
 
     replication, split = sympy.symbols(
         "split_bmm_m split_bmm_n", integer=True, positive=True
@@ -331,9 +331,11 @@ def test_cpsat_tabulates_a_burst_price_over_the_op_divisions():
     and the objective equals the concrete price for every division and
     residency."""
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
+        _SympyExprToCpSat,
+    )
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
         _CoreDivisionBufferWithCpVars,
-        _SympyExprToCpSat,
     )
     from torch_spyre._inductor.scratchpad.plan_solver import (
         CoreDivision,
@@ -728,9 +730,11 @@ def test_the_stream_price_subtracts_the_burst_excess_it_overlaps():
 def test_cpsat_tabulates_the_reused_stream_price_over_the_op_divisions():
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
     from torch_spyre._inductor.cost_model import _reused_operand_stream_excess_ns
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
+        _SympyExprToCpSat,
+    )
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
         _CoreDivisionBufferWithCpVars,
-        _SympyExprToCpSat,
     )
     from torch_spyre._inductor.scratchpad.plan_solver import (
         CoreDivision,
@@ -789,9 +793,11 @@ def test_cpsat_merges_tabular_price_levels_an_ulp_apart():
     """Two divisions whose prices are equal but for float rounding share one
     level, so they share one level literal instead of adding one each."""
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
+        _SympyExprToCpSat,
+    )
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
         _CoreDivisionBufferWithCpVars,
-        _SympyExprToCpSat,
     )
     from torch_spyre._inductor.scratchpad.plan_solver import (
         CoreDivision,
@@ -831,7 +837,7 @@ def test_cpsat_merges_tabular_price_levels_an_ulp_apart():
 
 
 def test_stick_plane_geometry_measures_the_source_burst():
-    from torch_spyre._inductor import dump_cost_model as dcm
+    from torch_spyre._inductor import cost_features as dcm
 
     b, h, s, d = sympy.symbols("b h s d", integer=True, nonnegative=True)
     # Granite's interleaved query [B, S, H, D] as the device stores it:
@@ -859,7 +865,7 @@ def test_a_batched_operand_runs_one_batch_element_at_a_time():
     rows of D elements."""
     from types import SimpleNamespace
 
-    from torch_spyre._inductor import dump_cost_model as dcm
+    from torch_spyre._inductor import cost_features as dcm
 
     b, h, m, s, d = sympy.symbols("b h m s d", integer=True, nonnegative=True)
     coords = [s, h, sympy.floor(d / 64), b, sympy.Mod(d, 64)]
