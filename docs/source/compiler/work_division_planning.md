@@ -410,6 +410,17 @@ floors are retained with the operation's work-division metadata when an IR pass
 reconstructs it. A later split may use any legal factor at least as large as the
 floor; it need not be a multiple of the original span factor.
 
+Overlapping view reads impose another hard domain. For example,
+`x.unfold(d, 4, 2)` reads a coordinate of the form `2*w + k`: the window
+variable `k` iterates over four values, but its physical device dimension
+holds only two. The planner splits `k` so each core reads at most two values.
+If `k` is reduced and must stay whole, each core instead gets one `w` value
+and one value of every physical dimension outside it. A preceding slice adds
+a base offset but does not change these restrictions. If no legal division
+fits the core budget, compilation raises `Unsupported` rather than emitting
+an incorrectly addressed read. A symbolic inner window extent is rejected
+until the planner can prove a safe bound for every runtime size.
+
 :::{admonition} What gets written to `iteration_space_ownership`
 :class: note
 
@@ -667,9 +678,10 @@ def fn(x, y):
 ```
 
 The compiler resolves each user-facing name onto the concrete iteration
-variables for each operation in the hint scope. Coarse-tiling hints are kept
-separate, so `spyre_hint(tiles={...})` and `spyre_hint(work_div={...})` can
-coexist in the same scope.
+variables for each operation in the hint scope. Tiling is expressed with
+`for_each_tile` rather than a hint, and a `spyre_hint(work_div={...})` scope
+wrapped around a `for_each_tile` call divides the operations in the loop body
+across cores.
 
 When the work-division planner sees a resolved user hint, it validates the
 request and commits the accepted splits directly instead of running the
@@ -690,7 +702,7 @@ and the user hint asks for fewer splits, the compiler logs a warning and applies
 the strict user hint. `raise_if_per_core_overflow` then raises `Unsupported` if
 the resulting per-core span exceeds the hardware limit.
 
-Set `SPYRE_INDUCTOR_IGNORE_HINTS=1` to ignore `spyre_hint(work_div={...})`
+Set `SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS=1` to ignore `spyre_hint(work_div={...})`
 annotations and use the automatic work-distribution planner.
 
 :::{note}
