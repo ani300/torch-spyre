@@ -220,6 +220,10 @@ A body intended for use in decompositions should follow this contract:
 | Do not return scan inputs or views of them, or outputs that share storage with each other. Clone as needed. | Storage-alias checks raise during tracing. Read-only inputs may share storage, including a tensor passed both sliced and invariant. |
 | Use at least one nonempty sliced/gathered operand, matching trip counts, valid dimensions, and exact tile divisibility. | Existing tiling checks plus explicit zero-trip and `reverse` type checks raise before tracing the scan. |
 
+The graph checks apply the same read-only-input and disjoint-output rules to
+nested higher-order bodies. This is conservative even if a nested operator
+would otherwise allow returning an unchanged input: return a clone in that body.
+
 For example, pass the scaled query through every loop that reads it:
 
 ```python
