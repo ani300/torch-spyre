@@ -780,54 +780,39 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   }
   // FP8 multi-dim stick layout uses specialized DCI generation
   if (stl.element_arrangement == ElementArrangement::QFP8WT) {
-    // Reverse PyTorch ordering before reading N/K from cpu_sizes.
+    // QFP8WT stores each [..., K, N] matrix as [N/64, K/2, 64, 2].
+    // Keep all leading batch/expert axes instead of dropping them as in the
+    // original rank-2 linear-only transfer.
     std::reverse(cpu_sizes.begin(), cpu_sizes.end());
+    std::reverse(cpu_strides.begin(), cpu_strides.end());
     std::reverse(device_sizes.begin(), device_sizes.end());
-
-    const int64_t eps = stl.elems_per_stick();
+    TORCH_CHECK(cpu_sizes.size() >= 2, "QFP8WT DMA needs [..., K, N]");
     const int64_t si = 2;
-    const int64_t so = eps / si;
-    // cpu_sizes is reversed from PyTorch ordering [K, N] → [N, K], so
-    // cpu_sizes[0] = N (columns) and cpu_sizes[1] = K (rows).
+    const int64_t so = stl.elems_per_stick() / si;
     const int64_t N = cpu_sizes[0];
     const int64_t K = cpu_sizes[1];
-
-    // Expanded device shape: [si, so, K/si, N/so]
-    TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
-    TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
-    const int64_t dim2 = K / si;
-    const int64_t dim3 = N / so;
-
-    // Host strides for the expanded layout
-    const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
-    const int64_t dst3 =
-        dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
-
-    // Host (row-major) strides in the expanded 4D index space [si, so, dim2,
-    // dim3]:
-    //   element [k,n]: k = d2*si + a,  n = d3*so + b
-    //   host byte = k*N + n = (d2*si + a)*N + (d3*so + b)
-    //             = a*N + b*1 + d2*(si*N) + d3*so
-    //   → stride_src = [N, 1, si*N, so]
-    const std::vector<int64_t> host_strides = {N, 1, si * N, so};
-
-    // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
-    //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
-    //   (within a stick: si dimension innermost at stride=1, so dimension at
-    //   stride=si) → stride = [1, si, dst2, dst3]
-    const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
-
+    TORCH_CHECK(K % si == 0, "QFP8WT K must be divisible by 2");
+    TORCH_CHECK(N % so == 0, "QFP8WT N must be divisible by 64");
+    std::vector<int64_t> expanded_shape = {si, so, K / si, N / so};
+    std::vector<int64_t> host_strides = {cpu_strides[1], cpu_strides[0],
+                                         si * cpu_strides[1],
+                                         so * cpu_strides[0]};
+    std::vector<int64_t> device_strides = {1, si, si * so, K * so};
+    int64_t matrix_volume = K * N;
+    for (size_t axis = 2; axis < cpu_sizes.size(); ++axis) {
+      expanded_shape.push_back(cpu_sizes[axis]);
+      host_strides.push_back(cpu_strides[axis]);
+      device_strides.push_back(matrix_volume);
+      matrix_volume *= cpu_sizes[axis];
+    }
     DataConversionStrideInfo dcsi;
-    dcsi.size_ = {si, so, dim2, dim3};
+    dcsi.size_ = expanded_shape;
     dcsi.stride_src_ = host2device ? host_strides : device_strides;
     dcsi.stride_dst_ = host2device ? device_strides : host_strides;
     dcsi.offset_src_ = host2device ? cpu_offset : 0;
     dcsi.offset_dst_ = host2device ? 0 : cpu_offset;
     dci.dcsi_ = {dcsi};
-    // For H2D, output (device) shape is the expanded 4D form.
-    // For D2H, output (host) shape is the original 2D cpu_sizes.
-    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
-    dci.output_shape_ = host2device ? expanded_dev_shape : cpu_sizes;
+    dci.output_shape_ = host2device ? expanded_shape : cpu_sizes;
     dci.input_shape_ = host2device ? cpu_sizes : device_sizes;
   } else {
     dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,

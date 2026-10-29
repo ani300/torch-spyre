@@ -58,12 +58,7 @@ class TestDmaToSpyreFp8Kernel:
         assert list(dev.shape) == [128, 256], f"Shape mismatch: {list(dev.shape)}"
 
     def test_non_contiguous_input(self):
-        """Non-contiguous FP8 weight is transferred correctly without a CPU copy.
-
-        The QFP8WT DCI path in spyre_mem.cpp derives host strides analytically
-        from K and N, so it ignores the CPU tensor's actual strides. A transposed
-        (non-contiguous) view can be passed directly without calling .contiguous().
-        """
+        """A transposed FP8 source preserves its values without a CPU copy."""
         from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
 
         # t() produces a non-contiguous [128, 256] view with strides [1, 128]
@@ -75,6 +70,9 @@ class TestDmaToSpyreFp8Kernel:
 
         assert dev.device.type == DEVICE_TYPE
         assert dev.dtype == torch.float8_e4m3fn
+        torch.testing.assert_close(
+            dev.cpu().view(torch.uint8), weight.view(torch.uint8), atol=0, rtol=0
+        )
 
     def test_rejects_non_fp8(self):
         """Raises AssertionError for non-FP8 dtype."""
@@ -84,13 +82,52 @@ class TestDmaToSpyreFp8Kernel:
         with pytest.raises(AssertionError, match="float8_e4m3fn"):
             _dma_to_spyre_fp8_kernel(weight)
 
-    def test_rejects_non_2d(self):
-        """Raises AssertionError for non-2D tensor."""
+    def test_rejects_vector(self):
+        """A weight needs at least the K and N matrix axes."""
         from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
 
-        weight = torch.randn(4, 128, 128, dtype=torch.float16).to(torch.float8_e4m3fn)
-        with pytest.raises(AssertionError, match="2D"):
+        weight = torch.zeros(128, dtype=torch.float8_e4m3fn)
+        with pytest.raises(AssertionError, match="K, N"):
             _dma_to_spyre_fp8_kernel(weight)
+
+    @pytest.mark.parametrize("leading", [(), (4,), (2, 3), (128,)])
+    @pytest.mark.parametrize("view", [False, True])
+    def test_batched_byte_roundtrip(self, leading, view):
+        """Every expert survives DMA, including strided, offset checkpoint views."""
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        gen = torch.Generator().manual_seed(791)
+        weight = torch.randn(*leading, 256, 130, generator=gen).to(torch.float8_e4m3fn)
+        weight = weight[..., 2:].transpose(-1, -2)
+        if not view:
+            weight = weight.contiguous()
+        dev = _dma_to_spyre_fp8_kernel(weight)
+        torch.testing.assert_close(
+            dev.cpu().view(torch.uint8), weight.view(torch.uint8), atol=0, rtol=0
+        )
+
+    def test_batched_scaled_bmm(self):
+        """The DMA layout is consumed correctly, beyond a symmetric roundtrip."""
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        gen = torch.Generator().manual_seed(91)
+        # Small integer FP8 codes make the FP32 oracle exact, isolating packing.
+        weight = (
+            torch.randint(-2, 3, (4, 256, 128), generator=gen)
+            .to(torch.float8_e4m3fn)
+            .transpose(-1, -2)
+        )
+        act = torch.randint(-2, 3, (4, 128, 128), generator=gen).half()
+        dev = _dma_to_spyre_fp8_kernel(weight)
+
+        @torch.compile(fullgraph=True)
+        def run(x, w):
+            q = torch.ops.spyre.qfp8ch(x)
+            return torch.ops.spyre.scaled_bmm(q, w, out_dtype=torch.float16)
+
+        actual = run(act.to(DEVICE), dev).cpu().float()
+        reference = torch.bmm(act.float(), weight.float())
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
     def test_production_shapes(self):
         """Common Granite-3.3 8B Linear weight shapes transfer correctly."""

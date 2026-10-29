@@ -278,45 +278,35 @@ def _dma_to_spyre_indirect_access(
 def _dma_to_spyre_fp8_kernel(
     weight: torch.Tensor,
 ) -> torch.Tensor:
-    """Transfer a pre-quantized FP8 weight to Spyre with KERNEL layout.
+    """DMA pre-quantized ``[..., K, N]`` FP8 weights into QFP8WT.
 
-    Creates a KERNEL tensor with 2D stick layout ``[2, 64]`` and
-    ``ElementArrangement.QFP8WT`` for use with ``_scaled_mm``.
-
-    This is for pre-quantized ``torch.float8_e4m3fn`` weights loaded from
-    model checkpoints (e.g. ``granite-3.3-8b-instruct-fp8``).  It creates
-    the optimal device layout for FP8 matrix multiplication without requiring
-    any runtime ``qfp8wt`` quantization overhead.
-
-    Caller must ensure ``weight.ndim == 2`` and
-    ``weight.dtype == torch.float8_e4m3fn``.
+    Leading dimensions are independent weight matrices (for example experts).
+    The transfer packs 2x64 sticks directly and respects CPU source strides.
+    No device quantization or temporary DL16 expert stack is required.
     """
-    assert weight.ndim == 2, "FP8 KERNEL layout is for 2D weights only"
+    assert weight.ndim >= 2, "FP8 KERNEL layout needs [..., K, N] weights"
+    assert weight.device.type == "cpu", "FP8 KERNEL DMA expects CPU weights"
     assert weight.dtype == torch.float8_e4m3fn, (
         f"Weight must be torch.float8_e4m3fn, got {weight.dtype}"
     )
-    assert weight.shape[0] % 2 == 0, (
-        f"FP8 KERNEL K={weight.shape[0]} must be divisible by 2 (si=2)"
-    )
-    assert weight.shape[1] % 64 == 0, (
-        f"FP8 KERNEL N={weight.shape[1]} must be divisible by 64 (so=64)"
-    )
-
+    assert weight.shape[-2] % 2 == 0, "FP8 KERNEL K must be divisible by 2"
+    assert weight.shape[-1] % 64 == 0, "FP8 KERNEL N must be divisible by 64"
     _ensure_spyre_runtime()
-
-    # Note: contiguity is NOT required here. The QFP8WT branch in generate_dci
-    # (spyre_mem.cpp) derives host strides analytically from K and N — it does
-    # not use the CPU tensor's actual strides. This means a non-contiguous view
-    # (e.g. p.t()) is safe to pass directly, avoiding a CPU memcpy.
+    rank = weight.ndim
+    # Source views may have holes or transposed axes. The device allocation and
+    # its logical strides must still describe the packed, dense destination.
+    strides = [1] * rank
+    for axis in range(rank - 2, -1, -1):
+        strides[axis] = strides[axis + 1] * weight.shape[axis + 1]
     layout = SpyreTensorLayout(
-        list(weight.shape),  # host_size: [K, N] = [in_features, out_features]
-        list(weight.stride()),  # host_strides: row-major [N, 1]
+        list(weight.shape),
+        strides,
         torch.float8_e4m3fn,
-        [0, 1],  # dim_order: identity, matches _qfp8wt_stl in propagate_layouts
-        ElementArrangement.QFP8WT,  # 2D stick [2, 64] for KERNEL tensor
+        [rank - 2, *range(rank - 2), rank - 1],
+        ElementArrangement.QFP8WT,
     )
     dst = spyre_empty_with_layout(
-        weight.size(), weight.stride(), torch.float8_e4m3fn, layout
+        weight.size(), tuple(strides), torch.float8_e4m3fn, layout
     )
     copy_tensor(weight, dst, non_blocking=False)
     return dst
